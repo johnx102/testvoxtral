@@ -1,0 +1,9 @@
+{
+  "input": {
+    "task": "transcribe_diarized",
+    "audio_url": "https://example.com/mon_audio.wav",
+    "language": "fr",
+    "with_summary": true,
+    "max_new_tokens": 512
+  }
+}

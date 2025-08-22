@@ -1,0 +1,8 @@
+{
+  "input": {
+    "task": "transcribe",
+    "audio_url": "https://example.com/mon_audio.wav",
+    "language": "fr",
+    "max_new_tokens": 512
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "input": {
+    "task": "summary",
+    "audio_url": "https://example.com/mon_audio.wav",
+    "language": "fr",
+    "max_sentences": 5,
+    "style": "Résumé à puces, clair pour un client."
+  }
+}
