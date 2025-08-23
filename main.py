@@ -26,6 +26,8 @@ def log(msg: str):
         print(msg, flush=True)
 
 # Env
+APP_VERSION = os.environ.get("APP_VERSION", "unknown")
+
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Mini-3B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "512"))
@@ -38,6 +40,7 @@ WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli").strip()
 SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()  # "zero-shot" or "classifier"
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
+SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU (default to avoid NVRTC issues)
 
 # Globals
 _processor = None
@@ -158,9 +161,17 @@ def load_diarizer():
     if HF_TOKEN:
         kwargs["use_auth_token"] = HF_TOKEN
     _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
-    if torch.cuda.is_available():
-        _diarizer.to(torch.device("cuda"))  # FIX: use torch.device
-    log("[INIT] Diarizer ready.")
+    try:
+        if torch.cuda.is_available():
+            try:
+                _diarizer.to(torch.device("cuda"))
+            except TypeError:
+                _diarizer.to("cuda")
+            log("[INIT] Diarizer moved to CUDA.")
+        else:
+            log("[INIT] CUDA not available; diarizer on CPU.")
+    except Exception as e:
+        log(f"[WARN] Could not move diarizer to CUDA: {e}. Keeping on CPU.")
     return _diarizer
 
 # Sentiment
@@ -169,15 +180,18 @@ def load_sentiment():
     if not ENABLE_SENTIMENT:
         return None
 
+    # Force CPU by default to avoid NVRTC / TorchScript issues.
+    device_idx = SENTIMENT_DEVICE
+
     if SENTIMENT_TYPE == "zero-shot":
         if _sentiment_zero_shot is not None:
             return _sentiment_zero_shot
-        log(f"[INIT] Loading zero-shot sentiment: {SENTIMENT_MODEL}")
+        log(f"[INIT] Loading zero-shot sentiment on device {device_idx}: {SENTIMENT_MODEL}")
         _sentiment_zero_shot = hf_pipeline(
             "zero-shot-classification",
             model=SENTIMENT_MODEL,
             tokenizer=SENTIMENT_MODEL,
-            device=_device_idx(),
+            device=device_idx,
             model_kwargs={"use_safetensors": True}
         )
         log("[INIT] Zero-shot sentiment ready.")
@@ -185,11 +199,11 @@ def load_sentiment():
     else:
         if _sentiment_clf is not None:
             return _sentiment_clf
-        log(f"[INIT] Loading classifier sentiment: {SENTIMENT_MODEL}")
+        log(f"[INIT] Loading classifier sentiment on device {device_idx}: {SENTIMENT_MODEL}")
         tok = AutoTokenizer.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
         mdl = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
         _sentiment_clf = TextClassificationPipeline(
-            model=mdl, tokenizer=tok, device=_device_idx(), return_all_scores=True, truncation=True
+            model=mdl, tokenizer=tok, device=device_idx, return_all_scores=True, truncation=True
         )
         log("[INIT] Classifier sentiment ready.")
         return _sentiment_clf
@@ -305,6 +319,7 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
 # Health / diagnostics
 def health():
     info = {
+        "app_version": APP_VERSION,
         "python": os.popen("python -V").read().strip(),
         "torch": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
@@ -316,6 +331,7 @@ def health():
         "diar_model": DIAR_MODEL,
         "sentiment_model": SENTIMENT_MODEL if ENABLE_SENTIMENT else None,
         "sentiment_type": SENTIMENT_TYPE,
+        "sentiment_device": "cpu" if SENTIMENT_DEVICE == -1 else f"cuda:{SENTIMENT_DEVICE}"
     }
     errors = {}
     try:

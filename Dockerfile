@@ -6,7 +6,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
-    TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+    TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
+    PYTORCH_JIT=0 \
+    APP_VERSION=2025-08-23-02
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -41,6 +43,7 @@ ENV MODEL_ID="mistralai/Voxtral-Mini-3B-2507" \
     SENTIMENT_MODEL="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli" \
     SENTIMENT_TYPE="zero-shot" \
     ENABLE_SENTIMENT="1" \
+    SENTIMENT_DEVICE="-1" \
     LOG_LEVEL="INFO"
 
 ENTRYPOINT ["python", "-u", "main.py"]

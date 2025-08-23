@@ -1,34 +1,20 @@
-# Voxtral Mini 3B — Transcription + Résumé + Diarization + Humeur (Health2)
+# Voxtral Mini 3B — Transcription + Résumé + Diarization + Humeur (Health3)
 
-Corrections incluses :
-- pyannote `.to(torch.device("cuda"))`
-- ajout `mistral_common` (Voxtral tokenizer)
-- sentiment via **zero-shot** `MoritzLaurer/mDeBERTa-v3-base-mnli-xnli` (safetensors)
+**Fixes clés :**
+- Sentiment **sur CPU** par défaut (`SENTIMENT_DEVICE=-1`) + `PYTORCH_JIT=0` → évite l'erreur NVRTC/TorchScript `fabs(...)`.
+- Diarizer `.to(...)` **robuste** : essaie CUDA (torch.device), sinon garde sur CPU sans crasher.
+- `APP_VERSION=2025-08-23-02` renvoyé dans `/health` pour vérifier que la bonne image tourne.
 
-## Build & Push
-```bash
-docker build -t <repo>/voxtral-mini-serverless-diar-sent-health2:latest .
-docker push <repo>/voxtral-mini-serverless-diar-sent-health2:latest
-```
-
-## Variables d’env
-- `MODEL_ID=mistralai/Voxtral-Mini-3B-2507`
-- `HF_TOKEN` (si nécessaire, ex. pyannote licence)
-- `DIAR_MODEL=pyannote/speaker-diarization-3.1`
-- `SENTIMENT_MODEL=MoritzLaurer/mDeBERTa-v3-base-mnli-xnli`
-- `SENTIMENT_TYPE=zero-shot`
-- `ENABLE_SENTIMENT=1`
-- `MAX_DURATION_S=1200`
-
-## Health check
+## Health
 ```bash
 curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
   -H "Authorization: Bearer $RUNPOD_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{ "input": { "task": "health" } }'
 ```
+Vérifie que `info.app_version` = **2025-08-23-02** et `sentiment_device` = **cpu**.
 
-## Transcription diarized + résumé
+## Transcription diarized
 ```bash
 curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
   -H "Authorization: Bearer $RUNPOD_API_KEY" \
