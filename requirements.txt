@@ -11,4 +11,7 @@ requests>=2.32.0
 pyannote.audio>=3.1.1
 sentencepiece>=0.2.0
 
+# Voxtral tokenizer dependency
+mistral_common>=1.4.0
+
 runpod==1.6.2

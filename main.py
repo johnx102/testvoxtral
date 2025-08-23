@@ -3,7 +3,7 @@ from typing import Optional, List, Dict, Any, Tuple
 
 import torch
 from transformers import (
-    AutoProcessor, AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline
+    AutoProcessor, AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline, pipeline as hf_pipeline
 )
 
 # Try Voxtral-specific class
@@ -35,14 +35,16 @@ MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "1200"))
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
-SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "cardiffnlp/twitter-xlm-roberta-base-sentiment").strip()
+SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli").strip()
+SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()  # "zero-shot" or "classifier"
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
 
 # Globals
 _processor = None
 _model = None
 _diarizer = None
-_sentiment = None  # TextClassificationPipeline
+_sentiment_clf = None       # TextClassificationPipeline (if classifier)
+_sentiment_zero_shot = None # zero-shot pipeline
 
 def _select_dtype() -> torch.dtype:
     if torch.cuda.is_available():
@@ -52,6 +54,9 @@ def _select_dtype() -> torch.dtype:
 
 def _device_str() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+def _device_idx() -> int:
+    return 0 if torch.cuda.is_available() else -1
 
 def _download_to_tmp(url: str) -> str:
     resp = requests.get(url, timeout=120, stream=True)
@@ -154,27 +159,40 @@ def load_diarizer():
         kwargs["use_auth_token"] = HF_TOKEN
     _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
     if torch.cuda.is_available():
-        _diarizer.to("cuda")
+        _diarizer.to(torch.device("cuda"))  # FIX: use torch.device
     log("[INIT] Diarizer ready.")
     return _diarizer
 
 # Sentiment
 def load_sentiment():
-    global _sentiment
+    global _sentiment_clf, _sentiment_zero_shot
     if not ENABLE_SENTIMENT:
         return None
-    if _sentiment is not None:
-        return _sentiment
-    log(f"[INIT] Loading sentiment: {SENTIMENT_MODEL}")
-    tok = AutoTokenizer.from_pretrained(SENTIMENT_MODEL)
-    mdl = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL)
-    _sentiment = TextClassificationPipeline(
-        model=mdl, tokenizer=tok,
-        device=0 if torch.cuda.is_available() else -1,
-        return_all_scores=True, truncation=True
-    )
-    log("[INIT] Sentiment ready.")
-    return _sentiment
+
+    if SENTIMENT_TYPE == "zero-shot":
+        if _sentiment_zero_shot is not None:
+            return _sentiment_zero_shot
+        log(f"[INIT] Loading zero-shot sentiment: {SENTIMENT_MODEL}")
+        _sentiment_zero_shot = hf_pipeline(
+            "zero-shot-classification",
+            model=SENTIMENT_MODEL,
+            tokenizer=SENTIMENT_MODEL,
+            device=_device_idx(),
+            model_kwargs={"use_safetensors": True}
+        )
+        log("[INIT] Zero-shot sentiment ready.")
+        return _sentiment_zero_shot
+    else:
+        if _sentiment_clf is not None:
+            return _sentiment_clf
+        log(f"[INIT] Loading classifier sentiment: {SENTIMENT_MODEL}")
+        tok = AutoTokenizer.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
+        mdl = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
+        _sentiment_clf = TextClassificationPipeline(
+            model=mdl, tokenizer=tok, device=_device_idx(), return_all_scores=True, truncation=True
+        )
+        log("[INIT] Classifier sentiment ready.")
+        return _sentiment_clf
 
 def _label_fr(en_label: str) -> str:
     m = {"negative": "mauvais", "neutral": "neutre", "positive": "bon"}
@@ -188,23 +206,33 @@ def _label_fr(en_label: str) -> str:
     return m.get(key, en_label)
 
 def classify_sentiment(text: str) -> Dict[str, Any]:
-    clf = load_sentiment()
-    if clf is None or not text.strip():
+    if not ENABLE_SENTIMENT or not text.strip():
         return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
-    res = clf(text.strip())[0]
-    canonical = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
-    for r in res:
-        lbl = r["label"].lower()
-        if lbl.startswith("label_"):
-            try:
-                idx = int(lbl.split("_")[-1])
-                lbl = ["negative", "neutral", "positive"][idx]
-            except Exception:
-                pass
-        if lbl in canonical:
-            canonical[lbl] = float(r["score"])
-    label_en = max(canonical.items(), key=lambda kv: kv[1])[0]
-    return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": canonical[label_en], "scores": canonical}
+
+    if SENTIMENT_TYPE == "zero-shot":
+        clf = load_sentiment()
+        res = clf(text.strip(), candidate_labels=["positive", "neutral", "negative"], multi_label=False)
+        scores = {"positive": 0.0, "neutral": 0.0, "negative": 0.0}
+        for lbl, sc in zip(res["labels"], res["scores"]):
+            scores[lbl.lower()] = float(sc)
+        label_en = res["labels"][0].lower()
+        return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": scores[label_en], "scores": scores}
+    else:
+        clf = load_sentiment()
+        res = clf(text.strip())[0]
+        canonical = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
+        for r in res:
+            lbl = r["label"].lower()
+            if lbl.startswith("label_"):
+                try:
+                    idx = int(lbl.split("_")[-1])
+                    lbl = ["negative", "neutral", "positive"][idx]
+                except Exception:
+                    pass
+            if lbl in canonical:
+                canonical[lbl] = float(r["score"])
+        label_en = max(canonical.items(), key=lambda kv: kv[1])[0]
+        return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": canonical[label_en], "scores": canonical}
 
 def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, Any]:
     total = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
@@ -250,12 +278,12 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
         conv = _build_conv_transcribe(tmp, language)
         out = run_voxtral(conv, max_new_tokens=max_new_tokens)
         text = (out.get("text") or "").strip()
-        mood = classify_sentiment(text) if ENABLE_SENTIMENT else {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
+        mood = classify_sentiment(text)
 
         segments.append({"speaker": speaker, "start": start_s, "end": end_s, "text": text, "mood": mood})
         if text:
             transcript_parts.append(f"{speaker}: {text}")
-        if ENABLE_SENTIMENT and dur_s > 0:
+        if dur_s > 0:
             weighted_moods.append((mood, dur_s))
             mood_by_speaker_weights.setdefault(speaker, []).append((mood, dur_s))
 
@@ -270,10 +298,8 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
         s = run_voxtral(conv_sum, max_new_tokens=max_new_tokens)
         result["summary"] = s.get("text", "")
 
-    if ENABLE_SENTIMENT:
-        result["mood_overall"] = aggregate_mood(weighted_moods)
-        result["mood_by_speaker"] = {spk: aggregate_mood(lst) for spk, lst in mood_by_speaker_weights.items()}
-
+    result["mood_overall"] = aggregate_mood(weighted_moods)
+    result["mood_by_speaker"] = {spk: aggregate_mood(lst) for spk, lst in mood_by_speaker_weights.items()}
     return result
 
 # Health / diagnostics
@@ -289,8 +315,8 @@ def health():
         "model_id": MODEL_ID,
         "diar_model": DIAR_MODEL,
         "sentiment_model": SENTIMENT_MODEL if ENABLE_SENTIMENT else None,
+        "sentiment_type": SENTIMENT_TYPE,
     }
-    # Try loading components with clear error messages
     errors = {}
     try:
         load_voxtral()

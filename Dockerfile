@@ -38,7 +38,8 @@ ENV MODEL_ID="mistralai/Voxtral-Mini-3B-2507" \
     MAX_DURATION_S="1200" \
     DIAR_MODEL="pyannote/speaker-diarization-3.1" \
     WITH_SUMMARY_DEFAULT="1" \
-    SENTIMENT_MODEL="cardiffnlp/twitter-xlm-roberta-base-sentiment" \
+    SENTIMENT_MODEL="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli" \
+    SENTIMENT_TYPE="zero-shot" \
     ENABLE_SENTIMENT="1" \
     LOG_LEVEL="INFO"
 
