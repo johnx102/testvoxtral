@@ -3,10 +3,11 @@ from typing import Optional, List, Dict, Any, Tuple
 
 import torch
 from transformers import (
-    AutoProcessor, AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline, pipeline as hf_pipeline
+    AutoProcessor, AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline,
+    pipeline as hf_pipeline
 )
 
-# Try Voxtral-specific class
+# Voxtral class (requires transformers@main)
 try:
     from transformers import VoxtralForConditionalGeneration  # type: ignore
     _HAS_VOXTRAL_CLASS = True
@@ -19,14 +20,18 @@ from pyannote.audio import Pipeline
 
 import runpod
 
+# ---------------------------
+# Logging
+# ---------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-
 def log(msg: str):
     if LOG_LEVEL in ("DEBUG", "INFO"):
         print(msg, flush=True)
 
-# Env
-APP_VERSION = os.environ.get("APP_VERSION", "unknown")
+# ---------------------------
+# Env / Config
+# ---------------------------
+APP_VERSION = os.environ.get("APP_VERSION", "max2-2025-08-23")
 
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Mini-3B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
@@ -37,18 +42,31 @@ MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "1200"))
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
+# Sentiment (kept CPU-friendly by default)
 SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli").strip()
 SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()  # "zero-shot" or "classifier"
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
-SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU (default to avoid NVRTC issues)
+SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
+
+# NEW: limit speakers
+MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))  # hard cap in diarization call
+EXACT_TWO = os.environ.get("EXACT_TWO", "0") == "1"       # if true, force exactly 2 speakers
+
+# Optional UX toggles
+STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
+FACTUAL_SUMMARY = os.environ.get("FACTUAL_SUMMARY", "1") == "1"
+ROLE_LABELS = [r.strip() for r in os.environ.get("ROLE_LABELS", "Agent,Client").split(",") if r.strip()]
 
 # Globals
 _processor = None
 _model = None
 _diarizer = None
-_sentiment_clf = None       # TextClassificationPipeline (if classifier)
-_sentiment_zero_shot = None # zero-shot pipeline
+_sentiment_clf = None
+_sentiment_zero_shot = None
 
+# ---------------------------
+# Helpers
+# ---------------------------
 def _select_dtype() -> torch.dtype:
     if torch.cuda.is_available():
         major, _ = torch.cuda.get_device_capability(0)
@@ -57,9 +75,6 @@ def _select_dtype() -> torch.dtype:
 
 def _device_str() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
-
-def _device_idx() -> int:
-    return 0 if torch.cuda.is_available() else -1
 
 def _download_to_tmp(url: str) -> str:
     resp = requests.get(url, timeout=120, stream=True)
@@ -78,7 +93,9 @@ def _b64_to_tmp(b64: str) -> str:
         f.write(raw)
     return path
 
+# ---------------------------
 # Voxtral
+# ---------------------------
 def load_voxtral():
     global _processor, _model
     if _processor is not None and _model is not None:
@@ -108,7 +125,15 @@ def load_voxtral():
 
 def _build_conv_transcribe(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
     lang_prefix = f"lang:{language} " if language else ""
-    instruction = f"{lang_prefix}[TRANSCRIBE]"
+    if STRICT_TRANSCRIPTION:
+        constraints = (
+            "Transcris mot à mot en conservant la langue source. "
+            "Aucune traduction, paraphrase, commentaire ou ajout. "
+            "Garde la ponctuation et les hésitations si audibles."
+        )
+        instruction = f"{lang_prefix}[TRANSCRIBE] {constraints}"
+    else:
+        instruction = f"{lang_prefix}[TRANSCRIBE]"
     return [{
         "role": "user",
         "content": [
@@ -121,13 +146,17 @@ def _build_conv_summary(local_path: str, language: Optional[str], max_sentences:
     parts = []
     if language:
         parts.append(f"lang:{language}")
+    if FACTUAL_SUMMARY:
+        parts.extend([
+            "Résumé factuel, concis, sans invention.",
+            "Si une information est inconnue, écrire « inconnu ».",
+            "Puces courtes."
+        ])
     if style:
         parts.append(style.strip())
     if max_sentences:
         parts.append(f"Résumé en {max_sentences} phrases.")
-    else:
-        parts.append("Fais un résumé concis et structuré.")
-    instruction = " ".join(parts)
+    instruction = " ".join(parts) if parts else "Résumé factuel."
     return [{
         "role": "user",
         "content": [
@@ -145,13 +174,15 @@ def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict
 
     gen_kwargs = dict(max_new_tokens=max_new_tokens, temperature=TEMPERATURE, top_p=TOP_P)
     start = time.time()
-    outputs = model.generate(**inputs, **gen_kwargs)
+    outputs = model.generate(**gen_kwargs, **inputs)
     elapsed = time.time() - start
 
     decoded = processor.batch_decode(outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
     return {"text": decoded[0] if decoded else "", "latency_s": round(elapsed, 3)}
 
-# Diarization
+# ---------------------------
+# Diarization (limit to max 2 speakers)
+# ---------------------------
 def load_diarizer():
     global _diarizer
     if _diarizer is not None:
@@ -174,15 +205,15 @@ def load_diarizer():
         log(f"[WARN] Could not move diarizer to CUDA: {e}. Keeping on CPU.")
     return _diarizer
 
-# Sentiment
+# ---------------------------
+# Sentiment (CPU-friendly by default)
+# ---------------------------
 def load_sentiment():
     global _sentiment_clf, _sentiment_zero_shot
     if not ENABLE_SENTIMENT:
         return None
 
-    # Force CPU by default to avoid NVRTC / TorchScript issues.
-    device_idx = SENTIMENT_DEVICE
-
+    device_idx = SENTIMENT_DEVICE  # -1 => CPU
     if SENTIMENT_TYPE == "zero-shot":
         if _sentiment_zero_shot is not None:
             return _sentiment_zero_shot
@@ -264,7 +295,64 @@ def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, An
     label_en = max(norm.items(), key=lambda kv: kv[1])[0]
     return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": norm[label_en], "scores": norm}
 
+# ---------------------------
+# Enforce MAX 2 speakers post-process (safety net)
+# ---------------------------
+def _enforce_max_two_speakers(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    speakers = list({s["speaker"] for s in segments})
+    if len(speakers) <= 2:
+        return segments
+
+    dur = {}
+    cent = {}
+    for s in segments:
+        d = float(s["end"]) - float(s["start"])
+        spk = s["speaker"]
+        mid = (float(s["start"]) + float(s["end"])) / 2.0
+        dur[spk] = dur.get(spk, 0.0) + d
+        sm, ds = cent.get(spk, (0.0, 0.0))
+        cent[spk] = (sm + mid * d, ds + d)
+
+    top2 = sorted(dur.keys(), key=lambda k: dur[k], reverse=True)[:2]
+    centroids = {}
+    for spk in top2:
+        sm, ds = cent[spk]
+        centroids[spk] = (sm / ds) if ds > 0 else 0.0
+
+    def nearest(mid):
+        best, bestd = None, 1e18
+        for spk, c in centroids.items():
+            dd = abs(mid - c)
+            if dd < bestd:
+                best, bestd = spk, dd
+        return best
+
+    for s in segments:
+        if s["speaker"] not in top2:
+            mid = (float(s["start"]) + float(s["end"])) / 2.0
+            s["speaker"] = nearest(mid)
+
+    return segments
+
+# ---------------------------
+# Optional: map speakers to role labels
+# ---------------------------
+def _map_roles(segments: List[Dict[str, Any]]):
+    seen = []
+    for s in segments:
+        spk = s["speaker"]
+        if spk not in seen:
+            seen.append(spk)
+    mapping = {}
+    for i, spk in enumerate(seen):
+        if i < len(ROLE_LABELS):
+            mapping[spk] = ROLE_LABELS[i]
+    for s in segments:
+        s["speaker"] = mapping.get(s["speaker"], s["speaker"])
+
+# ---------------------------
 # Core flow
+# ---------------------------
 def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
     try:
         import soundfile as sf
@@ -276,28 +364,50 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
         pass
 
     dia = load_diarizer()
-    diarization = dia(wav_path)
+
+    # Call diarizer with constraints to keep at most 2 speakers
+    try:
+        if EXACT_TWO:
+            diarization = dia(wav_path, num_speakers=min(2, MAX_SPEAKERS))
+        else:
+            diarization = dia(wav_path, min_speakers=1, max_speakers=min(2, MAX_SPEAKERS))
+    except TypeError:
+        # Different signatures across versions
+        if EXACT_TWO:
+            diarization = dia(wav_path, min_speakers=min(2, MAX_SPEAKERS), max_speakers=min(2, MAX_SPEAKERS))
+        else:
+            diarization = dia(wav_path, num_speakers=min(2, MAX_SPEAKERS))
+
     audio = AudioSegment.from_wav(wav_path)
 
-    segments, transcript_parts = [], []
-    weighted_moods, mood_by_speaker_weights = [], {}
+    segments = []
+    transcript_parts = []
+
+    weighted_moods = []
+    mood_by_speaker_weights = {}
 
     for turn, _, speaker in diarization.itertracks(yield_label=True):
-        start_s, end_s = float(turn.start), float(turn.end)
+        start_s = float(turn.start)
+        end_s = float(turn.end)
         dur_s = max(0.0, end_s - start_s)
-        seg_audio = audio[int(start_s*1000): int(end_s*1000)]
+        seg_audio = audio[int(start_s * 1000): int(end_s * 1000)]
+
         tmp = os.path.join(tempfile.gettempdir(), f"seg_{speaker}_{int(start_s*1000)}.wav")
         seg_audio.export(tmp, format="wav")
 
         conv = _build_conv_transcribe(tmp, language)
         out = run_voxtral(conv, max_new_tokens=max_new_tokens)
         text = (out.get("text") or "").strip()
-        mood = classify_sentiment(text)
 
-        segments.append({"speaker": speaker, "start": start_s, "end": end_s, "text": text, "mood": mood})
+        mood = classify_sentiment(text) if ENABLE_SENTIMENT else {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
+
+        seg = {"speaker": speaker, "start": start_s, "end": end_s, "text": text, "mood": mood}
+        segments.append(seg)
+
         if text:
             transcript_parts.append(f"{speaker}: {text}")
-        if dur_s > 0:
+
+        if ENABLE_SENTIMENT and dur_s > 0:
             weighted_moods.append((mood, dur_s))
             mood_by_speaker_weights.setdefault(speaker, []).append((mood, dur_s))
 
@@ -306,17 +416,40 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
         except Exception:
             pass
 
-    result = {"segments": segments, "transcript": "\n".join(transcript_parts)}
+    # Safety net: if diarizer still produced >2, clamp to 2
+    segments = _enforce_max_two_speakers(segments)
+
+    # Optional role mapping
+    _map_roles(segments)
+
+    # Rebuild transcript with mapped speaker labels
+    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
+
+    result = {"segments": segments, "transcript": full_transcript}
+
     if with_summary:
         conv_sum = _build_conv_summary(wav_path, language, max_sentences=None, style="Résumé clair en français, à puces si pertinent.")
         s = run_voxtral(conv_sum, max_new_tokens=max_new_tokens)
         result["summary"] = s.get("text", "")
 
-    result["mood_overall"] = aggregate_mood(weighted_moods)
-    result["mood_by_speaker"] = {spk: aggregate_mood(lst) for spk, lst in mood_by_speaker_weights.items()}
+    if ENABLE_SENTIMENT:
+        result["mood_overall"] = aggregate_mood(weighted_moods)
+        # Aggregate by (mapped) speaker label after enforcement
+        per_role = {}
+        for seg in segments:
+            d = float(seg["end"]) - float(seg["start"])
+            m = seg.get("mood")
+            r = seg["speaker"]
+            if not m or not m.get("scores"):
+                continue
+            per_role.setdefault(r, []).append((m, d))
+        result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
+
     return result
 
+# ---------------------------
 # Health / diagnostics
+# ---------------------------
 def health():
     info = {
         "app_version": APP_VERSION,
@@ -331,7 +464,12 @@ def health():
         "diar_model": DIAR_MODEL,
         "sentiment_model": SENTIMENT_MODEL if ENABLE_SENTIMENT else None,
         "sentiment_type": SENTIMENT_TYPE,
-        "sentiment_device": "cpu" if SENTIMENT_DEVICE == -1 else f"cuda:{SENTIMENT_DEVICE}"
+        "sentiment_device": "cpu" if SENTIMENT_DEVICE == -1 else f"cuda:{SENTIMENT_DEVICE}",
+        "max_speakers": MAX_SPEAKERS,
+        "exact_two": EXACT_TWO,
+        "strict_transcription": STRICT_TRANSCRIPTION,
+        "factual_summary": FACTUAL_SUMMARY,
+        "role_labels": ROLE_LABELS,
     }
     errors = {}
     try:
@@ -349,7 +487,9 @@ def health():
             errors["sentiment_load"] = f"{type(e).__name__}: {e}"
     return {"ok": len(errors) == 0, "info": info, "errors": errors}
 
+# ---------------------------
 # Handler
+# ---------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         inp = job.get("input", {}) or {}
@@ -398,7 +538,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-# Warm
+# Warm load
 try:
     load_voxtral()
     load_diarizer()
