@@ -17,7 +17,6 @@ except Exception:
 
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
-
 import runpod
 
 # ---------------------------
@@ -31,7 +30,7 @@ def log(msg: str):
 # ---------------------------
 # Env / Config
 # ---------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "max2-2025-08-23")
+APP_VERSION = os.environ.get("APP_VERSION", "extractive-2025-08-23")
 
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Mini-3B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
@@ -42,20 +41,23 @@ MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "1200"))
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
-# Sentiment (kept CPU-friendly by default)
+# Sentiment (CPU by default to avoid NVRTC issues)
 SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli").strip()
 SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()  # "zero-shot" or "classifier"
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
 SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
 
-# NEW: limit speakers
+# Diarization speaker limit
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))  # hard cap in diarization call
-EXACT_TWO = os.environ.get("EXACT_TWO", "0") == "1"       # if true, force exactly 2 speakers
+EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"       # force exactly 2 by défaut
 
-# Optional UX toggles
+# Behavior toggles
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
 FACTUAL_SUMMARY = os.environ.get("FACTUAL_SUMMARY", "1") == "1"
 ROLE_LABELS = [r.strip() for r in os.environ.get("ROLE_LABELS", "Agent,Client").split(",") if r.strip()]
+
+# Extractive (faithful) summary based on transcript only
+EXTRACTIVE_SUMMARY = os.environ.get("EXTRACTIVE_SUMMARY", "1") == "1"
 
 # Globals
 _processor = None
@@ -102,16 +104,14 @@ def load_voxtral():
         return _processor, _model
 
     dtype = _select_dtype()
-    log(f"[INIT] Loading Voxtral: {MODEL_ID} dtype={dtype}")
+    log(f"[INIT] Loading Voxtral: {MODEL_ID} torch_dtype={dtype}")
 
     proc_kwargs = {}
     if HF_TOKEN:
         proc_kwargs["token"] = HF_TOKEN
     _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
 
-    mdl_kwargs = {"dtype": dtype}
-    if torch.cuda.is_available():
-        mdl_kwargs["device_map"] = {"": 0}
+    mdl_kwargs = {"torch_dtype": dtype, "device_map": "auto"}
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
 
@@ -119,6 +119,20 @@ def load_voxtral():
         _model = VoxtralForConditionalGeneration.from_pretrained(MODEL_ID, **mdl_kwargs)
     else:
         raise RuntimeError("Transformers build without VoxtralForConditionalGeneration. Update transformers@main.")
+
+    # Fallback: ensure CUDA
+    try:
+        if torch.cuda.is_available():
+            _model.to(torch.device("cuda"))
+    except Exception as e:
+        log(f"[WARN] Could not move Voxtral to CUDA explicitly: {e}")
+
+    # Log device/dtype
+    try:
+        p = next(_model.parameters())
+        log(f"[INIT] Voxtral device={p.device}, dtype={p.dtype}")
+    except Exception:
+        pass
 
     log("[INIT] Voxtral ready.")
     return _processor, _model
@@ -174,7 +188,7 @@ def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict
 
     gen_kwargs = dict(max_new_tokens=max_new_tokens, temperature=TEMPERATURE, top_p=TOP_P)
     start = time.time()
-    outputs = model.generate(**gen_kwargs, **inputs)
+    outputs = model.generate(**inputs, **gen_kwargs)
     elapsed = time.time() - start
 
     decoded = processor.batch_decode(outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
@@ -296,6 +310,66 @@ def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, An
     return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": norm[label_en], "scores": norm}
 
 # ---------------------------
+# Extractive summary helpers
+# ---------------------------
+def _is_filler(text: str) -> bool:
+    t = (text or "").lower().strip()
+    fillers = [
+        "bonjour", "bonsoir", "au revoir", "bonne soirée", "bon week-end",
+        "merci", "merci beaucoup", "je vous en prie"
+    ]
+    return any(t == f or t.startswith(f + ".") for f in fillers)
+
+def extractive_summary_from_segments(segments, max_bullets=6) -> str:
+    bullets = []
+    # 1) Demande du client
+    for s in segments:
+        if s["speaker"].lower().startswith("client") and not _is_filler(s["text"]):
+            if any(k in s["text"].lower() for k in ["veux", "voudrais", "savoir", "possible", "peux", "pouvez", "je veux", "je voudrais"]):
+                bullets.append(f"Le **client** demande : « {s['text']} »")
+                break
+    # 2) Réponse/proposition de l’agent
+    for s in segments:
+        if s["speaker"].lower().startswith("agent") and not _is_filler(s["text"]):
+            if any(k in s["text"].lower() for k in ["laisser un message", "rappeler", "transmettre", "je vais", "je le transmets", "je m'en occupe"]):
+                bullets.append(f"L’**agent** propose : « {s['text']} »")
+                break
+    # 3) Confirmation du client
+    for s in segments:
+        if s["speaker"].lower().startswith("client") and not _is_filler(s["text"]):
+            if any(k in s["text"].lower() for k in ["oui", "d'accord", "ok", "c'est ça"]):
+                bullets.append(f"**Confirmation du client** : « {s['text']} »")
+                break
+    # 4) Engagement / action de l’agent
+    for s in segments:
+        if s["speaker"].lower().startswith("agent") and not _is_filler(s["text"]):
+            if any(k in s["text"].lower() for k in ["je vais le transmettre", "je le transmets", "je transmets", "je m'en occupe"]):
+                bullets.append(f"L’**agent** s’engage : « {s['text']} »")
+                break
+    # 5) Remerciements
+    for s in segments:
+        if "merci" in (s["text"] or "").lower():
+            bullets.append("**Remerciements échangés.**")
+            break
+    # 6) Clôture
+    for s in segments:
+        if "au revoir" in (s["text"] or "").lower():
+            bullets.append("**Fin d’appel : salutations.**")
+            break
+
+    # Compléter si trop court avec des phrases non-remplissage
+    if len(bullets) < 3:
+        for s in segments:
+            if not _is_filler(s["text"]):
+                bullets.append(f"{s['speaker']} : « {s['text']} »")
+            if len(bullets) >= max_bullets:
+                break
+
+    if not bullets:
+        return "Résumé indisponible (aucun contenu exploitable)."
+    return "- " + "\n- ".join(bullets[:max_bullets])
+
+# ---------------------------
 # Enforce MAX 2 speakers post-process (safety net)
 # ---------------------------
 def _enforce_max_two_speakers(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -354,6 +428,7 @@ def _map_roles(segments: List[Dict[str, Any]]):
 # Core flow
 # ---------------------------
 def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
+    # Duration guard
     try:
         import soundfile as sf
         info = sf.info(wav_path)
@@ -416,7 +491,7 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
         except Exception:
             pass
 
-    # Safety net: if diarizer still produced >2, clamp to 2
+    # Safety net: enforce max 2 speakers
     segments = _enforce_max_two_speakers(segments)
 
     # Optional role mapping
@@ -428,9 +503,12 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
     result = {"segments": segments, "transcript": full_transcript}
 
     if with_summary:
-        conv_sum = _build_conv_summary(wav_path, language, max_sentences=None, style="Résumé clair en français, à puces si pertinent.")
-        s = run_voxtral(conv_sum, max_new_tokens=max_new_tokens)
-        result["summary"] = s.get("text", "")
+        if EXTRACTIVE_SUMMARY:
+            result["summary"] = extractive_summary_from_segments(segments)
+        else:
+            conv_sum = _build_conv_summary(wav_path, language, max_sentences=None, style="Résumé clair en français, à puces si pertinent.")
+            s = run_voxtral(conv_sum, max_new_tokens=max_new_tokens)
+            result["summary"] = s.get("text", "")
 
     if ENABLE_SENTIMENT:
         result["mood_overall"] = aggregate_mood(weighted_moods)
@@ -469,8 +547,21 @@ def health():
         "exact_two": EXACT_TWO,
         "strict_transcription": STRICT_TRANSCRIPTION,
         "factual_summary": FACTUAL_SUMMARY,
+        "extractive_summary": EXTRACTIVE_SUMMARY,
         "role_labels": ROLE_LABELS,
     }
+    try:
+        if _model is not None:
+            p = next(_model.parameters())
+            info["voxtral_device"] = str(p.device)
+            info["voxtral_dtype"]  = str(p.dtype)
+        else:
+            info["voxtral_device"] = None
+            info["voxtral_dtype"]  = None
+    except Exception:
+        info["voxtral_device"] = "unknown"
+        info["voxtral_dtype"]  = "unknown"
+
     errors = {}
     try:
         load_voxtral()
@@ -521,6 +612,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 return out
             return {"task": "transcribe_diarized", **out}
         elif task in ("summary", "summarize"):
+            # Summary directly from whole audio if needed
             conv = _build_conv_summary(local_path, language, inp.get("max_sentences"), inp.get("style"))
             out = run_voxtral(conv, max_new_tokens=max_new_tokens)
             return {"task": "summary", **out}
