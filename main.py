@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, time, base64, tempfile, uuid, requests, json, traceback, re
+import os, time, base64, tempfile, uuid, requests, json, traceback, re, signal
 from typing import Optional, List, Dict, Any, Tuple
 
 import torch
@@ -31,14 +31,14 @@ def log(msg: str):
         print(msg, flush=True)
 
 # ---------------------------
-# Env / Config
+# Env / Config - OPTIMISÉ POUR SMALL
 # ---------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "stable-2025-08-25")
+APP_VERSION = os.environ.get("APP_VERSION", "small-optimized-2025-08-25")
 
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "512"))
-MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "1200"))
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "128"))      # OPTIMISÉ : 512→128
+MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "300"))      # OPTIMISÉ : 1200→300
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
@@ -51,11 +51,11 @@ SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
 # Diarization speaker limit
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
 EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"   # force exactement 2 si possible
-MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "0.35"))  # secondes
+MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "0.8"))         # OPTIMISÉ : 0.35→0.8
 
 # Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
-# Résumé par défaut: concis & fidèle (pas des morceaux recopiés)
+# Résumé par défaut: génératif intelligent
 CONCISE_SUMMARY = os.environ.get("CONCISE_SUMMARY", "1") == "1"
 EXTRACTIVE_SUMMARY = os.environ.get("EXTRACTIVE_SUMMARY", "0") == "1"
 
@@ -92,10 +92,28 @@ def _b64_to_tmp(b64: str) -> str:
         f.write(raw)
     return path
 
-# ---------------------------
-# Voxtral
-# ---------------------------
+def check_gpu_memory():
+    """Vérifier la mémoire GPU disponible"""
+    if torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9  # GB
+        allocated = torch.cuda.memory_allocated(0) / 1e9
+        cached = torch.cuda.memory_reserved(0) / 1e9
+        free = total - cached
+        
+        log(f"[GPU] Total: {total:.1f}GB | Allocated: {allocated:.1f}GB | Cached: {cached:.1f}GB | Free: {free:.1f}GB")
+        
+        if total < 45:  # Moins de 45GB = problème pour Small
+            log(f"[ERROR] GPU has only {total:.1f}GB - Voxtral Small needs ~55GB minimum")
+            return False
+        elif free < 10:  # Moins de 10GB libres
+            log(f"[WARN] Only {free:.1f}GB free - might cause OOM")
+            
+        return True
+    return False
 
+# ---------------------------
+# Voxtral - OPTIMISÉ POUR SMALL
+# ---------------------------
 def load_voxtral():
     global _processor, _model
     if _processor is not None and _model is not None:
@@ -148,52 +166,6 @@ def load_voxtral():
     log("[INIT] Voxtral ready.")
     return _processor, _model
 
-# ---------------------------
-# AJOUTEZ ces variables d'environnement pour RunPod
-# ---------------------------
-
-# Timeouts étendus pour Small
-MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "600"))      # Réduit de 1200 à 600
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "256"))      # Réduit de 512 à 256
-
-# ---------------------------
-# OPTIONNEL : Vérification mémoire au startup
-# Ajoutez cette fonction après load_voxtral()
-# ---------------------------
-
-def check_gpu_memory():
-    """Vérifier la mémoire GPU disponible"""
-    if torch.cuda.is_available():
-        total = torch.cuda.get_device_properties(0).total_memory / 1e9  # GB
-        allocated = torch.cuda.memory_allocated(0) / 1e9
-        cached = torch.cuda.memory_reserved(0) / 1e9
-        free = total - cached
-        
-        log(f"[GPU] Total: {total:.1f}GB | Allocated: {allocated:.1f}GB | Cached: {cached:.1f}GB | Free: {free:.1f}GB")
-        
-        if total < 45:  # Moins de 45GB = problème pour Small
-            log(f"[ERROR] GPU has only {total:.1f}GB - Voxtral Small needs ~55GB minimum")
-            return False
-        elif free < 10:  # Moins de 10GB libres
-            log(f"[WARN] Only {free:.1f}GB free - might cause OOM")
-            
-        return True
-    return False
-
-# Appelez cette fonction dans le preload :
-# À la fin du fichier, modifiez :
-
-# Preload (chaud) avec vérification mémoire
-try:
-    if not check_gpu_memory():
-        log("[CRITICAL] Insufficient GPU memory for Voxtral Small - consider using Mini")
-    load_voxtral()
-    load_diarizer()
-    if ENABLE_SENTIMENT:
-        load_sentiment()
-except Exception as e:
-    log(f"[WARN] Deferred load: {e}")
-
 def _move_to_device_no_cast(batch, device: str):
     # Déplace uniquement sur device, sans modifier dtype
     if hasattr(batch, "to"):
@@ -240,6 +212,31 @@ def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict
     inp_len = _input_len_from_batch(inputs)
     decoded = processor.batch_decode(outputs[:, inp_len:], skip_special_tokens=True)
     return {"text": decoded[0] if decoded else "", "latency_s": dt}
+
+def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens: int, timeout: int = 45) -> Dict[str, Any]:
+    """
+    Wrapper avec timeout pour éviter les requêtes infinies
+    """
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Voxtral inference timed out after {timeout}s")
+    
+    # Setup timeout
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(timeout)
+    
+    try:
+        result = run_voxtral(conversation, max_new_tokens)
+        signal.alarm(0)  # Cancel timeout
+        return result
+    except TimeoutError as e:
+        log(f"[TIMEOUT] {e}")
+        return {"text": "", "latency_s": timeout}
+    except Exception as e:
+        signal.alarm(0)
+        log(f"[ERROR] Voxtral inference failed: {e}")
+        return {"text": "", "latency_s": 0}
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)
 
 def _build_conv_transcribe(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
     lang_prefix = f"lang:{language} " if language else ""
@@ -415,7 +412,7 @@ def extractive_summary_from_segments(segments, max_bullets=6) -> str:
     for s in segments:
         if s["speaker"].lower().startswith("agent") and not _is_filler(s["text"]):
             if any(k in s["text"].lower() for k in ["je vais", "je transmets", "je m'en occupe", "je peux vous proposer", "on peut"]):
-                bullets.append(f"**Réponse de l’agent** : « {s['text']} »")
+                bullets.append(f"**Réponse de l'agent** : « {s['text']} »")
                 break
     # confirmation client
     for s in segments:
@@ -428,7 +425,7 @@ def extractive_summary_from_segments(segments, max_bullets=6) -> str:
         bullets.append("**Remerciements échangés.**")
     # clôture
     if any("au revoir" in (s["text"] or "").lower() for s in segments):
-        bullets.append("**Fin d’appel.**")
+        bullets.append("**Fin d'appel.**")
 
     if not bullets:
         for s in segments:
@@ -465,9 +462,9 @@ def concise_summary_from_segments(segments, max_lines=6) -> str:
     lines = []
     if demande: lines.append(f"Demande: {demande}")
     if motif and motif != demande: lines.append(f"Motif: {motif}")
-    if action: lines.append(f"Action de l’agent: {action}")
+    if action: lines.append(f"Action de l'agent: {action}")
 
-    # Tentative d’extraction simple de date/heure/adresse/numéro
+    # Tentative d'extraction simple de date/heure/adresse/numéro
     candidates = []
     for s in segments:
         t = s.get("text","")
@@ -496,6 +493,102 @@ def concise_summary_from_segments(segments, max_lines=6) -> str:
             lines.append(c)
 
     return "\n".join(lines[:max_lines]) if lines else "Résumé indisponible."
+
+# ---------------------------
+# NOUVEAUX RÉSUMÉS GÉNÉRATIFS INTELLIGENTS
+# ---------------------------
+
+def generate_smart_summary_from_transcript(full_transcript: str, language: Optional[str] = None) -> str:
+    """
+    Utilise Voxtral pour générer un résumé intelligent à partir du transcript complet.
+    Plus efficace et cohérent que l'extraction basique.
+    """
+    if not full_transcript.strip():
+        return "Résumé indisponible."
+    
+    # Instructions très précises pour un résumé professionnel
+    lang_prefix = f"lang:{language} " if language else ""
+    instruction = (
+        f"{lang_prefix}Résume cette conversation téléphonique en 2-3 phrases courtes et professionnelles. "
+        "Format attendu: 'Le client [demande/action]. L'agent [réponse]. [Résultat final].' "
+        "Sois factuel, concis, sans détails superflus. Focus sur l'essentiel business."
+    )
+    
+    # Conversation pour Voxtral avec le transcript en mode texte
+    conversation = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": f"{instruction}\n\nConversation:\n{full_transcript}"}
+        ]
+    }]
+    
+    try:
+        result = run_voxtral_with_timeout(conversation, max_new_tokens=96, timeout=30)  # Court pour résumé concis
+        summary = (result.get("text") or "").strip()
+        
+        # Validation basique de qualité
+        if len(summary) < 15 or "résumé" in summary.lower() or summary.startswith("Je"):
+            log("[WARN] Generated summary seems poor, falling back to extractive")
+            return fallback_extractive_summary(full_transcript)
+        
+        return summary
+        
+    except Exception as e:
+        log(f"[WARN] Generative summary failed: {e}")
+        return fallback_extractive_summary(full_transcript)
+
+def fallback_extractive_summary(transcript: str) -> str:
+    """
+    Résumé extractif simple et robuste en cas d'échec du génératif.
+    Plus intelligent que la version précédente.
+    """
+    lines = [l.strip() for l in transcript.split('\n') if l.strip() and len(l.strip()) > 5]
+    
+    if not lines:
+        return "Conversation très courte."
+    
+    # Recherche patterns métier améliorés
+    client_demand = None
+    agent_response = None
+    
+    # Mots-clés pour identifier les demandes importantes
+    demand_keywords = ["voulais", "voudrais", "besoin", "demande", "rdv", "rendez-vous", 
+                      "disponib", "possible", "consultation", "docteur", "savoir", "question"]
+    
+    # Mots-clés pour identifier les réponses importantes  
+    response_keywords = ["non", "oui", "pas", "disponib", "possible", "je vais", "désolé", 
+                        "malheureusement", "aujourd'hui", "demain"]
+    
+    for line in lines:
+        if line.startswith("Client:"):
+            client_text = line.replace("Client:", "").strip()
+            # Score la ligne selon pertinence business
+            score = len(client_text) + sum(5 for kw in demand_keywords if kw in client_text.lower())
+            if score > 20 and not client_demand:  # Seuil de pertinence
+                client_demand = client_text
+                
+        elif line.startswith("Agent:"):
+            agent_text = line.replace("Agent:", "").strip()
+            # Éviter les simples politesses
+            if len(agent_text) > 8 and not agent_text.lower().strip() in ["bonjour", "bonsoir", "au revoir"]:
+                score = len(agent_text) + sum(3 for kw in response_keywords if kw in agent_text.lower())
+                if score > 15 and not agent_response:
+                    agent_response = agent_text
+    
+    # Construction résumé structuré
+    parts = []
+    if client_demand:
+        parts.append(f"Demande: {client_demand}")
+    if agent_response:
+        parts.append(f"Réponse: {agent_response}")
+    
+    # Fallback si patterns échouent
+    if not parts:
+        # Prendre les 2 segments les plus substantiels
+        substantial_lines = [l for l in lines if len(l) > 20]
+        parts = substantial_lines[:2] if substantial_lines else lines[:2]
+    
+    return " | ".join(parts) if parts else "Conversation courte."
 
 # ---------------------------
 # Post-traitements segments
@@ -550,7 +643,7 @@ def _map_roles(segments: List[Dict[str, Any]]):
         s["speaker"] = mapping.get(s["speaker"], s["speaker"])
 
 # ---------------------------
-# Core flow
+# Core flow - OPTIMISÉ POUR SMALL
 # ---------------------------
 def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
     # Durée max
@@ -586,20 +679,30 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
         start_s = float(turn.start)
         end_s = float(turn.end)
         dur_s = max(0.0, end_s - start_s)
+        
+        # OPTIMISÉ : Ignore segments très courts pour Small (économise temps)
         if dur_s < MIN_SEG_DUR:
-            continue  # ignore micro-segments
-
+            continue
+        
+        # OPTIMISÉ : Segments très courts = transcription simplifiée
+        if dur_s < 2.0:  # Moins de 2 secondes
+            max_tokens_segment = 32  # Très peu de tokens
+            timeout_segment = 15     # Timeout court
+        else:
+            max_tokens_segment = min(max_new_tokens, 64)  # Tokens normaux mais limités
+            timeout_segment = 30     # Timeout normal
+        
         seg_audio = audio[int(start_s * 1000): int(end_s * 1000)]
         tmp = os.path.join(tempfile.gettempdir(), f"seg_{speaker}_{int(start_s*1000)}.wav")
         seg_audio.export(tmp, format="wav")
 
-        # 1er essai: consigne stricte
+        # Transcription avec timeout adaptatif
         conv = _build_conv_transcribe(tmp, language)
-        out = run_voxtral(conv, max_new_tokens=max_new_tokens)
+        out = run_voxtral_with_timeout(conv, max_new_tokens=max_tokens_segment, timeout=timeout_segment)
         text = (out.get("text") or "").strip()
 
-        # Fallback si vide -> consigne simple
-        if not text:
+        # Fallback seulement si segment > 2s et vide
+        if not text and dur_s >= 2.0:
             lang_prefix = f"lang:{language} " if language else ""
             conv2 = [{
                 "role": "user",
@@ -608,8 +711,12 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
                     {"type": "text", "text": f"{lang_prefix}[TRANSCRIBE]"}
                 ],
             }]
-            out2 = run_voxtral(conv2, max_new_tokens=max_new_tokens)
+            out2 = run_voxtral_with_timeout(conv2, max_new_tokens=max_tokens_segment, timeout=timeout_segment)
             text = (out2.get("text") or "").strip()
+        
+        # Logging performance
+        if out.get("latency_s", 0) > 20:
+            log(f"[PERF] Slow transcription: {dur_s:.1f}s audio took {out.get('latency_s', 0):.1f}s")
 
         mood = classify_sentiment(text) if (ENABLE_SENTIMENT and text) else {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
 
@@ -636,15 +743,18 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
 
     result = {"segments": segments, "transcript": full_transcript}
 
-    # Résumé
+    # RÉSUMÉ GÉNÉRATIF AMÉLIORÉ
     if with_summary:
         if CONCISE_SUMMARY:
-            result["summary"] = concise_summary_from_segments(segments) if any(s.get("text") for s in segments) else "Résumé indisponible."
+            # NOUVEAU : Résumé génératif intelligent avec Voxtral
+            result["summary"] = generate_smart_summary_from_transcript(full_transcript, language)
         elif EXTRACTIVE_SUMMARY:
+            # Ancien résumé extractif (conservé en option)
             result["summary"] = extractive_summary_from_segments(segments) if any(s.get("text") for s in segments) else "Résumé indisponible."
         else:
-            conv_sum = _build_conv_summary(wav_path, language, max_sentences=None, style="Résumé clair en français.")
-            s = run_voxtral(conv_sum, max_new_tokens=max_new_tokens)
+            # Mode résumé audio direct (votre version originale)
+            conv_sum = _build_conv_summary(wav_path, language, max_sentences=3, style="Résumé professionnel concis en français.")
+            s = run_voxtral_with_timeout(conv_sum, max_new_tokens=96, timeout=30)  # Réduit pour résumé concis
             result["summary"] = s.get("text", "") or "Résumé indisponible."
 
     # Humeurs
@@ -751,11 +861,11 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             return {"task": "transcribe_diarized", **out}
         elif task in ("summary", "summarize"):
             conv = _build_conv_summary(local_path, language, inp.get("max_sentences"), inp.get("style"))
-            out = run_voxtral(conv, max_new_tokens=max_new_tokens)
+            out = run_voxtral_with_timeout(conv, max_new_tokens=96, timeout=30)
             return {"task": "summary", **out}
         else:
             conv = _build_conv_transcribe(local_path, language)
-            out = run_voxtral(conv, max_new_tokens=max_new_tokens)
+            out = run_voxtral_with_timeout(conv, max_new_tokens=min(max_new_tokens, 64), timeout=30)
             return {"task": "transcribe", **out}
 
     except Exception as e:
@@ -767,8 +877,10 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-# Preload (chaud)
+# Preload (chaud) avec vérification mémoire
 try:
+    if not check_gpu_memory():
+        log("[CRITICAL] Insufficient GPU memory for Voxtral Small - consider using Mini")
     load_voxtral()
     load_diarizer()
     if ENABLE_SENTIMENT:
