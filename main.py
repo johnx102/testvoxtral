@@ -239,15 +239,26 @@ def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens:
         signal.signal(signal.SIGALRM, old_handler)
 
 def _build_conv_transcribe(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
-    lang_prefix = f"lang:{language} " if language else ""
+    # Force le français si pas spécifié explicitement
+    if not language:
+        language = "fr"  # NOUVEAU : force français par défaut
+    
+    lang_prefix = f"lang:{language} " if language else "lang:fr "
+    
     if STRICT_TRANSCRIPTION:
         constraints = (
-            "Transcris mot à mot, sans ajout, sans traduction, sans paraphrase. "
-            "Garde la langue source et la ponctuation."
+            "TRANSCRIPTION TEXTUELLE EXACTE UNIQUEMENT. "
+            "Reproduis chaque mot exactement comme prononcé. "
+            "AUCUNE traduction, AUCUN ajout, AUCUNE correction. "
+            "Si c'est du français, reste en français. "
+            "Si inaudible: [inaudible]. "
+            "Pas de ponctuation excessive. "
+            "ZÉRO interprétation."
         )
         instruction = f"{lang_prefix}[TRANSCRIBE] {constraints}"
     else:
-        instruction = f"{lang_prefix}[TRANSCRIBE]"
+        instruction = f"{lang_prefix}[TRANSCRIBE] Mot à mot, langue originale uniquement."
+    
     return [{
         "role": "user",
         "content": [
@@ -255,6 +266,108 @@ def _build_conv_transcribe(local_path: str, language: Optional[str]) -> List[Dic
             {"type": "text", "text": instruction},
         ],
     }]
+
+# ---------------------------
+# AJOUTEZ cette fonction alternative pour tester
+# ---------------------------
+
+def _build_conv_transcribe_ultra_strict(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
+    """Version ultra-stricte pour éviter les hallucinations"""
+    return [{
+        "role": "user",
+        "content": [
+            {"type": "audio", "path": local_path},
+            {"type": "text", "text": "lang:fr [TRANSCRIBE] Écris exactement ce qui est dit, mot pour mot, en français uniquement."}
+        ],
+    }]
+
+# ---------------------------
+# MODIFIEZ la boucle de transcription dans diarize_then_transcribe()
+# Remplacez la partie transcription par :
+# ---------------------------
+
+        # VERSION ULTRA-STRICTE pour éviter hallucinations
+        if dur_s < 2.0:  # Segments courts
+            max_tokens_segment = 24   # RÉDUIT : 32→24
+            timeout_segment = 15
+        else:
+            max_tokens_segment = 48   # RÉDUIT : 64→48  
+            timeout_segment = 25      # RÉDUIT : 30→25
+
+        seg_audio = audio[int(start_s * 1000): int(end_s * 1000)]
+        tmp = os.path.join(tempfile.gettempdir(), f"seg_{speaker}_{int(start_s*1000)}.wav")
+        seg_audio.export(tmp, format="wav")
+
+        # Essai 1 : Version ultra-stricte
+        conv = _build_conv_transcribe_ultra_strict(tmp, "fr")
+        out = run_voxtral_with_timeout(conv, max_new_tokens=max_tokens_segment, timeout=timeout_segment)
+        text = (out.get("text") or "").strip()
+
+        # Fallback seulement si vide ET segment > 1.5s
+        if not text and dur_s >= 1.5:
+            log(f"[FALLBACK] Empty transcription for {dur_s:.1f}s segment")
+            conv2 = [{
+                "role": "user",
+                "content": [
+                    {"type": "audio", "path": tmp},
+                    {"type": "text", "text": "lang:fr [TRANSCRIBE]"}  # Minimal prompt
+                ],
+            }]
+            out2 = run_voxtral_with_timeout(conv2, max_new_tokens=max_tokens_segment, timeout=timeout_segment)
+            text = (out2.get("text") or "").strip()
+
+        # NOUVEAU : Filtre post-transcription pour éliminer aberrations
+        text = clean_transcription_result(text, dur_s)
+
+# ---------------------------
+# AJOUTEZ cette fonction de nettoyage
+# ---------------------------
+
+def clean_transcription_result(text: str, duration_s: float) -> str:
+    """
+    Nettoie le résultat de transcription pour éliminer les aberrations
+    """
+    if not text:
+        return ""
+    
+    text = text.strip()
+    
+    # Filtre 1: Segments suspects (hallucinations communes de Voxtral)
+    suspicious_phrases = [
+        "so, you're making",
+        "in fact, i have",
+        "tell me the price",
+        "thank you very much",
+        "i think it's",
+        "after that, it can",
+        "and sometimes it even",
+    ]
+    
+    text_lower = text.lower()
+    for phrase in suspicious_phrases:
+        if phrase in text_lower and duration_s < 3.0:  # Phrases longues dans segments courts = suspect
+            log(f"[FILTER] Suspicious phrase detected: '{text}' (duration: {duration_s:.1f}s)")
+            return ""  # Vide plutôt qu'hallucination
+    
+    # Filtre 2: Mots anglais suspects dans conversation française
+    english_words = ["for", "this", "week", "yes", "of", "course", "telephone", "number", "what", "age", "please"]
+    words = text.lower().split()
+    english_ratio = sum(1 for word in words if word in english_words) / max(len(words), 1)
+    
+    if english_ratio > 0.4 and duration_s < 4.0:  # Plus de 40% anglais dans segment court
+        log(f"[FILTER] Too much English detected: '{text}' (ratio: {english_ratio:.1%})")
+        return ""
+    
+    # Filtre 3: Segments trop longs pour la durée audio (hallucination)
+    words_count = len(text.split())
+    max_expected_words = int(duration_s * 4)  # ~4 mots/seconde max
+    
+    if words_count > max_expected_words * 1.5:  # 50% de marge
+        log(f"[FILTER] Too many words for duration: {words_count} words in {duration_s:.1f}s")
+        return text.split()[:max_expected_words]  # Tronquer
+    
+    return text
+
 
 def _build_conv_summary(local_path: str, language: Optional[str], max_sentences: Optional[int], style: Optional[str]) -> List[Dict[str, Any]]:
     parts = []
