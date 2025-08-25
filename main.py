@@ -95,6 +95,7 @@ def _b64_to_tmp(b64: str) -> str:
 # ---------------------------
 # Voxtral
 # ---------------------------
+
 def load_voxtral():
     global _processor, _model
     if _processor is not None and _model is not None:
@@ -107,7 +108,16 @@ def load_voxtral():
         proc_kwargs["token"] = HF_TOKEN
     _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
 
-    mdl_kwargs = {"device_map": "auto"}
+    # MÉMOIRE GPU OPTIMISÉE pour Small 24B
+    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
+    log(f"[INIT] Using dtype: {dtype}")
+    
+    mdl_kwargs = {
+        "torch_dtype": dtype,          # CRUCIAL : force dtype optimal
+        "device_map": "auto",
+        "low_cpu_mem_usage": True,     # NOUVEAU : économise RAM CPU
+        "max_memory": {0: "50GB"}      # NOUVEAU : limite explicite GPU 0
+    }
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
 
@@ -116,21 +126,73 @@ def load_voxtral():
     else:
         raise RuntimeError("Transformers sans VoxtralForConditionalGeneration. Utiliser transformers@main/nightly.")
 
-    # S'assurer que le modèle est bien sur CUDA si dispo
-    try:
-        if torch.cuda.is_available():
-            _model.to(torch.device("cuda"))
-    except Exception as e:
-        log(f"[WARN] Could not move Voxtral to CUDA explicitly: {e}")
+    # PAS de .to() explicite - laisse device_map gérer
+    log("[INIT] Skipping explicit .to() - letting device_map handle placement")
 
     try:
         p = next(_model.parameters())
         log(f"[INIT] Voxtral device={p.device}, dtype={p.dtype}")
-    except Exception:
-        pass
+        
+        # Vérification que le modèle est majoritairement sur GPU
+        gpu_params = sum(1 for p in _model.parameters() if p.device.type == 'cuda')
+        total_params = sum(1 for p in _model.parameters())
+        gpu_ratio = gpu_params / total_params if total_params > 0 else 0
+        log(f"[INIT] GPU params ratio: {gpu_ratio:.2f} ({gpu_params}/{total_params})")
+        
+        if gpu_ratio < 0.8:
+            log(f"[WARN] Only {gpu_ratio:.1%} of model on GPU - expect slow performance")
+            
+    except Exception as e:
+        log(f"[WARN] Could not check model device: {e}")
 
     log("[INIT] Voxtral ready.")
     return _processor, _model
+
+# ---------------------------
+# AJOUTEZ ces variables d'environnement pour RunPod
+# ---------------------------
+
+# Timeouts étendus pour Small
+MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "600"))      # Réduit de 1200 à 600
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "256"))      # Réduit de 512 à 256
+
+# ---------------------------
+# OPTIONNEL : Vérification mémoire au startup
+# Ajoutez cette fonction après load_voxtral()
+# ---------------------------
+
+def check_gpu_memory():
+    """Vérifier la mémoire GPU disponible"""
+    if torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9  # GB
+        allocated = torch.cuda.memory_allocated(0) / 1e9
+        cached = torch.cuda.memory_reserved(0) / 1e9
+        free = total - cached
+        
+        log(f"[GPU] Total: {total:.1f}GB | Allocated: {allocated:.1f}GB | Cached: {cached:.1f}GB | Free: {free:.1f}GB")
+        
+        if total < 45:  # Moins de 45GB = problème pour Small
+            log(f"[ERROR] GPU has only {total:.1f}GB - Voxtral Small needs ~55GB minimum")
+            return False
+        elif free < 10:  # Moins de 10GB libres
+            log(f"[WARN] Only {free:.1f}GB free - might cause OOM")
+            
+        return True
+    return False
+
+# Appelez cette fonction dans le preload :
+# À la fin du fichier, modifiez :
+
+# Preload (chaud) avec vérification mémoire
+try:
+    if not check_gpu_memory():
+        log("[CRITICAL] Insufficient GPU memory for Voxtral Small - consider using Mini")
+    load_voxtral()
+    load_diarizer()
+    if ENABLE_SENTIMENT:
+        load_sentiment()
+except Exception as e:
+    log(f"[WARN] Deferred load: {e}")
 
 def _move_to_device_no_cast(batch, device: str):
     # Déplace uniquement sur device, sans modifier dtype
