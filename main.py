@@ -154,9 +154,11 @@ def _input_len_from_batch(inputs) -> int:
 
 def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict[str, Any]:
     processor, model = load_voxtral()
+    
+    # Voxtral ne supporte pas add_generation_prompt - essai avec, puis sans
     try:
         inputs = processor.apply_chat_template(conversation, add_generation_prompt=True)
-    except TypeError:
+    except (TypeError, ValueError):  # Capture ValueError aussi !
         inputs = processor.apply_chat_template(conversation)
 
     device = _device_str()
