@@ -1,16 +1,7 @@
-import re
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-RunPod Serverless — Voxtral + PyAnnote (strict 2 speakers) + résumé concis + humeur
-Base: dernière version fournie par l'utilisateur (fonctionnelle), avec ces améliorations :
-- Diarization stricte à 2 locuteurs via pyannote (exact_two par défaut).
-- Transcription STRICTE par segment avec le mode transcription natif de Voxtral (pas de chat), donc pas d'interprétation.
-- Résumé concis (2–3 phrases) construit de façon extractive à partir du transcript (sans LLM), pour éviter les dérapages.
-- Conserve le pipeline d'humeur existant.
-"""
 
-import os, time, base64, tempfile, uuid, requests, json, traceback, io, re
+import os, time, base64, tempfile, uuid, requests, json, traceback, re
 from typing import Optional, List, Dict, Any, Tuple
 
 import torch
@@ -19,7 +10,7 @@ from transformers import (
     pipeline as hf_pipeline
 )
 
-# Voxtral class (requires transformers@main)
+# Voxtral class (transformers @ main / nightly)
 try:
     from transformers import VoxtralForConditionalGeneration  # type: ignore
     _HAS_VOXTRAL_CLASS = True
@@ -30,11 +21,9 @@ except Exception:
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
 import runpod
-import soundfile as sf
-import numpy as np
 
 # ---------------------------
-# Logging
+# Logging minimal
 # ---------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 def log(msg: str):
@@ -44,29 +33,33 @@ def log(msg: str):
 # ---------------------------
 # Env / Config
 # ---------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "strict-2spk-2025-08-25")
+APP_VERSION = os.environ.get("APP_VERSION", "stable-2025-08-25")
 
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Mini-3B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "256"))
-TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.0"))
-TOP_P = float(os.environ.get("TOP_P", "0.95"))
-MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "2400"))
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "512"))
+MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "1200"))
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
-# Sentiment (CPU by default to avoid NVRTC issues)
+# Sentiment (CPU par défaut)
 SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli").strip()
-SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()  # "zero-shot" or "classifier"
+SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()  # "zero-shot" | "classifier"
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
 SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
 
 # Diarization speaker limit
-MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))  # hard cap in diarization call
-EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"       # force exactly 2 by défaut
+MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
+EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"   # force exactement 2 si possible
+MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "0.35"))  # secondes
 
-# Behavior toggles
+# Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
+# Résumé par défaut: concis & fidèle (pas des morceaux recopiés)
+CONCISE_SUMMARY = os.environ.get("CONCISE_SUMMARY", "1") == "1"
+EXTRACTIVE_SUMMARY = os.environ.get("EXTRACTIVE_SUMMARY", "0") == "1"
+
+# Libellés des rôles (après mapping)
 ROLE_LABELS = [r.strip() for r in os.environ.get("ROLE_LABELS", "Agent,Client").split(",") if r.strip()]
 
 # Globals
@@ -77,14 +70,8 @@ _sentiment_clf = None
 _sentiment_zero_shot = None
 
 # ---------------------------
-# Helpers
+# Helpers généraux
 # ---------------------------
-def _select_dtype() -> torch.dtype:
-    if torch.cuda.is_available():
-        major, _ = torch.cuda.get_device_capability(0)
-        return torch.bfloat16 if major >= 8 else torch.float16
-    return torch.float32
-
 def _device_str() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -113,31 +100,29 @@ def load_voxtral():
     if _processor is not None and _model is not None:
         return _processor, _model
 
-    dtype = _select_dtype()
-    log(f"[INIT] Loading Voxtral: {MODEL_ID} torch_dtype={dtype}")
+    log(f"[INIT] Loading Voxtral: {MODEL_ID}")
 
     proc_kwargs = {}
     if HF_TOKEN:
         proc_kwargs["token"] = HF_TOKEN
     _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
 
-    mdl_kwargs = {"torch_dtype": dtype, "device_map": "auto"}
+    mdl_kwargs = {"device_map": "auto"}
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
 
     if _HAS_VOXTRAL_CLASS:
         _model = VoxtralForConditionalGeneration.from_pretrained(MODEL_ID, **mdl_kwargs)
     else:
-        raise RuntimeError("Transformers build without VoxtralForConditionalGeneration. Update transformers@main.")
+        raise RuntimeError("Transformers sans VoxtralForConditionalGeneration. Utiliser transformers@main/nightly.")
 
-    # Fallback: ensure CUDA
+    # S'assurer que le modèle est bien sur CUDA si dispo
     try:
         if torch.cuda.is_available():
             _model.to(torch.device("cuda"))
     except Exception as e:
         log(f"[WARN] Could not move Voxtral to CUDA explicitly: {e}")
 
-    # Log device/dtype
     try:
         p = next(_model.parameters())
         log(f"[INIT] Voxtral device={p.device}, dtype={p.dtype}")
@@ -147,60 +132,89 @@ def load_voxtral():
     log("[INIT] Voxtral ready.")
     return _processor, _model
 
-def run_voxtral_chat(conversation, max_new_tokens: int) -> Dict[str, Any]:
-    """Ancien mode chat (génératif). Gardé pour résumés optionnels si besoin."""
+def _move_to_device_no_cast(batch, device: str):
+    # Déplace uniquement sur device, sans modifier dtype
+    if hasattr(batch, "to"):
+        return batch.to(device)
+    if isinstance(batch, dict):
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                batch[k] = v.to(device)
+    return batch
+
+def _input_len_from_batch(inputs) -> int:
+    try:
+        if isinstance(inputs, dict) and "input_ids" in inputs and isinstance(inputs["input_ids"], torch.Tensor):
+            return inputs["input_ids"].shape[1]
+        elif hasattr(inputs, "input_ids") and isinstance(inputs.input_ids, torch.Tensor):
+            return inputs.input_ids.shape[1]
+    except Exception:
+        pass
+    return 0
+
+def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict[str, Any]:
     processor, model = load_voxtral()
-    inputs = processor.apply_chat_template(conversation)
-    dtype = _select_dtype()
+    try:
+        inputs = processor.apply_chat_template(conversation, add_generation_prompt=True)
+    except TypeError:
+        inputs = processor.apply_chat_template(conversation)
+
     device = _device_str()
-    inputs = inputs.to(device, dtype=dtype)
+    inputs = _move_to_device_no_cast(inputs, device)
 
-    gen_kwargs = dict(max_new_tokens=max_new_tokens, temperature=TEMPERATURE, top_p=TOP_P, do_sample=(TEMPERATURE>0.0))
-    start = time.time()
-    outputs = model.generate(**inputs, **gen_kwargs)
-    elapsed = time.time() - start
-
-    decoded = processor.batch_decode(outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
-    return {"text": decoded[0] if decoded else "", "latency_s": round(elapsed, 3)}
-
-def vox_strict_transcribe_file(wav_path: str, language: Optional[str]) -> str:
-    """
-    Utilise le mode transcription natif de Voxtral pour un chunk audio.
-    Zéro sampling, pas d'interprétation. Retourne une chaîne brute.
-    """
-    processor, model = load_voxtral()
-    # lire audio
-    data, sr = sf.read(wav_path, dtype="float32", always_2d=False)
-    if data.ndim == 2:
-        data = data.mean(axis=1)
-    # certains conteneurs peuvent avoir d'autres SR; Voxtral peut gérer, sinon pydub peut rééchantillonner en amont
-    inputs = processor.apply_transcription_request(
-        language=language or "auto",
-        audio=data,
-        model_id=MODEL_ID,
-        sampling_rate=sr,
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=False,     # déterministe pour la transcription
+        temperature=None,
+        top_p=None,
     )
-    # déplacer sur device
-    todev = {}
-    for k, v in inputs.items():
-        if hasattr(v, "to"):
-            todev[k] = v.to(_device_str(), dtype=_select_dtype())
-        else:
-            todev[k] = v
-    with torch.no_grad():
-        out = _model.generate(
-            **todev,
-            max_new_tokens=256,
-            do_sample=False,
-            num_beams=1,
+
+    t0 = time.time()
+    outputs = model.generate(**inputs, **gen_kwargs)
+    dt = round(time.time() - t0, 3)
+
+    inp_len = _input_len_from_batch(inputs)
+    decoded = processor.batch_decode(outputs[:, inp_len:], skip_special_tokens=True)
+    return {"text": decoded[0] if decoded else "", "latency_s": dt}
+
+def _build_conv_transcribe(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
+    lang_prefix = f"lang:{language} " if language else ""
+    if STRICT_TRANSCRIPTION:
+        constraints = (
+            "Transcris mot à mot, sans ajout, sans traduction, sans paraphrase. "
+            "Garde la langue source et la ponctuation."
         )
-    # décoder uniquement la continuation
-    start_idx = inputs["input_ids"].shape[1] if "input_ids" in inputs else 0
-    txt = _processor.batch_decode(out[:, start_idx:], skip_special_tokens=True)[0]
-    return (txt or "").strip()
+        instruction = f"{lang_prefix}[TRANSCRIBE] {constraints}"
+    else:
+        instruction = f"{lang_prefix}[TRANSCRIBE]"
+    return [{
+        "role": "user",
+        "content": [
+            {"type": "audio", "path": local_path},
+            {"type": "text", "text": instruction},
+        ],
+    }]
+
+def _build_conv_summary(local_path: str, language: Optional[str], max_sentences: Optional[int], style: Optional[str]) -> List[Dict[str, Any]]:
+    parts = []
+    if language:
+        parts.append(f"lang:{language}")
+    parts.append("Résumé factuel, concis, sans invention.")
+    if max_sentences:
+        parts.append(f"Résumé en {max_sentences} phrases.")
+    if style:
+        parts.append(style)
+    instruction = " ".join(parts)
+    return [{
+        "role": "user",
+        "content": [
+            {"type": "audio", "path": local_path},
+            {"type": "text", "text": instruction},
+        ],
+    }]
 
 # ---------------------------
-# Diarization (limit to max 2 speakers)
+# Diarization
 # ---------------------------
 def load_diarizer():
     global _diarizer
@@ -225,7 +239,7 @@ def load_diarizer():
     return _diarizer
 
 # ---------------------------
-# Sentiment (CPU-friendly by default)
+# Sentiment
 # ---------------------------
 def load_sentiment():
     global _sentiment_clf, _sentiment_zero_shot
@@ -315,40 +329,112 @@ def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, An
     return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": norm[label_en], "scores": norm}
 
 # ---------------------------
-# Extractive concise summary (2–3 sentences)
+# Résumés à partir des segments
 # ---------------------------
-FILLERS = {"bonjour","bonsoir","au revoir","bonne journée","bonne soirée","bon week-end","merci","merci beaucoup","je vous en prie"}
+def _is_filler(text: str) -> bool:
+    t = (text or "").lower().strip()
+    fillers = [
+        "bonjour", "bonsoir", "au revoir", "bonne soirée", "bon week-end",
+        "merci", "merci beaucoup", "je vous en prie"
+    ]
+    return any(t == f or t.startswith(f + ".") for f in fillers)
 
-def _clean_t(t: str) -> str:
-    return re.sub(r'\s+', ' ', (t or '').strip())
+def extractive_summary_from_segments(segments, max_bullets=6) -> str:
+    bullets = []
+    # demande client
+    for s in segments:
+        if s["speaker"].lower().startswith("client") and not _is_filler(s["text"]):
+            if any(k in s["text"].lower() for k in ["rendez-vous", "rdv", "je veux", "je voudrais", "savoir", "prise", "demande", "est-ce que"]):
+                bullets.append(f"**Demande du client** : « {s['text']} »")
+                break
+    # proposition agent
+    for s in segments:
+        if s["speaker"].lower().startswith("agent") and not _is_filler(s["text"]):
+            if any(k in s["text"].lower() for k in ["je vais", "je transmets", "je m'en occupe", "je peux vous proposer", "on peut"]):
+                bullets.append(f"**Réponse de l’agent** : « {s['text']} »")
+                break
+    # confirmation client
+    for s in segments:
+        if s["speaker"].lower().startswith("client") and not _is_filler(s["text"]):
+            if any(k in s["text"].lower() for k in ["oui", "d'accord", "ok", "parfait", "très bien"]):
+                bullets.append(f"**Confirmation** : « {s['text']} »")
+                break
+    # remerciements
+    if any("merci" in (s["text"] or "").lower() for s in segments):
+        bullets.append("**Remerciements échangés.**")
+    # clôture
+    if any("au revoir" in (s["text"] or "").lower() for s in segments):
+        bullets.append("**Fin d’appel.**")
 
-def _sig_utterances(segments: List[Dict[str, Any]]):
-    return [s for s in segments if _clean_t(s.get("text","")).lower() not in FILLERS and len(_clean_t(s.get("text","")))>=3]
+    if not bullets:
+        for s in segments:
+            if not _is_filler(s["text"]):
+                bullets.append(f"{s['speaker']} : « {s['text']} »")
+            if len(bullets) >= max_bullets:
+                break
 
-def concise_summary_from_segments(segments: List[Dict[str, Any]]) -> str:
-    segs = _sig_utterances(segments)
-    if not segs:
+    return "- " + "\n- ".join(bullets[:max_bullets]) if bullets else "Résumé indisponible."
+
+def concise_summary_from_segments(segments, max_lines=6) -> str:
+    """
+    Résumé court, fidèle, à partir du transcript uniquement.
+    On extrait: motif/demande, réponse/action, rendez-vous/dates/heures, infos clés.
+    """
+    text_all = " ".join([s.get("text","") for s in segments if s.get("text")]).strip()
+    if not text_all:
         return "Résumé indisponible."
-    # Intent (client)
-    intent = next((s for s in segs if s["speaker"].lower().startswith("client")), None)
-    # First meaningful agent reply
-    reply = next((s for s in segs if s["speaker"].lower().startswith("agent")), None)
-    # Outcome (last meaningful)
-    outcome = next((s for s in reversed(segs) if _clean_t(s.get("text")) and s["speaker"].lower().startswith(("agent","client"))), None)
 
-    parts = []
-    if intent:
-        parts.append(f"Le client dit : « { _clean_t(intent['text']) } ».")
-    if reply and (not outcome or reply is not outcome):
-        parts.append(f"L'agent répond/propose : « { _clean_t(reply['text']) } ».")
-    if outcome:
-        parts.append(f"Conclusion : « { _clean_t(outcome['text']) } ».")
+    def find_first(patterns, speaker_prefix=None):
+        for s in segments:
+            if speaker_prefix and not s["speaker"].lower().startswith(speaker_prefix):
+                continue
+            t = (s.get("text") or "").lower()
+            if any(p in t for p in patterns):
+                return s["text"]
+        return None
 
-    # cap to 3 sentences max; if only one, keep it.
-    return " ".join(parts[:3])
+    demande = find_first(["rendez-vous", "rdv", "prise de", "je veux", "je voudrais", "est-ce que", "savoir", "disponibil"], "client")
+    motif   = find_first(["pour", "motif", "c'est pour", "afin de"], "client")
+    action  = find_first(["je vais", "je transmets", "on peut", "je peux vous", "je propose"], "agent")
+    horaire = find_first([r"^(\d{1,2} ?h ?\d{0,2})", "à ", "le "], None)  # repère grossier
+
+    lines = []
+    if demande: lines.append(f"Demande: {demande}")
+    if motif and motif != demande: lines.append(f"Motif: {motif}")
+    if action: lines.append(f"Action de l’agent: {action}")
+
+    # Tentative d’extraction simple de date/heure/adresse/numéro
+    candidates = []
+    for s in segments:
+        t = s.get("text","")
+        if not t: continue
+        if re.search(r"\b\d{1,2}\s?h(?:\s?\d{2})?\b", t.lower()):
+            candidates.append(("Horaire", t))
+        if re.search(r"\b(\d{1,2}/\d{1,2}|\d{1,2}\s\w+)\b", t.lower()):
+            candidates.append(("Date", t))
+        if re.search(r"\b(0[1-9]|[1-9]\d)\s?\d{2}\s?\d{2}\s?\d{2}\b", t.replace("-", " ")):  # FR (très) approximatif
+            candidates.append(("Téléphone", t))
+        if any(k in t.lower() for k in ["rue", "boulevard", "avenue", "bd ", "av "]):
+            candidates.append(("Adresse", t))
+
+    # déduplique en gardant les premières occurrences parlantes
+    seen = set()
+    for k, v in candidates:
+        if k not in seen and len(lines) < max_lines:
+            lines.append(f"{k}: {v}")
+            seen.add(k)
+
+    # si rien trouvé, on prend les 2-3 interventions les plus longues (non-filler)
+    if len(lines) < 2:
+        chunks = [s["text"] for s in sorted(segments, key=lambda x: len(x.get("text","")), reverse=True)
+                  if s.get("text") and not _is_filler(s["text"])]
+        for c in chunks[:max_lines-len(lines)]:
+            lines.append(c)
+
+    return "\n".join(lines[:max_lines]) if lines else "Résumé indisponible."
 
 # ---------------------------
-# Enforce MAX 2 speakers post-process (safety net)
+# Post-traitements segments
 # ---------------------------
 def _enforce_max_two_speakers(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     speakers = list({s["speaker"] for s in segments})
@@ -386,9 +472,6 @@ def _enforce_max_two_speakers(segments: List[Dict[str, Any]]) -> List[Dict[str, 
 
     return segments
 
-# ---------------------------
-# Optional: map speakers to role labels
-# ---------------------------
 def _map_roles(segments: List[Dict[str, Any]]):
     seen = []
     for s in segments:
@@ -406,8 +489,9 @@ def _map_roles(segments: List[Dict[str, Any]]):
 # Core flow
 # ---------------------------
 def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
-    # Duration guard
+    # Durée max
     try:
+        import soundfile as sf
         info = sf.info(wav_path)
         est_dur = info.frames / float(info.samplerate or 1)
         if est_dur > MAX_DURATION_S:
@@ -416,15 +500,12 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
         pass
 
     dia = load_diarizer()
-
-    # Call diarizer with constraints to keep exactly 2 speakers when requested
     try:
         if EXACT_TWO:
             diarization = dia(wav_path, num_speakers=min(2, MAX_SPEAKERS))
         else:
             diarization = dia(wav_path, min_speakers=1, max_speakers=min(2, MAX_SPEAKERS))
     except TypeError:
-        # Different signatures across versions
         if EXACT_TWO:
             diarization = dia(wav_path, min_speakers=min(2, MAX_SPEAKERS), max_speakers=min(2, MAX_SPEAKERS))
         else:
@@ -434,7 +515,6 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
 
     segments = []
     transcript_parts = []
-
     weighted_moods = []
     mood_by_speaker_weights = {}
 
@@ -442,52 +522,70 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
         start_s = float(turn.start)
         end_s = float(turn.end)
         dur_s = max(0.0, end_s - start_s)
+        if dur_s < MIN_SEG_DUR:
+            continue  # ignore micro-segments
 
-        # exporter segment vers wav temporaire
         seg_audio = audio[int(start_s * 1000): int(end_s * 1000)]
         tmp = os.path.join(tempfile.gettempdir(), f"seg_{speaker}_{int(start_s*1000)}.wav")
         seg_audio.export(tmp, format="wav")
 
-        # *** TRANSCRIPTION STRICTE ***
-        try:
-            text = vox_strict_transcribe_file(tmp, language)
-        except Exception as e:
-            text = ""
+        # 1er essai: consigne stricte
+        conv = _build_conv_transcribe(tmp, language)
+        out = run_voxtral(conv, max_new_tokens=max_new_tokens)
+        text = (out.get("text") or "").strip()
 
-        mood = classify_sentiment(text) if ENABLE_SENTIMENT else {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
+        # Fallback si vide -> consigne simple
+        if not text:
+            lang_prefix = f"lang:{language} " if language else ""
+            conv2 = [{
+                "role": "user",
+                "content": [
+                    {"type": "audio", "path": tmp},
+                    {"type": "text", "text": f"{lang_prefix}[TRANSCRIBE]"}
+                ],
+            }]
+            out2 = run_voxtral(conv2, max_new_tokens=max_new_tokens)
+            text = (out2.get("text") or "").strip()
+
+        mood = classify_sentiment(text) if (ENABLE_SENTIMENT and text) else {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
 
         seg = {"speaker": speaker, "start": start_s, "end": end_s, "text": text, "mood": mood}
         segments.append(seg)
 
         if text:
             transcript_parts.append(f"{speaker}: {text}")
-
-        if ENABLE_SENTIMENT and dur_s > 0:
-            weighted_moods.append((mood, dur_s))
-            mood_by_speaker_weights.setdefault(speaker, []).append((mood, dur_s))
+            if ENABLE_SENTIMENT and dur_s > 0:
+                weighted_moods.append((mood, dur_s))
+                mood_by_speaker_weights.setdefault(speaker, []).append((mood, dur_s))
 
         try:
             os.remove(tmp)
         except Exception:
             pass
 
-    # Safety net: enforce max 2 speakers
+    # Safety net 2 speakers + mapping rôles
     segments = _enforce_max_two_speakers(segments)
-
-    # Optional role mapping
     _map_roles(segments)
 
-    # Rebuild transcript with mapped speaker labels
+    # Transcript final
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
 
     result = {"segments": segments, "transcript": full_transcript}
 
+    # Résumé
     if with_summary:
-        result["summary"] = concise_summary_from_segments(segments)
+        if CONCISE_SUMMARY:
+            result["summary"] = concise_summary_from_segments(segments) if any(s.get("text") for s in segments) else "Résumé indisponible."
+        elif EXTRACTIVE_SUMMARY:
+            result["summary"] = extractive_summary_from_segments(segments) if any(s.get("text") for s in segments) else "Résumé indisponible."
+        else:
+            conv_sum = _build_conv_summary(wav_path, language, max_sentences=None, style="Résumé clair en français.")
+            s = run_voxtral(conv_sum, max_new_tokens=max_new_tokens)
+            result["summary"] = s.get("text", "") or "Résumé indisponible."
 
+    # Humeurs
     if ENABLE_SENTIMENT:
         result["mood_overall"] = aggregate_mood(weighted_moods)
-        # Aggregate by (mapped) speaker label after enforcement
         per_role = {}
         for seg in segments:
             d = float(seg["end"]) - float(seg["start"])
@@ -501,7 +599,7 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
     return result
 
 # ---------------------------
-# Health / diagnostics
+# Health
 # ---------------------------
 def health():
     info = {
@@ -521,6 +619,9 @@ def health():
         "max_speakers": MAX_SPEAKERS,
         "exact_two": EXACT_TWO,
         "strict_transcription": STRICT_TRANSCRIPTION,
+        "concise_summary": CONCISE_SUMMARY,
+        "extractive_summary": EXTRACTIVE_SUMMARY,
+        "min_seg_dur": MIN_SEG_DUR,
         "role_labels": ROLE_LABELS,
     }
     try:
@@ -585,18 +686,13 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 return out
             return {"task": "transcribe_diarized", **out}
         elif task in ("summary", "summarize"):
-            # Résumé concis basé sur transcript global (transcription du fichier complet, sans diarization)
-            # Pour rester simple et robuste, on applique la transcription stricte une fois sur tout le fichier.
-            try:
-                text_full = vox_strict_transcribe_file(local_path, language)
-            except Exception as e:
-                text_full = ""
-            seg = [{"speaker": "Global", "start": 0.0, "end": 0.0, "text": text_full}]
-            return {"task": "summary", "summary": concise_summary_from_segments(seg), "transcript": text_full}
+            conv = _build_conv_summary(local_path, language, inp.get("max_sentences"), inp.get("style"))
+            out = run_voxtral(conv, max_new_tokens=max_new_tokens)
+            return {"task": "summary", **out}
         else:
-            # Transcription stricte du fichier complet sans diarization
-            text_full = vox_strict_transcribe_file(local_path, language)
-            return {"task": "transcribe", "transcript": text_full}
+            conv = _build_conv_transcribe(local_path, language)
+            out = run_voxtral(conv, max_new_tokens=max_new_tokens)
+            return {"task": "transcribe", **out}
 
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc(limit=3)}
@@ -607,7 +703,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-# Warm load
+# Preload (chaud)
 try:
     load_voxtral()
     load_diarizer()
