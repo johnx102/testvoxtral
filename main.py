@@ -10,7 +10,7 @@ Base: dernière version fournie par l'utilisateur (fonctionnelle), avec ces amé
 - Conserve le pipeline d'humeur existant.
 """
 
-import os, time, base64, tempfile, uuid, requests, json, traceback, io
+import os, time, base64, tempfile, uuid, requests, json, traceback, io, re
 from typing import Optional, List, Dict, Any, Tuple
 
 import torch
