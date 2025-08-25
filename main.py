@@ -33,7 +33,7 @@ def log(msg: str):
 # ---------------------------
 # Env / Config - ULTRA-STRICT OPTIMISÉ
 # ---------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "ultra-strict-2025-08-25")
+APP_VERSION = os.environ.get("APP_VERSION", "ultra-strict-2025-08-25-v2")
 
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
@@ -55,8 +55,8 @@ MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "1.0"))         # ULTRA-STRICT
 
 # Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
-# Résumé par défaut: génératif intelligent
-CONCISE_SUMMARY = os.environ.get("CONCISE_SUMMARY", "1") == "1"
+# NOUVEAU : Mode résumé optimisé
+SMART_SUMMARY = os.environ.get("SMART_SUMMARY", "1") == "1"  # Résumé intelligent par défaut
 EXTRACTIVE_SUMMARY = os.environ.get("EXTRACTIVE_SUMMARY", "0") == "1"
 
 # Libellés des rôles (après mapping)
@@ -324,26 +324,201 @@ def clean_transcription_result(text: str, duration_s: float) -> str:
     
     return text
 
-def _build_conv_summary(local_path: str, language: Optional[str], max_sentences: Optional[int], style: Optional[str]) -> List[Dict[str, Any]]:
-    parts = []
-    if language:
-        parts.append(f"lang:{language}")
-    parts.append("Résumé factuel, concis, sans invention.")
-    if max_sentences:
-        parts.append(f"Résumé en {max_sentences} phrases.")
-    if style:
-        parts.append(style)
-    instruction = " ".join(parts)
-    return [{
+# ---------------------------
+# RÉSUMÉS OPTIMISÉS - VERSION 2.0
+# ---------------------------
+
+def generate_natural_summary(full_transcript: str, language: Optional[str] = None) -> str:
+    """
+    Génère un résumé naturel et utile sans structure artificielle.
+    Instructions simplifiées pour des résultats plus pertinents.
+    """
+    if not full_transcript.strip():
+        return "Conversation vide."
+    
+    # Instructions optimisées pour résumés naturels et utiles
+    lang_prefix = f"lang:{language} " if language else ""
+    
+    # Instruction simple et efficace
+    instruction = (
+        f"{lang_prefix}Résume cette conversation en 1-2 phrases simples et claires. "
+        "Dis juste l'essentiel : qui appelle pourquoi, et ce qui va se passer. "
+        "Sois direct et naturel, sans format particulier."
+    )
+    
+    # Conversation pour Voxtral
+    conversation = [{
         "role": "user",
         "content": [
-            {"type": "audio", "path": local_path},
-            {"type": "text", "text": instruction},
-        ],
+            {"type": "text", "text": f"{instruction}\n\nConversation:\n{full_transcript}"}
+        ]
     }]
+    
+    try:
+        result = run_voxtral_with_timeout(conversation, max_new_tokens=72, timeout=25)
+        summary = (result.get("text") or "").strip()
+        
+        # Validation et nettoyage
+        summary = clean_generated_summary(summary)
+        
+        if not summary or len(summary) < 10:
+            log("[WARN] Generated summary too short, using extractive fallback")
+            return create_extractive_summary(full_transcript)
+        
+        return summary
+        
+    except Exception as e:
+        log(f"[ERROR] Natural summary generation failed: {e}")
+        return create_extractive_summary(full_transcript)
+
+def clean_generated_summary(summary: str) -> str:
+    """
+    Nettoie et valide les résumés générés par Voxtral.
+    """
+    if not summary:
+        return ""
+    
+    # Supprime les phrases d'introduction inutiles
+    unwanted_starts = [
+        "voici un résumé", "résumé de la conversation", "cette conversation",
+        "dans cette conversation", "le résumé", "il s'agit"
+    ]
+    
+    summary_lower = summary.lower().strip()
+    for start in unwanted_starts:
+        if summary_lower.startswith(start):
+            # Trouve la première phrase réelle après
+            sentences = re.split(r'[.!?]+', summary)
+            for sentence in sentences[1:]:
+                cleaned = sentence.strip()
+                if len(cleaned) > 15 and not any(cleaned.lower().startswith(u) for u in unwanted_starts):
+                    summary = cleaned
+                    break
+    
+    # Supprime les formats artificiels
+    patterns_to_remove = [
+        r'décision[/:].*?étape[s]?\s*:', 
+        r'prochaine[s]?\s*étape[s]?\s*:',
+        r'action[s]?\s*à\s*prendre\s*:',
+        r'conclusion\s*:',
+        r'format\s*attendu\s*:'
+    ]
+    
+    for pattern in patterns_to_remove:
+        summary = re.sub(pattern, '', summary, flags=re.IGNORECASE).strip()
+    
+    # Nettoie la ponctuation excessive
+    summary = re.sub(r'\.{2,}', '.', summary)
+    summary = re.sub(r'\s+', ' ', summary).strip()
+    
+    # Supprime les résumés qui semblent artificiels
+    artificial_indicators = [
+        "format attendu", "décision/prochaine étape", "action à prendre",
+        "structure suivante", "points suivants"
+    ]
+    
+    if any(indicator in summary.lower() for indicator in artificial_indicators):
+        return ""
+    
+    return summary
+
+def create_extractive_summary(transcript: str) -> str:
+    """
+    Résumé extractif amélioré basé sur l'analyse du contenu.
+    Plus intelligent que la version précédente.
+    """
+    if not transcript:
+        return "Conversation indisponible."
+    
+    lines = [l.strip() for l in transcript.split('\n') if l.strip() and ':' in l]
+    
+    if not lines:
+        return "Conversation très courte."
+    
+    # Analyse des patterns de conversation
+    summary_parts = []
+    
+    # 1. Identifie le motif de l'appel (client)
+    client_lines = [l for l in lines if l.lower().startswith('client:')]
+    for line in client_lines:
+        text = line.replace('Client:', '').strip().lower()
+        
+        # Motifs d'appel courants
+        if any(kw in text for kw in ['rendez-vous', 'rdv', 'prendre', 'avancer', 'reporter']):
+            summary_parts.append("Appel pour un rendez-vous")
+            break
+        elif any(kw in text for kw in ['information', 'renseignement', 'savoir']):
+            summary_parts.append("Demande d'information")
+            break
+        elif any(kw in text for kw in ['problème', 'souci', 'bug']):
+            summary_parts.append("Signalement d'un problème")
+            break
+    
+    # 2. Identifie la réponse de l'agent
+    agent_lines = [l for l in lines if l.lower().startswith('agent:')]
+    for line in agent_lines:
+        text = line.replace('Agent:', '').strip().lower()
+        
+        if any(kw in text for kw in ['je vais', 'on va', 'nous allons']):
+            action = line.replace('Agent:', '').strip()
+            if len(action) > 10:  # Action substantielle
+                summary_parts.append(f"L'agent va {action.lower()}")
+                break
+        elif any(kw in text for kw in ['pas possible', 'impossible', 'désolé']):
+            summary_parts.append("L'agent ne peut pas satisfaire la demande")
+            break
+        elif any(kw in text for kw in ['disponible', 'libre', 'possible']):
+            summary_parts.append("Créneau trouvé")
+            break
+    
+    # 3. Si pas assez d'éléments, prend les segments les plus informatifs
+    if len(summary_parts) < 2:
+        substantive_lines = []
+        for line in lines:
+            text = line.split(':', 1)[1].strip() if ':' in line else line
+            # Évite les formules de politesse
+            if (len(text) > 15 and 
+                not any(pol in text.lower() for pol in ['bonjour', 'au revoir', 'merci', 'bonne journée'])):
+                substantive_lines.append(text)
+        
+        # Ajoute les 2 plus substantielles
+        for text in substantive_lines[:2]:
+            if len(summary_parts) < 3:
+                summary_parts.append(text)
+    
+    # Construction du résumé final
+    if not summary_parts:
+        return "Conversation brève sans motif identifié."
+    
+    return ". ".join(summary_parts) + "."
+
+def select_best_summary_approach(transcript: str) -> str:
+    """
+    Sélectionne la meilleure approche de résumé selon le contenu.
+    """
+    # Analyse de la qualité du transcript
+    lines = transcript.split('\n')
+    total_words = len(transcript.split())
+    
+    # Si très court, résumé simple
+    if total_words < 20:
+        return "Conversation très brève."
+    
+    # Si transcript de bonne qualité, essaye génératif
+    if total_words > 30 and len(lines) > 3:
+        generative_summary = generate_natural_summary(transcript)
+        
+        # Validation de qualité
+        if (generative_summary and 
+            len(generative_summary) > 15 and 
+            not any(bad in generative_summary.lower() for bad in ['format', 'structure', 'décision/'])):
+            return generative_summary
+    
+    # Fallback extractif
+    return create_extractive_summary(transcript)
 
 # ---------------------------
-# Diarization
+# Diarization (inchangé)
 # ---------------------------
 def load_diarizer():
     global _diarizer
@@ -368,7 +543,7 @@ def load_diarizer():
     return _diarizer
 
 # ---------------------------
-# Sentiment
+# Sentiment (inchangé)
 # ---------------------------
 def load_sentiment():
     global _sentiment_clf, _sentiment_zero_shot
@@ -458,208 +633,7 @@ def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, An
     return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": norm[label_en], "scores": norm}
 
 # ---------------------------
-# Résumés à partir des segments
-# ---------------------------
-def _is_filler(text: str) -> bool:
-    t = (text or "").lower().strip()
-    fillers = [
-        "bonjour", "bonsoir", "au revoir", "bonne soirée", "bon week-end",
-        "merci", "merci beaucoup", "je vous en prie"
-    ]
-    return any(t == f or t.startswith(f + ".") for f in fillers)
-
-def extractive_summary_from_segments(segments, max_bullets=6) -> str:
-    bullets = []
-    # demande client
-    for s in segments:
-        if s["speaker"].lower().startswith("client") and not _is_filler(s["text"]):
-            if any(k in s["text"].lower() for k in ["rendez-vous", "rdv", "je veux", "je voudrais", "savoir", "prise", "demande", "est-ce que"]):
-                bullets.append(f"**Demande du client** : « {s['text']} »")
-                break
-    # proposition agent
-    for s in segments:
-        if s["speaker"].lower().startswith("agent") and not _is_filler(s["text"]):
-            if any(k in s["text"].lower() for k in ["je vais", "je transmets", "je m'en occupe", "je peux vous proposer", "on peut"]):
-                bullets.append(f"**Réponse de l'agent** : « {s['text']} »")
-                break
-    # confirmation client
-    for s in segments:
-        if s["speaker"].lower().startswith("client") and not _is_filler(s["text"]):
-            if any(k in s["text"].lower() for k in ["oui", "d'accord", "ok", "parfait", "très bien"]):
-                bullets.append(f"**Confirmation** : « {s['text']} »")
-                break
-    # remerciements
-    if any("merci" in (s["text"] or "").lower() for s in segments):
-        bullets.append("**Remerciements échangés.**")
-    # clôture
-    if any("au revoir" in (s["text"] or "").lower() for s in segments):
-        bullets.append("**Fin d'appel.**")
-
-    if not bullets:
-        for s in segments:
-            if not _is_filler(s["text"]):
-                bullets.append(f"{s['speaker']} : « {s['text']} »")
-            if len(bullets) >= max_bullets:
-                break
-
-    return "- " + "\n- ".join(bullets[:max_bullets]) if bullets else "Résumé indisponible."
-
-def concise_summary_from_segments(segments, max_lines=6) -> str:
-    """
-    Résumé court, fidèle, à partir du transcript uniquement.
-    On extrait: motif/demande, réponse/action, rendez-vous/dates/heures, infos clés.
-    """
-    text_all = " ".join([s.get("text","") for s in segments if s.get("text")]).strip()
-    if not text_all:
-        return "Résumé indisponible."
-
-    def find_first(patterns, speaker_prefix=None):
-        for s in segments:
-            if speaker_prefix and not s["speaker"].lower().startswith(speaker_prefix):
-                continue
-            t = (s.get("text") or "").lower()
-            if any(p in t for p in patterns):
-                return s["text"]
-        return None
-
-    demande = find_first(["rendez-vous", "rdv", "prise de", "je veux", "je voudrais", "est-ce que", "savoir", "disponibil"], "client")
-    motif   = find_first(["pour", "motif", "c'est pour", "afin de"], "client")
-    action  = find_first(["je vais", "je transmets", "on peut", "je peux vous", "je propose"], "agent")
-    horaire = find_first([r"^(\d{1,2} ?h ?\d{0,2})", "à ", "le "], None)  # repère grossier
-
-    lines = []
-    if demande: lines.append(f"Demande: {demande}")
-    if motif and motif != demande: lines.append(f"Motif: {motif}")
-    if action: lines.append(f"Action de l'agent: {action}")
-
-    # Tentative d'extraction simple de date/heure/adresse/numéro
-    candidates = []
-    for s in segments:
-        t = s.get("text","")
-        if not t: continue
-        if re.search(r"\b\d{1,2}\s?h(?:\s?\d{2})?\b", t.lower()):
-            candidates.append(("Horaire", t))
-        if re.search(r"\b(\d{1,2}/\d{1,2}|\d{1,2}\s\w+)\b", t.lower()):
-            candidates.append(("Date", t))
-        if re.search(r"\b(0[1-9]|[1-9]\d)\s?\d{2}\s?\d{2}\s?\d{2}\b", t.replace("-", " ")):  # FR (très) approximatif
-            candidates.append(("Téléphone", t))
-        if any(k in t.lower() for k in ["rue", "boulevard", "avenue", "bd ", "av "]):
-            candidates.append(("Adresse", t))
-
-    # déduplique en gardant les premières occurrences parlantes
-    seen = set()
-    for k, v in candidates:
-        if k not in seen and len(lines) < max_lines:
-            lines.append(f"{k}: {v}")
-            seen.add(k)
-
-    # si rien trouvé, on prend les 2-3 interventions les plus longues (non-filler)
-    if len(lines) < 2:
-        chunks = [s["text"] for s in sorted(segments, key=lambda x: len(x.get("text","")), reverse=True)
-                  if s.get("text") and not _is_filler(s["text"])]
-        for c in chunks[:max_lines-len(lines)]:
-            lines.append(c)
-
-    return "\n".join(lines[:max_lines]) if lines else "Résumé indisponible."
-
-# ---------------------------
-# NOUVEAUX RÉSUMÉS GÉNÉRATIFS INTELLIGENTS
-# ---------------------------
-
-def generate_smart_summary_from_transcript(full_transcript: str, language: Optional[str] = None) -> str:
-    """
-    Utilise Voxtral pour générer un résumé intelligent à partir du transcript complet.
-    Plus efficace et cohérent que l'extraction basique.
-    """
-    if not full_transcript.strip():
-        return "Résumé indisponible."
-    
-    # Instructions très précises pour un résumé professionnel
-    lang_prefix = f"lang:{language} " if language else ""
-    instruction = (
-        f"{lang_prefix}Résume cette conversation téléphonique en 2-3 phrases courtes et professionnelles. "
-        "Format attendu: 'Le client [demande/action]. L'agent [réponse]. [Résultat final].' "
-        "Sois factuel, concis, sans détails superflus. Focus sur l'essentiel business."
-    )
-    
-    # Conversation pour Voxtral avec le transcript en mode texte
-    conversation = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": f"{instruction}\n\nConversation:\n{full_transcript}"}
-        ]
-    }]
-    
-    try:
-        result = run_voxtral_with_timeout(conversation, max_new_tokens=96, timeout=30)  # Court pour résumé concis
-        summary = (result.get("text") or "").strip()
-        
-        # Validation basique de qualité
-        if len(summary) < 15 or "résumé" in summary.lower() or summary.startswith("Je"):
-            log("[WARN] Generated summary seems poor, falling back to extractive")
-            return fallback_extractive_summary(full_transcript)
-        
-        return summary
-        
-    except Exception as e:
-        log(f"[WARN] Generative summary failed: {e}")
-        return fallback_extractive_summary(full_transcript)
-
-def fallback_extractive_summary(transcript: str) -> str:
-    """
-    Résumé extractif simple et robuste en cas d'échec du génératif.
-    Plus intelligent que la version précédente.
-    """
-    lines = [l.strip() for l in transcript.split('\n') if l.strip() and len(l.strip()) > 5]
-    
-    if not lines:
-        return "Conversation très courte."
-    
-    # Recherche patterns métier améliorés
-    client_demand = None
-    agent_response = None
-    
-    # Mots-clés pour identifier les demandes importantes
-    demand_keywords = ["voulais", "voudrais", "besoin", "demande", "rdv", "rendez-vous", 
-                      "disponib", "possible", "consultation", "docteur", "savoir", "question"]
-    
-    # Mots-clés pour identifier les réponses importantes  
-    response_keywords = ["non", "oui", "pas", "disponib", "possible", "je vais", "désolé", 
-                        "malheureusement", "aujourd'hui", "demain"]
-    
-    for line in lines:
-        if line.startswith("Client:"):
-            client_text = line.replace("Client:", "").strip()
-            # Score la ligne selon pertinence business
-            score = len(client_text) + sum(5 for kw in demand_keywords if kw in client_text.lower())
-            if score > 20 and not client_demand:  # Seuil de pertinence
-                client_demand = client_text
-                
-        elif line.startswith("Agent:"):
-            agent_text = line.replace("Agent:", "").strip()
-            # Éviter les simples politesses
-            if len(agent_text) > 8 and not agent_text.lower().strip() in ["bonjour", "bonsoir", "au revoir"]:
-                score = len(agent_text) + sum(3 for kw in response_keywords if kw in agent_text.lower())
-                if score > 15 and not agent_response:
-                    agent_response = agent_text
-    
-    # Construction résumé structuré
-    parts = []
-    if client_demand:
-        parts.append(f"Demande: {client_demand}")
-    if agent_response:
-        parts.append(f"Réponse: {agent_response}")
-    
-    # Fallback si patterns échouent
-    if not parts:
-        # Prendre les 2 segments les plus substantiels
-        substantial_lines = [l for l in lines if len(l) > 20]
-        parts = substantial_lines[:2] if substantial_lines else lines[:2]
-    
-    return " | ".join(parts) if parts else "Conversation courte."
-
-# ---------------------------
-# Post-traitements segments
+# Post-traitements segments (inchangé)
 # ---------------------------
 def _enforce_max_two_speakers(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     speakers = list({s["speaker"] for s in segments})
@@ -711,7 +685,7 @@ def _map_roles(segments: List[Dict[str, Any]]):
         s["speaker"] = mapping.get(s["speaker"], s["speaker"])
 
 # ---------------------------
-# Core flow - ULTRA-STRICT
+# Core flow - ULTRA-STRICT avec résumés optimisés
 # ---------------------------
 def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
     # Durée max
@@ -814,19 +788,35 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
 
     result = {"segments": segments, "transcript": full_transcript}
 
-    # RÉSUMÉ GÉNÉRATIF AMÉLIORÉ
+    # RÉSUMÉS OPTIMISÉS VERSION 2.0
     if with_summary:
-        if CONCISE_SUMMARY:
-            # NOUVEAU : Résumé génératif intelligent avec Voxtral
-            result["summary"] = generate_smart_summary_from_transcript(full_transcript, language)
+        if SMART_SUMMARY:
+            # NOUVEAU : Système de résumé intelligent et naturel
+            result["summary"] = select_best_summary_approach(full_transcript)
         elif EXTRACTIVE_SUMMARY:
-            # Ancien résumé extractif (conservé en option)
-            result["summary"] = extractive_summary_from_segments(segments) if any(s.get("text") for s in segments) else "Résumé indisponible."
+            # Résumé extractif amélioré
+            result["summary"] = create_extractive_summary(full_transcript)
         else:
-            # Mode résumé audio direct (votre version originale)
-            conv_sum = _build_conv_summary(wav_path, language, max_sentences=3, style="Résumé professionnel concis en français.")
-            s = run_voxtral_with_timeout(conv_sum, max_new_tokens=96, timeout=30)  # Réduit pour résumé concis
-            result["summary"] = s.get("text", "") or "Résumé indisponible."
+            # Fallback : résumé audio direct (mode original)
+            try:
+                instruction = (
+                    f"lang:{language or 'fr'} "
+                    "Résume cette conversation en 1-2 phrases simples et utiles. "
+                    "Dis juste l'essentiel sans format particulier."
+                )
+                conv_sum = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "audio", "path": wav_path},
+                        {"type": "text", "text": instruction}
+                    ]
+                }]
+                s = run_voxtral_with_timeout(conv_sum, max_new_tokens=72, timeout=25)
+                summary_text = (s.get("text", "") or "").strip()
+                result["summary"] = clean_generated_summary(summary_text) or "Résumé indisponible."
+            except Exception as e:
+                log(f"[ERROR] Audio summary failed: {e}")
+                result["summary"] = create_extractive_summary(full_transcript)
 
     # Humeurs
     if ENABLE_SENTIMENT:
@@ -844,7 +834,7 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
     return result
 
 # ---------------------------
-# Health
+# Health (inchangé)
 # ---------------------------
 def health():
     info = {
@@ -864,7 +854,7 @@ def health():
         "max_speakers": MAX_SPEAKERS,
         "exact_two": EXACT_TWO,
         "strict_transcription": STRICT_TRANSCRIPTION,
-        "concise_summary": CONCISE_SUMMARY,
+        "smart_summary": SMART_SUMMARY,
         "extractive_summary": EXTRACTIVE_SUMMARY,
         "min_seg_dur": MIN_SEG_DUR,
         "role_labels": ROLE_LABELS,
@@ -898,7 +888,7 @@ def health():
     return {"ok": len(errors) == 0, "info": info, "errors": errors}
 
 # ---------------------------
-# Handler
+# Handler (inchangé sauf résumés)
 # ---------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
@@ -931,9 +921,30 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 return out
             return {"task": "transcribe_diarized", **out}
         elif task in ("summary", "summarize"):
-            conv = _build_conv_summary(local_path, language, inp.get("max_sentences"), inp.get("style"))
-            out = run_voxtral_with_timeout(conv, max_new_tokens=96, timeout=30)
-            return {"task": "summary", **out}
+            # Utilise le nouveau système de résumé intelligent
+            try:
+                # Lit l'audio d'abord pour faire un transcript
+                temp_result = diarize_then_transcribe(local_path, language, max_new_tokens, False)
+                if "error" in temp_result:
+                    return temp_result
+                
+                transcript = temp_result.get("transcript", "")
+                summary = select_best_summary_approach(transcript) if transcript else "Audio indisponible."
+                
+                return {"task": "summary", "text": summary, "latency_s": 0}
+            except Exception as e:
+                log(f"[ERROR] Smart summary failed: {e}")
+                # Fallback mode résumé audio direct
+                instruction = "Résume cette conversation en 1-2 phrases simples et utiles."
+                conv = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "audio", "path": local_path},
+                        {"type": "text", "text": instruction}
+                    ]
+                }]
+                out = run_voxtral_with_timeout(conv, max_new_tokens=72, timeout=25)
+                return {"task": "summary", **out}
         else:
             conv = _build_conv_transcribe(local_path, language)
             out = run_voxtral_with_timeout(conv, max_new_tokens=min(max_new_tokens, 64), timeout=30)
