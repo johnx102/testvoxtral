@@ -1,267 +1,618 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RunPod — Voxtral (transcribe strict) + PyAnnote diarization stricte (exactement 2 locuteurs) + résumé concis + humeur.
-- Transcript strict (greedy, sans sampling), construit uniquement à partir des segments diarizés.
-- Diarization PyAnnote 3.1 forcée à 2 locuteurs (min_speakers=2, max_speakers=2) → rôles Agent/Client.
-- Résumé concis (2–3 phrases) fidèle au transcript.
-- Humeur globale + par locuteur (positive / neutral / negative).
+RunPod Serverless — Voxtral + PyAnnote (strict 2 speakers) + résumé concis + humeur
+Base: dernière version fournie par l'utilisateur (fonctionnelle), avec ces améliorations :
+- Diarization stricte à 2 locuteurs via pyannote (exact_two par défaut).
+- Transcription STRICTE par segment avec le mode transcription natif de Voxtral (pas de chat), donc pas d'interprétation.
+- Résumé concis (2–3 phrases) construit de façon extractive à partir du transcript (sans LLM), pour éviter les dérapages.
+- Conserve le pipeline d'humeur existant.
 """
 
-import os, io, time, json, base64
-from typing import Any, Dict, List, Tuple
+import os, time, base64, tempfile, uuid, requests, json, traceback, io
+from typing import Optional, List, Dict, Any, Tuple
 
 import torch
-import numpy as np
+from transformers import (
+    AutoProcessor, AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline,
+    pipeline as hf_pipeline
+)
+
+# Voxtral class (requires transformers@main)
+try:
+    from transformers import VoxtralForConditionalGeneration  # type: ignore
+    _HAS_VOXTRAL_CLASS = True
+except Exception:
+    VoxtralForConditionalGeneration = None  # type: ignore
+    _HAS_VOXTRAL_CLASS = False
+
+from pydub import AudioSegment
+from pyannote.audio import Pipeline
+import runpod
 import soundfile as sf
+import numpy as np
 
-# --------- ENV ---------
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
-VOXTRAL_MODEL_ID = os.getenv("VOXTRAL_MODEL_ID", "mistralai/Voxtral-Mini-3B-2507")
-DIAR_MODEL_ID = os.getenv("DIAR_MODEL_ID", "pyannote/speaker-diarization-3.1")
-SENTIMENT_MODEL_ID = os.getenv("SENTIMENT_MODEL_ID", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
-MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "2400"))  # 40 minutes hard cap
-MAX_SPEAKERS = 2  # strict
+# ---------------------------
+# Logging
+# ---------------------------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+def log(msg: str):
+    if LOG_LEVEL in ("DEBUG", "INFO"):
+        print(msg, flush=True)
 
-try:
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-except Exception:
-    pass
+# ---------------------------
+# Env / Config
+# ---------------------------
+APP_VERSION = os.environ.get("APP_VERSION", "strict-2spk-2025-08-25")
 
-# --------- Transformers (Voxtral) ---------
-from transformers import VoxtralForConditionalGeneration, VoxtralProcessor, pipeline as hf_pipeline
+MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Mini-3B-2507").strip()
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "256"))
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.0"))
+TOP_P = float(os.environ.get("TOP_P", "0.95"))
+MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "2400"))
+DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
+WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
-_vox_processor = VoxtralProcessor.from_pretrained(VOXTRAL_MODEL_ID)
-_vox_model = VoxtralForConditionalGeneration.from_pretrained(VOXTRAL_MODEL_ID, torch_dtype=DTYPE)
-_vox_model.to(DEVICE).eval()
+# Sentiment (CPU by default to avoid NVRTC issues)
+SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli").strip()
+SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()  # "zero-shot" or "classifier"
+ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
+SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
 
-# --------- Sentiment ---------
-try:
-    _clf = hf_pipeline("zero-shot-classification", model=SENTIMENT_MODEL_ID, device=0 if DEVICE=="cuda" else -1)
-except Exception:
-    _clf = None
+# Diarization speaker limit
+MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))  # hard cap in diarization call
+EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"       # force exactly 2 by défaut
 
-# --------- Diarization (pyannote) ---------
-from pyannote.audio import Pipeline as PyanPipeline
+# Behavior toggles
+STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
+ROLE_LABELS = [r.strip() for r in os.environ.get("ROLE_LABELS", "Agent,Client").split(",") if r.strip()]
+
+# Globals
+_processor = None
+_model = None
 _diarizer = None
-def load_diarizer():
-    global _diarizer
-    if _diarizer is None:
-        if not HF_TOKEN:
-            raise RuntimeError("HF_TOKEN manquant pour pyannote.")
-        _diarizer = PyanPipeline.from_pretrained(DIAR_MODEL_ID, use_auth_token=HF_TOKEN)
-        _diarizer.to(torch.device(DEVICE))
-    return _diarizer
+_sentiment_clf = None
+_sentiment_zero_shot = None
 
-# --------- Utils ---------
-def _resample_ta(wave: np.ndarray, sr: int, target_sr: int) -> Tuple[np.ndarray, int]:
-    import torchaudio.functional as AF
-    wav_t = torch.from_numpy(wave).float().unsqueeze(0)  # (1, n)
-    with torch.no_grad():
-        out = AF.resample(wav_t, orig_freq=sr, new_freq=target_sr)
-    return out.squeeze(0).numpy(), target_sr
+# ---------------------------
+# Helpers
+# ---------------------------
+def _select_dtype() -> torch.dtype:
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability(0)
+        return torch.bfloat16 if major >= 8 else torch.float16
+    return torch.float32
 
-def _load_audio_from_event(event_input: Dict[str, Any]) -> Tuple[np.ndarray, int]:
-    if "audio_b64" in event_input and event_input["audio_b64"]:
-        byts = base64.b64decode(event_input["audio_b64"])
-        data, sr = sf.read(io.BytesIO(byts), dtype="float32", always_2d=False)
-    elif "audio_url" in event_input and event_input["audio_url"]:
-        import requests
-        r = requests.get(event_input["audio_url"], timeout=90)
-        r.raise_for_status()
-        data, sr = sf.read(io.BytesIO(r.content), dtype="float32", always_2d=False)
-    elif "file_path" in event_input and event_input["file_path"]:
-        data, sr = sf.read(event_input["file_path"], dtype="float32", always_2d=False)
+def _device_str() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+def _download_to_tmp(url: str) -> str:
+    resp = requests.get(url, timeout=120, stream=True)
+    resp.raise_for_status()
+    path = os.path.join(tempfile.gettempdir(), f"audio_{uuid.uuid4().hex}.wav")
+    with open(path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+    return path
+
+def _b64_to_tmp(b64: str) -> str:
+    raw = base64.b64decode(b64)
+    path = os.path.join(tempfile.gettempdir(), f"audio_{uuid.uuid4().hex}.wav")
+    with open(path, "wb") as f:
+        f.write(raw)
+    return path
+
+# ---------------------------
+# Voxtral
+# ---------------------------
+def load_voxtral():
+    global _processor, _model
+    if _processor is not None and _model is not None:
+        return _processor, _model
+
+    dtype = _select_dtype()
+    log(f"[INIT] Loading Voxtral: {MODEL_ID} torch_dtype={dtype}")
+
+    proc_kwargs = {}
+    if HF_TOKEN:
+        proc_kwargs["token"] = HF_TOKEN
+    _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
+
+    mdl_kwargs = {"torch_dtype": dtype, "device_map": "auto"}
+    if HF_TOKEN:
+        mdl_kwargs["token"] = HF_TOKEN
+
+    if _HAS_VOXTRAL_CLASS:
+        _model = VoxtralForConditionalGeneration.from_pretrained(MODEL_ID, **mdl_kwargs)
     else:
-        raise ValueError("Provide 'audio_url', 'audio_b64' or 'file_path'.")
+        raise RuntimeError("Transformers build without VoxtralForConditionalGeneration. Update transformers@main.")
 
+    # Fallback: ensure CUDA
+    try:
+        if torch.cuda.is_available():
+            _model.to(torch.device("cuda"))
+    except Exception as e:
+        log(f"[WARN] Could not move Voxtral to CUDA explicitly: {e}")
+
+    # Log device/dtype
+    try:
+        p = next(_model.parameters())
+        log(f"[INIT] Voxtral device={p.device}, dtype={p.dtype}")
+    except Exception:
+        pass
+
+    log("[INIT] Voxtral ready.")
+    return _processor, _model
+
+def run_voxtral_chat(conversation, max_new_tokens: int) -> Dict[str, Any]:
+    """Ancien mode chat (génératif). Gardé pour résumés optionnels si besoin."""
+    processor, model = load_voxtral()
+    inputs = processor.apply_chat_template(conversation)
+    dtype = _select_dtype()
+    device = _device_str()
+    inputs = inputs.to(device, dtype=dtype)
+
+    gen_kwargs = dict(max_new_tokens=max_new_tokens, temperature=TEMPERATURE, top_p=TOP_P, do_sample=(TEMPERATURE>0.0))
+    start = time.time()
+    outputs = model.generate(**inputs, **gen_kwargs)
+    elapsed = time.time() - start
+
+    decoded = processor.batch_decode(outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+    return {"text": decoded[0] if decoded else "", "latency_s": round(elapsed, 3)}
+
+def vox_strict_transcribe_file(wav_path: str, language: Optional[str]) -> str:
+    """
+    Utilise le mode transcription natif de Voxtral pour un chunk audio.
+    Zéro sampling, pas d'interprétation. Retourne une chaîne brute.
+    """
+    processor, model = load_voxtral()
+    # lire audio
+    data, sr = sf.read(wav_path, dtype="float32", always_2d=False)
     if data.ndim == 2:
         data = data.mean(axis=1)
-
-    # hard cap
-    max_n = int(MAX_AUDIO_SECONDS * sr)
-    if data.shape[0] > max_n:
-        data = data[:max_n]
-
-    # resample to 16k
-    if sr != 16000:
-        data, sr = _resample_ta(data, sr, 16000)
-
-    return data, sr
-
-def _vox_transcribe_chunk(wave_mono_f32: np.ndarray, sr: int, language: str | None) -> str:
-    inputs = _vox_processor.apply_transcription_request(
+    # certains conteneurs peuvent avoir d'autres SR; Voxtral peut gérer, sinon pydub peut rééchantillonner en amont
+    inputs = processor.apply_transcription_request(
         language=language or "auto",
-        audio=wave_mono_f32,
-        model_id=VOXTRAL_MODEL_ID,
+        audio=data,
+        model_id=MODEL_ID,
         sampling_rate=sr,
     )
-    inputs = {k: (v.to(DEVICE, dtype=DTYPE) if hasattr(v, "to") else v) for k, v in inputs.items()}
+    # déplacer sur device
+    todev = {}
+    for k, v in inputs.items():
+        if hasattr(v, "to"):
+            todev[k] = v.to(_device_str(), dtype=_select_dtype())
+        else:
+            todev[k] = v
     with torch.no_grad():
-        out = _vox_model.generate(
-            **inputs,
+        out = _model.generate(
+            **todev,
             max_new_tokens=256,
             do_sample=False,
             num_beams=1,
         )
-    text = _vox_processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
-    return text.strip()
+    # décoder uniquement la continuation
+    start_idx = inputs["input_ids"].shape[1] if "input_ids" in inputs else 0
+    txt = _processor.batch_decode(out[:, start_idx:], skip_special_tokens=True)[0]
+    return (txt or "").strip()
 
-def _summarize_concise(transcript_text: str, max_new_tokens: int = 160) -> str:
-    if not transcript_text.strip():
-        return ""
-    tok = _vox_processor.tokenizer
-    prompt = (
-        "Tu résumes fidèlement un appel en français. "
-        "Écris 2–3 phrases concises, sans listes ni citations, sans ajout d'informations.\n\n"
-        f"Transcription:\n{transcript_text}\n\nRésumé:"
-    )
-    encoded = tok.apply_chat_template(
-        [{"role": "user", "content": prompt}],
-        add_generation_prompt=True,
-        return_tensors="pt",
-    ).to(DEVICE)
-    with torch.no_grad():
-        out = _vox_model.generate(
-            input_ids=encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-        )
-    return tok.batch_decode(out[:, encoded.shape[1]:], skip_special_tokens=True)[0].strip()
-
-def _classify_mood_fr(text: str) -> Dict[str, Any]:
-    if not _clf or not text.strip():
-        return {"label_en":"neutral","label_fr":"neutre","confidence":0.0,"scores":{"negative":0.0,"neutral":1.0,"positive":0.0}}
-    res = _clf(text, candidate_labels=["positive","neutral","negative"], multi_label=False)
-    if isinstance(res, list):
-        res = res[0]
-    labels, scores = res["labels"], res["scores"]
-    mapping = {"positive":"bon","neutral":"neutre","negative":"mauvais"}
-    best = labels[0]
-    return {
-        "label_en": best,
-        "label_fr": mapping.get(best, best),
-        "confidence": float(scores[labels.index(best)]),
-        "scores": {k: float(scores[labels.index(k)]) for k in ["negative","neutral","positive"] if k in labels},
-    }
-
-# --------- Core ---------
-def transcribe_diarized_strict(event_input: Dict[str, Any]) -> Dict[str, Any]:
-    language = event_input.get("language") or None
-    with_summary = bool(event_input.get("with_summary", True))
-    max_new_tokens = int(event_input.get("max_new_tokens", 160))
-
-    wav, sr = _load_audio_from_event(event_input)
-
-    # diarization strict à 2 speakers
-    diar = load_diarizer()
-    diarization = diar({"waveform": torch.tensor(wav).unsqueeze(0), "sample_rate": sr,
-                        "min_speakers": MAX_SPEAKERS, "max_speakers": MAX_SPEAKERS})
-
-    segments: List[Dict[str, Any]] = []
+# ---------------------------
+# Diarization (limit to max 2 speakers)
+# ---------------------------
+def load_diarizer():
+    global _diarizer
+    if _diarizer is not None:
+        return _diarizer
+    log(f"[INIT] Loading diarization: {DIAR_MODEL}")
+    kwargs = {}
+    if HF_TOKEN:
+        kwargs["use_auth_token"] = HF_TOKEN
+    _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
     try:
-        for segment, _, speaker in diarization.itertracks(yield_label=True):
-            segments.append({"start": float(segment.start), "end": float(segment.end), "speaker": str(speaker)})
-    except Exception:
-        segments = list(diarization.get("segments", []))
-
-    segments.sort(key=lambda s: (s.get("start", 0.0), s.get("end", 0.0)))
-
-    # garder l'ordre d'apparition pour mapper Agent/Client
-    order: List[str] = []
-    for s in segments:
-        sp = s["speaker"]
-        if sp not in order:
-            order.append(sp)
-        if len(order) >= MAX_SPEAKERS:
-            break
-    # sécurité si pipeline renvoie moins de 2 labels
-    while len(order) < MAX_SPEAKERS:
-        order.append(f"SPEAKER_{len(order):02d}")
-
-    role_for = {order[0]: "Agent", order[1]: "Client"}
-
-    # Transcription strict sur chaque segment
-    PAD, MIN_DUR = 0.10, 0.60
-    n = len(wav)
-    out_segments: List[Dict[str, Any]] = []
-    lines: List[str] = []
-
-    for seg in segments:
-        spk = seg["speaker"]
-        if spk not in role_for:
-            continue
-        start, end = float(seg["start"]), float(seg["end"])
-        if end - start < MIN_DUR:
-            continue
-        s = max(0.0, start - PAD)
-        e = min(n / sr, end + PAD)
-        s_idx, e_idx = int(s * sr), int(e * sr)
-        chunk = wav[s_idx:e_idx]
-        txt = _vox_transcribe_chunk(chunk, sr, language)
-        role = role_for[spk]
-        if txt:
-            out_segments.append({"start": start, "end": end, "speaker": role, "text": txt})
-            lines.append(f"{role}: {txt}")
-
-    transcript = "\n".join(lines).strip()
-    summary = _summarize_concise(transcript, max_new_tokens=max_new_tokens) if with_summary else ""
-
-    # Humeur
-    mood_overall = _classify_mood_fr(transcript)
-    mood_by_speaker: Dict[str, Any] = {}
-    texts_by_role: Dict[str, List[str]] = {}
-    for s in out_segments:
-        texts_by_role.setdefault(s["speaker"], []).append(s["text"])
-    for role, txts in texts_by_role.items():
-        mood_by_speaker[role] = _classify_mood_fr(" ".join(txts))
-
-    return {
-        "task": "transcribe_diarized",
-        "segments": out_segments,
-        "transcript": transcript,
-        "summary": summary,
-        "mood_overall": mood_overall,
-        "mood_by_speaker": mood_by_speaker,
-    }
-
-# --------- RunPod handler ---------
-def handler(event: Dict[str, Any]) -> Dict[str, Any]:
-    t0 = time.time()
-    try:
-        inp = event.get("input") or {}
-        task = (inp.get("task") or "transcribe_diarized").strip().lower()
-
-        if task in ("health", "status", "ping"):
-            info = {
-                "ok": True,
-                "python": "%s" % (tuple(map(int, torch.__version__.split('+')[0].split('.'))) and __import__('sys').version.split()[0]),
-                "torch": torch.__version__,
-                "cuda_available": torch.cuda.is_available(),
-                "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-                "device": DEVICE,
-                "model_id": VOXTRAL_MODEL_ID,
-                "diar_model": DIAR_MODEL_ID,
-                "sentiment_model": SENTIMENT_MODEL_ID,
-                "hf_token_present": bool(HF_TOKEN),
-                "transformers_has_voxtral": True,
-            }
-            return {"status": "OK", "output": info, "executionTime": int((time.time() - t0) * 1000)}
-
-        if task == "transcribe_diarized":
-            out = transcribe_diarized_strict(inp)
-            return {"status": "COMPLETED", "output": out, "executionTime": int((time.time() - t0) * 1000)}
-
-        return {"status": "FAILED", "error": f"Unknown task '{task}'", "executionTime": int((time.time() - t0) * 1000)}
+        if torch.cuda.is_available():
+            try:
+                _diarizer.to(torch.device("cuda"))
+            except TypeError:
+                _diarizer.to("cuda")
+            log("[INIT] Diarizer moved to CUDA.")
+        else:
+            log("[INIT] CUDA not available; diarizer on CPU.")
     except Exception as e:
-        import traceback
-        trace = traceback.format_exc()
-        return {"status": "FAILED", "error": f"{type(e).__name__}: {e}", "output": {"trace": trace}, "executionTime": int((time.time() - t0) * 1000)}
+        log(f"[WARN] Could not move diarizer to CUDA: {e}. Keeping on CPU.")
+    return _diarizer
 
-# local test
-if __name__ == "__main__":
-    print(json.dumps(handler({"input": {"task": "health"}}), ensure_ascii=False, indent=2))
+# ---------------------------
+# Sentiment (CPU-friendly by default)
+# ---------------------------
+def load_sentiment():
+    global _sentiment_clf, _sentiment_zero_shot
+    if not ENABLE_SENTIMENT:
+        return None
+
+    device_idx = SENTIMENT_DEVICE  # -1 => CPU
+    if SENTIMENT_TYPE == "zero-shot":
+        if _sentiment_zero_shot is not None:
+            return _sentiment_zero_shot
+        log(f"[INIT] Loading zero-shot sentiment on device {device_idx}: {SENTIMENT_MODEL}")
+        _sentiment_zero_shot = hf_pipeline(
+            "zero-shot-classification",
+            model=SENTIMENT_MODEL,
+            tokenizer=SENTIMENT_MODEL,
+            device=device_idx,
+            model_kwargs={"use_safetensors": True}
+        )
+        log("[INIT] Zero-shot sentiment ready.")
+        return _sentiment_zero_shot
+    else:
+        if _sentiment_clf is not None:
+            return _sentiment_clf
+        log(f"[INIT] Loading classifier sentiment on device {device_idx}: {SENTIMENT_MODEL}")
+        tok = AutoTokenizer.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
+        mdl = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
+        _sentiment_clf = TextClassificationPipeline(
+            model=mdl, tokenizer=tok, device=device_idx, return_all_scores=True, truncation=True
+        )
+        log("[INIT] Classifier sentiment ready.")
+        return _sentiment_clf
+
+def _label_fr(en_label: str) -> str:
+    m = {"negative": "mauvais", "neutral": "neutre", "positive": "bon"}
+    key = en_label.lower()
+    if key.startswith("label_"):
+        try:
+            idx = int(key.split("_")[-1])
+            key = ["negative", "neutral", "positive"][idx]
+        except Exception:
+            pass
+    return m.get(key, en_label)
+
+def classify_sentiment(text: str) -> Dict[str, Any]:
+    if not ENABLE_SENTIMENT or not text.strip():
+        return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
+
+    if SENTIMENT_TYPE == "zero-shot":
+        clf = load_sentiment()
+        res = clf(text.strip(), candidate_labels=["positive", "neutral", "negative"], multi_label=False)
+        scores = {"positive": 0.0, "neutral": 0.0, "negative": 0.0}
+        for lbl, sc in zip(res["labels"], res["scores"]):
+            scores[lbl.lower()] = float(sc)
+        label_en = res["labels"][0].lower()
+        return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": scores[label_en], "scores": scores}
+    else:
+        clf = load_sentiment()
+        res = clf(text.strip())[0]
+        canonical = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
+        for r in res:
+            lbl = r["label"].lower()
+            if lbl.startswith("label_"):
+                try:
+                    idx = int(lbl.split("_")[-1])
+                    lbl = ["negative", "neutral", "positive"][idx]
+                except Exception:
+                    pass
+            if lbl in canonical:
+                canonical[lbl] = float(r["score"])
+        label_en = max(canonical.items(), key=lambda kv: kv[1])[0]
+        return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": canonical[label_en], "scores": canonical}
+
+def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, Any]:
+    total = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
+    total_w = 0.0
+    for s, w in weighted:
+        if not s or not s.get("scores"):
+            continue
+        for k in total.keys():
+            total[k] += s["scores"].get(k, 0.0) * w
+        total_w += w
+    if total_w <= 0:
+        return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
+    ssum = sum(total.values())
+    norm = {k: (v/ssum if ssum > 0 else 0.0) for k, v in total.items()}
+    label_en = max(norm.items(), key=lambda kv: kv[1])[0]
+    return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": norm[label_en], "scores": norm}
+
+# ---------------------------
+# Extractive concise summary (2–3 sentences)
+# ---------------------------
+FILLERS = {"bonjour","bonsoir","au revoir","bonne journée","bonne soirée","bon week-end","merci","merci beaucoup","je vous en prie"}
+
+def _clean_t(t: str) -> str:
+    return re.sub(r'\s+', ' ', (t or '').strip())
+
+def _sig_utterances(segments: List[Dict[str, Any]]):
+    return [s for s in segments if _clean_t(s.get("text","")).lower() not in FILLERS and len(_clean_t(s.get("text","")))>=3]
+
+def concise_summary_from_segments(segments: List[Dict[str, Any]]) -> str:
+    segs = _sig_utterances(segments)
+    if not segs:
+        return "Résumé indisponible."
+    # Intent (client)
+    intent = next((s for s in segs if s["speaker"].lower().startswith("client")), None)
+    # First meaningful agent reply
+    reply = next((s for s in segs if s["speaker"].lower().startswith("agent")), None)
+    # Outcome (last meaningful)
+    outcome = next((s for s in reversed(segs) if _clean_t(s.get("text")) and s["speaker"].lower().startswith(("agent","client"))), None)
+
+    parts = []
+    if intent:
+        parts.append(f"Le client dit : « { _clean_t(intent['text']) } ».")
+    if reply and (not outcome or reply is not outcome):
+        parts.append(f"L'agent répond/propose : « { _clean_t(reply['text']) } ».")
+    if outcome:
+        parts.append(f"Conclusion : « { _clean_t(outcome['text']) } ».")
+
+    # cap to 3 sentences max; if only one, keep it.
+    return " ".join(parts[:3])
+
+# ---------------------------
+# Enforce MAX 2 speakers post-process (safety net)
+# ---------------------------
+def _enforce_max_two_speakers(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    speakers = list({s["speaker"] for s in segments})
+    if len(speakers) <= 2:
+        return segments
+
+    dur = {}
+    cent = {}
+    for s in segments:
+        d = float(s["end"]) - float(s["start"])
+        spk = s["speaker"]
+        mid = (float(s["start"]) + float(s["end"])) / 2.0
+        dur[spk] = dur.get(spk, 0.0) + d
+        sm, ds = cent.get(spk, (0.0, 0.0))
+        cent[spk] = (sm + mid * d, ds + d)
+
+    top2 = sorted(dur.keys(), key=lambda k: dur[k], reverse=True)[:2]
+    centroids = {}
+    for spk in top2:
+        sm, ds = cent[spk]
+        centroids[spk] = (sm / ds) if ds > 0 else 0.0
+
+    def nearest(mid):
+        best, bestd = None, 1e18
+        for spk, c in centroids.items():
+            dd = abs(mid - c)
+            if dd < bestd:
+                best, bestd = spk, dd
+        return best
+
+    for s in segments:
+        if s["speaker"] not in top2:
+            mid = (float(s["start"]) + float(s["end"])) / 2.0
+            s["speaker"] = nearest(mid)
+
+    return segments
+
+# ---------------------------
+# Optional: map speakers to role labels
+# ---------------------------
+def _map_roles(segments: List[Dict[str, Any]]):
+    seen = []
+    for s in segments:
+        spk = s["speaker"]
+        if spk not in seen:
+            seen.append(spk)
+    mapping = {}
+    for i, spk in enumerate(seen):
+        if i < len(ROLE_LABELS):
+            mapping[spk] = ROLE_LABELS[i]
+    for s in segments:
+        s["speaker"] = mapping.get(s["speaker"], s["speaker"])
+
+# ---------------------------
+# Core flow
+# ---------------------------
+def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
+    # Duration guard
+    try:
+        info = sf.info(wav_path)
+        est_dur = info.frames / float(info.samplerate or 1)
+        if est_dur > MAX_DURATION_S:
+            return {"error": f"Audio too long ({est_dur:.1f}s). Increase MAX_DURATION_S or send shorter file."}
+    except Exception:
+        pass
+
+    dia = load_diarizer()
+
+    # Call diarizer with constraints to keep exactly 2 speakers when requested
+    try:
+        if EXACT_TWO:
+            diarization = dia(wav_path, num_speakers=min(2, MAX_SPEAKERS))
+        else:
+            diarization = dia(wav_path, min_speakers=1, max_speakers=min(2, MAX_SPEAKERS))
+    except TypeError:
+        # Different signatures across versions
+        if EXACT_TWO:
+            diarization = dia(wav_path, min_speakers=min(2, MAX_SPEAKERS), max_speakers=min(2, MAX_SPEAKERS))
+        else:
+            diarization = dia(wav_path, num_speakers=min(2, MAX_SPEAKERS))
+
+    audio = AudioSegment.from_wav(wav_path)
+
+    segments = []
+    transcript_parts = []
+
+    weighted_moods = []
+    mood_by_speaker_weights = {}
+
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        start_s = float(turn.start)
+        end_s = float(turn.end)
+        dur_s = max(0.0, end_s - start_s)
+
+        # exporter segment vers wav temporaire
+        seg_audio = audio[int(start_s * 1000): int(end_s * 1000)]
+        tmp = os.path.join(tempfile.gettempdir(), f"seg_{speaker}_{int(start_s*1000)}.wav")
+        seg_audio.export(tmp, format="wav")
+
+        # *** TRANSCRIPTION STRICTE ***
+        try:
+            text = vox_strict_transcribe_file(tmp, language)
+        except Exception as e:
+            text = ""
+
+        mood = classify_sentiment(text) if ENABLE_SENTIMENT else {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
+
+        seg = {"speaker": speaker, "start": start_s, "end": end_s, "text": text, "mood": mood}
+        segments.append(seg)
+
+        if text:
+            transcript_parts.append(f"{speaker}: {text}")
+
+        if ENABLE_SENTIMENT and dur_s > 0:
+            weighted_moods.append((mood, dur_s))
+            mood_by_speaker_weights.setdefault(speaker, []).append((mood, dur_s))
+
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+    # Safety net: enforce max 2 speakers
+    segments = _enforce_max_two_speakers(segments)
+
+    # Optional role mapping
+    _map_roles(segments)
+
+    # Rebuild transcript with mapped speaker labels
+    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
+
+    result = {"segments": segments, "transcript": full_transcript}
+
+    if with_summary:
+        result["summary"] = concise_summary_from_segments(segments)
+
+    if ENABLE_SENTIMENT:
+        result["mood_overall"] = aggregate_mood(weighted_moods)
+        # Aggregate by (mapped) speaker label after enforcement
+        per_role = {}
+        for seg in segments:
+            d = float(seg["end"]) - float(seg["start"])
+            m = seg.get("mood")
+            r = seg["speaker"]
+            if not m or not m.get("scores"):
+                continue
+            per_role.setdefault(r, []).append((m, d))
+        result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
+
+    return result
+
+# ---------------------------
+# Health / diagnostics
+# ---------------------------
+def health():
+    info = {
+        "app_version": APP_VERSION,
+        "python": os.popen("python -V").read().strip(),
+        "torch": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_count": torch.cuda.device_count(),
+        "device": _device_str(),
+        "transformers_has_voxtral": _HAS_VOXTRAL_CLASS,
+        "hf_token_present": bool(HF_TOKEN),
+        "model_id": MODEL_ID,
+        "diar_model": DIAR_MODEL,
+        "sentiment_model": SENTIMENT_MODEL if ENABLE_SENTIMENT else None,
+        "sentiment_type": SENTIMENT_TYPE,
+        "sentiment_device": "cpu" if SENTIMENT_DEVICE == -1 else f"cuda:{SENTIMENT_DEVICE}",
+        "max_speakers": MAX_SPEAKERS,
+        "exact_two": EXACT_TWO,
+        "strict_transcription": STRICT_TRANSCRIPTION,
+        "role_labels": ROLE_LABELS,
+    }
+    try:
+        if _model is not None:
+            p = next(_model.parameters())
+            info["voxtral_device"] = str(p.device)
+            info["voxtral_dtype"]  = str(p.dtype)
+        else:
+            info["voxtral_device"] = None
+            info["voxtral_dtype"]  = None
+    except Exception:
+        info["voxtral_device"] = "unknown"
+        info["voxtral_dtype"]  = "unknown"
+
+    errors = {}
+    try:
+        load_voxtral()
+    except Exception as e:
+        errors["voxtral_load"] = f"{type(e).__name__}: {e}"
+    try:
+        load_diarizer()
+    except Exception as e:
+        errors["diarizer_load"] = f"{type(e).__name__}: {e}"
+    if ENABLE_SENTIMENT:
+        try:
+            load_sentiment()
+        except Exception as e:
+            errors["sentiment_load"] = f"{type(e).__name__}: {e}"
+    return {"ok": len(errors) == 0, "info": info, "errors": errors}
+
+# ---------------------------
+# Handler
+# ---------------------------
+def handler(job: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        inp = job.get("input", {}) or {}
+
+        if inp.get("ping"):
+            return {"pong": True}
+
+        if inp.get("task") == "health":
+            return health()
+
+        task = (inp.get("task") or "transcribe").lower()
+        language = inp.get("language") or None
+        max_new_tokens = int(inp.get("max_new_tokens", MAX_NEW_TOKENS))
+        with_summary = bool(inp.get("with_summary", WITH_SUMMARY_DEFAULT))
+
+        local_path, cleanup = None, False
+        if inp.get("audio_url"):
+            local_path = _download_to_tmp(inp["audio_url"]); cleanup = True
+        elif inp.get("audio_b64"):
+            local_path = _b64_to_tmp(inp["audio_b64"]); cleanup = True
+        elif inp.get("file_path"):
+            local_path = inp["file_path"]
+        elif task not in ("health",):
+            return {"error": "Provide 'audio_url', 'audio_b64' or 'file_path'."}
+
+        if task in ("transcribe_diarized", "diarized", "diarize"):
+            out = diarize_then_transcribe(local_path, language, max_new_tokens, with_summary)
+            if "error" in out:
+                return out
+            return {"task": "transcribe_diarized", **out}
+        elif task in ("summary", "summarize"):
+            # Résumé concis basé sur transcript global (transcription du fichier complet, sans diarization)
+            # Pour rester simple et robuste, on applique la transcription stricte une fois sur tout le fichier.
+            try:
+                text_full = vox_strict_transcribe_file(local_path, language)
+            except Exception as e:
+                text_full = ""
+            seg = [{"speaker": "Global", "start": 0.0, "end": 0.0, "text": text_full}]
+            return {"task": "summary", "summary": concise_summary_from_segments(seg), "transcript": text_full}
+        else:
+            # Transcription stricte du fichier complet sans diarization
+            text_full = vox_strict_transcribe_file(local_path, language)
+            return {"task": "transcribe", "transcript": text_full}
+
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc(limit=3)}
+    finally:
+        try:
+            if 'cleanup' in locals() and cleanup and local_path and os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception:
+            pass
+
+# Warm load
+try:
+    load_voxtral()
+    load_diarizer()
+    if ENABLE_SENTIMENT:
+        load_sentiment()
+except Exception as e:
+    log(f"[WARN] Deferred load: {e}")
+
+runpod.serverless.start({"handler": handler})
