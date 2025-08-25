@@ -31,13 +31,13 @@ def log(msg: str):
         print(msg, flush=True)
 
 # ---------------------------
-# Env / Config - OPTIMISÉ POUR SMALL
+# Env / Config - ULTRA-STRICT OPTIMISÉ
 # ---------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "small-optimized-2025-08-25")
+APP_VERSION = os.environ.get("APP_VERSION", "ultra-strict-2025-08-25")
 
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "128"))      # OPTIMISÉ : 512→128
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "64"))       # ULTRA-STRICT : 128→64
 MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "300"))      # OPTIMISÉ : 1200→300
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
@@ -51,7 +51,7 @@ SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
 # Diarization speaker limit
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
 EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"   # force exactement 2 si possible
-MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "0.8"))         # OPTIMISÉ : 0.35→0.8
+MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "1.0"))         # ULTRA-STRICT : 0.8→1.0
 
 # Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
@@ -267,10 +267,6 @@ def _build_conv_transcribe(local_path: str, language: Optional[str]) -> List[Dic
         ],
     }]
 
-# ---------------------------
-# AJOUTEZ cette fonction alternative pour tester
-# ---------------------------
-
 def _build_conv_transcribe_ultra_strict(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
     """Version ultra-stricte pour éviter les hallucinations"""
     return [{
@@ -280,48 +276,6 @@ def _build_conv_transcribe_ultra_strict(local_path: str, language: Optional[str]
             {"type": "text", "text": "lang:fr [TRANSCRIBE] Écris exactement ce qui est dit, mot pour mot, en français uniquement."}
         ],
     }]
-
-# ---------------------------
-# MODIFIEZ la boucle de transcription dans diarize_then_transcribe()
-# Remplacez la partie transcription par :
-# ---------------------------
-
-        # VERSION ULTRA-STRICTE pour éviter hallucinations
-        if dur_s < 2.0:  # Segments courts
-            max_tokens_segment = 24   # RÉDUIT : 32→24
-            timeout_segment = 15
-        else:
-            max_tokens_segment = 48   # RÉDUIT : 64→48  
-            timeout_segment = 25      # RÉDUIT : 30→25
-
-        seg_audio = audio[int(start_s * 1000): int(end_s * 1000)]
-        tmp = os.path.join(tempfile.gettempdir(), f"seg_{speaker}_{int(start_s*1000)}.wav")
-        seg_audio.export(tmp, format="wav")
-
-        # Essai 1 : Version ultra-stricte
-        conv = _build_conv_transcribe_ultra_strict(tmp, "fr")
-        out = run_voxtral_with_timeout(conv, max_new_tokens=max_tokens_segment, timeout=timeout_segment)
-        text = (out.get("text") or "").strip()
-
-        # Fallback seulement si vide ET segment > 1.5s
-        if not text and dur_s >= 1.5:
-            log(f"[FALLBACK] Empty transcription for {dur_s:.1f}s segment")
-            conv2 = [{
-                "role": "user",
-                "content": [
-                    {"type": "audio", "path": tmp},
-                    {"type": "text", "text": "lang:fr [TRANSCRIBE]"}  # Minimal prompt
-                ],
-            }]
-            out2 = run_voxtral_with_timeout(conv2, max_new_tokens=max_tokens_segment, timeout=timeout_segment)
-            text = (out2.get("text") or "").strip()
-
-        # NOUVEAU : Filtre post-transcription pour éliminer aberrations
-        text = clean_transcription_result(text, dur_s)
-
-# ---------------------------
-# AJOUTEZ cette fonction de nettoyage
-# ---------------------------
 
 def clean_transcription_result(text: str, duration_s: float) -> str:
     """
@@ -341,6 +295,8 @@ def clean_transcription_result(text: str, duration_s: float) -> str:
         "i think it's",
         "after that, it can",
         "and sometimes it even",
+        "what is your age",
+        "a telephone number"
     ]
     
     text_lower = text.lower()
@@ -350,7 +306,7 @@ def clean_transcription_result(text: str, duration_s: float) -> str:
             return ""  # Vide plutôt qu'hallucination
     
     # Filtre 2: Mots anglais suspects dans conversation française
-    english_words = ["for", "this", "week", "yes", "of", "course", "telephone", "number", "what", "age", "please"]
+    english_words = ["for", "this", "week", "yes", "of", "course", "telephone", "number", "what", "age", "please", "right", "side"]
     words = text.lower().split()
     english_ratio = sum(1 for word in words if word in english_words) / max(len(words), 1)
     
@@ -364,10 +320,9 @@ def clean_transcription_result(text: str, duration_s: float) -> str:
     
     if words_count > max_expected_words * 1.5:  # 50% de marge
         log(f"[FILTER] Too many words for duration: {words_count} words in {duration_s:.1f}s")
-        return text.split()[:max_expected_words]  # Tronquer
+        return " ".join(text.split()[:max_expected_words])  # Tronquer
     
     return text
-
 
 def _build_conv_summary(local_path: str, language: Optional[str], max_sentences: Optional[int], style: Optional[str]) -> List[Dict[str, Any]]:
     parts = []
@@ -756,7 +711,7 @@ def _map_roles(segments: List[Dict[str, Any]]):
         s["speaker"] = mapping.get(s["speaker"], s["speaker"])
 
 # ---------------------------
-# Core flow - OPTIMISÉ POUR SMALL
+# Core flow - ULTRA-STRICT
 # ---------------------------
 def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
     # Durée max
@@ -793,39 +748,42 @@ def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_toke
         end_s = float(turn.end)
         dur_s = max(0.0, end_s - start_s)
         
-        # OPTIMISÉ : Ignore segments très courts pour Small (économise temps)
+        # ULTRA-STRICT : Ignore segments très courts
         if dur_s < MIN_SEG_DUR:
             continue
         
-        # OPTIMISÉ : Segments très courts = transcription simplifiée
-        if dur_s < 2.0:  # Moins de 2 secondes
-            max_tokens_segment = 32  # Très peu de tokens
-            timeout_segment = 15     # Timeout court
+        # VERSION ULTRA-STRICTE pour éviter hallucinations
+        if dur_s < 2.0:  # Segments courts
+            max_tokens_segment = 24   # RÉDUIT : 32→24
+            timeout_segment = 15
         else:
-            max_tokens_segment = min(max_new_tokens, 64)  # Tokens normaux mais limités
-            timeout_segment = 30     # Timeout normal
-        
+            max_tokens_segment = 48   # RÉDUIT : 64→48  
+            timeout_segment = 25      # RÉDUIT : 30→25
+
         seg_audio = audio[int(start_s * 1000): int(end_s * 1000)]
         tmp = os.path.join(tempfile.gettempdir(), f"seg_{speaker}_{int(start_s*1000)}.wav")
         seg_audio.export(tmp, format="wav")
 
-        # Transcription avec timeout adaptatif
-        conv = _build_conv_transcribe(tmp, language)
+        # Essai 1 : Version ultra-stricte
+        conv = _build_conv_transcribe_ultra_strict(tmp, "fr")
         out = run_voxtral_with_timeout(conv, max_new_tokens=max_tokens_segment, timeout=timeout_segment)
         text = (out.get("text") or "").strip()
 
-        # Fallback seulement si segment > 2s et vide
-        if not text and dur_s >= 2.0:
-            lang_prefix = f"lang:{language} " if language else ""
+        # Fallback seulement si vide ET segment > 1.5s
+        if not text and dur_s >= 1.5:
+            log(f"[FALLBACK] Empty transcription for {dur_s:.1f}s segment")
             conv2 = [{
                 "role": "user",
                 "content": [
                     {"type": "audio", "path": tmp},
-                    {"type": "text", "text": f"{lang_prefix}[TRANSCRIBE]"}
+                    {"type": "text", "text": "lang:fr [TRANSCRIBE]"}  # Minimal prompt
                 ],
             }]
             out2 = run_voxtral_with_timeout(conv2, max_new_tokens=max_tokens_segment, timeout=timeout_segment)
             text = (out2.get("text") or "").strip()
+
+        # NOUVEAU : Filtre post-transcription pour éliminer aberrations
+        text = clean_transcription_result(text, dur_s)
         
         # Logging performance
         if out.get("latency_s", 0) > 20:
