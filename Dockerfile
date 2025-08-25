@@ -32,7 +32,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # App
 COPY main.py /app/main.py
 
-ENV MODEL_ID="mistralai/Voxtral-Mini-3B-2507" \
+ENV MODEL_ID="mistralai/Voxtral-Small-24B-2507" \
     MAX_NEW_TOKENS="512" \
     TEMPERATURE="0.0" \
     TOP_P="0.95" \
