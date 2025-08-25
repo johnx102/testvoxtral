@@ -35,7 +35,7 @@ def log(msg: str):
 # ---------------------------
 APP_VERSION = os.environ.get("APP_VERSION", "stable-2025-08-25")
 
-MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Mini-3B-2507").strip()
+MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "512"))
 MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "1200"))
