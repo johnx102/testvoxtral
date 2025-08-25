@@ -1,134 +1,98 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RunPod serverless — Voxtral (transcribe mode) + PyAnnote diarization + résumé concis + humeur
-- Transcript STRICT: génération greedy (do_sample=False), construit uniquement depuis l'audio de chaque segment diarizé.
-- Diarization: pyannote/speaker-diarization-3.1 (HF_TOKEN requis), limité à 2 locuteurs (Agent/Client).
-- Résumé: 2–3 phrases, fidèle, généré par Voxtral en mode texte (greedy).
-- Humeur: zero-shot (positive / neutral / negative) overall + par locuteur.
+RunPod — Voxtral (transcribe strict) + PyAnnote diarization stricte (exactement 2 locuteurs) + résumé concis + humeur.
+- Transcript strict (greedy, sans sampling), construit uniquement à partir des segments diarizés.
+- Diarization PyAnnote 3.1 forcée à 2 locuteurs (min_speakers=2, max_speakers=2) → rôles Agent/Client.
+- Résumé concis (2–3 phrases) fidèle au transcript.
+- Humeur globale + par locuteur (positive / neutral / negative).
 """
 
-import os
-import io
-import sys
-import time
-import json
-import base64
-import logging
-from typing import Dict, Any, List, Tuple
+import os, io, time, json, base64
+from typing import Any, Dict, List, Tuple
 
 import torch
 import numpy as np
 import soundfile as sf
 
-# =========================
-#  Logging
-# =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("voxrun")
-
-# =========================
-#  Env
-# =========================
+# --------- ENV ---------
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
 VOXTRAL_MODEL_ID = os.getenv("VOXTRAL_MODEL_ID", "mistralai/Voxtral-Mini-3B-2507")
 DIAR_MODEL_ID = os.getenv("DIAR_MODEL_ID", "pyannote/speaker-diarization-3.1")
 SENTIMENT_MODEL_ID = os.getenv("SENTIMENT_MODEL_ID", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli")
-MAX_SPEAKERS = int(os.getenv("MAX_SPEAKERS", "2"))  # limit to 2 as requested
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "2400"))  # 40 minutes hard cap
+MAX_SPEAKERS = 2  # strict
 
-# Make TF32 optional but not forced (pyannote warns when disabled)
 try:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 except Exception:
     pass
 
-# =========================
-#  Transformers (Voxtral)
-# =========================
-from transformers import (
-    VoxtralForConditionalGeneration,
-    VoxtralProcessor,
-    pipeline as hf_pipeline,
-)
+# --------- Transformers (Voxtral) ---------
+from transformers import VoxtralForConditionalGeneration, VoxtralProcessor, pipeline as hf_pipeline
 
-log.info("[INIT] Loading Voxtral: %s dtype=%s device=%s", VOXTRAL_MODEL_ID, DTYPE, DEVICE)
 _vox_processor = VoxtralProcessor.from_pretrained(VOXTRAL_MODEL_ID)
-_vox_model = VoxtralForConditionalGeneration.from_pretrained(
-    VOXTRAL_MODEL_ID,
-    torch_dtype=DTYPE,
-    device_map=DEVICE,
-)
-_vox_model.eval()
+_vox_model = VoxtralForConditionalGeneration.from_pretrained(VOXTRAL_MODEL_ID, torch_dtype=DTYPE)
+_vox_model.to(DEVICE).eval()
 
-# =========================
-#  Sentiment
-# =========================
-log.info("[INIT] Loading zero-shot sentiment on device %s: %s", ("0" if DEVICE=="cuda" else "-1"), SENTIMENT_MODEL_ID)
+# --------- Sentiment ---------
 try:
-    _clf = hf_pipeline(
-        "zero-shot-classification",
-        model=SENTIMENT_MODEL_ID,
-        device=0 if DEVICE=="cuda" else -1,
-    )
-    log.info("[INIT] Zero-shot sentiment ready.")
-except Exception as e:
+    _clf = hf_pipeline("zero-shot-classification", model=SENTIMENT_MODEL_ID, device=0 if DEVICE=="cuda" else -1)
+except Exception:
     _clf = None
-    log.warning("[INIT] Sentiment disabled: %s", e)
 
-# =========================
-#  Diarization (pyannote)
-# =========================
+# --------- Diarization (pyannote) ---------
 from pyannote.audio import Pipeline as PyanPipeline
-
 _diarizer = None
 def load_diarizer():
     global _diarizer
     if _diarizer is None:
         if not HF_TOKEN:
             raise RuntimeError("HF_TOKEN manquant pour pyannote.")
-        log.info("[INIT] Loading diarizer: %s", DIAR_MODEL_ID)
         _diarizer = PyanPipeline.from_pretrained(DIAR_MODEL_ID, use_auth_token=HF_TOKEN)
-        _diarizer.to(torch.device(DEVICE))  # IMPORTANT: torch.device
-        log.info("[INIT] Diarizer moved to %s.", DEVICE.upper())
+        _diarizer.to(torch.device(DEVICE))
     return _diarizer
 
-# =========================
-#  Utils
-# =========================
+# --------- Utils ---------
+def _resample_ta(wave: np.ndarray, sr: int, target_sr: int) -> Tuple[np.ndarray, int]:
+    import torchaudio.functional as AF
+    wav_t = torch.from_numpy(wave).float().unsqueeze(0)  # (1, n)
+    with torch.no_grad():
+        out = AF.resample(wav_t, orig_freq=sr, new_freq=target_sr)
+    return out.squeeze(0).numpy(), target_sr
+
 def _load_audio_from_event(event_input: Dict[str, Any]) -> Tuple[np.ndarray, int]:
-    """Return mono float32 waveform and sample_rate"""
     if "audio_b64" in event_input and event_input["audio_b64"]:
         byts = base64.b64decode(event_input["audio_b64"])
         data, sr = sf.read(io.BytesIO(byts), dtype="float32", always_2d=False)
     elif "audio_url" in event_input and event_input["audio_url"]:
         import requests
-        url = event_input["audio_url"]
-        r = requests.get(url, timeout=60)
+        r = requests.get(event_input["audio_url"], timeout=90)
         r.raise_for_status()
         data, sr = sf.read(io.BytesIO(r.content), dtype="float32", always_2d=False)
     elif "file_path" in event_input and event_input["file_path"]:
         data, sr = sf.read(event_input["file_path"], dtype="float32", always_2d=False)
     else:
         raise ValueError("Provide 'audio_url', 'audio_b64' or 'file_path'.")
+
     if data.ndim == 2:
         data = data.mean(axis=1)
-    # Resample to 16k for safety
-    target_sr = 16000
-    if sr != target_sr:
-        import resampy
-        data = resampy.resample(data, sr, target_sr)
-        sr = target_sr
+
+    # hard cap
+    max_n = int(MAX_AUDIO_SECONDS * sr)
+    if data.shape[0] > max_n:
+        data = data[:max_n]
+
+    # resample to 16k
+    if sr != 16000:
+        data, sr = _resample_ta(data, sr, 16000)
+
     return data, sr
 
 def _vox_transcribe_chunk(wave_mono_f32: np.ndarray, sr: int, language: str | None) -> str:
-    """Strict transcription mode: greedy decode (no sampling/beams=1)."""
     inputs = _vox_processor.apply_transcription_request(
         language=language or "auto",
         audio=wave_mono_f32,
@@ -147,15 +111,14 @@ def _vox_transcribe_chunk(wave_mono_f32: np.ndarray, sr: int, language: str | No
     return text.strip()
 
 def _summarize_concise(transcript_text: str, max_new_tokens: int = 160) -> str:
-    """2–3 sentences, faithful, greedy"""
     if not transcript_text.strip():
         return ""
+    tok = _vox_processor.tokenizer
     prompt = (
-        "Tu es un assistant qui résume fidèlement un appel téléphonique en français. "
-        "Rédige un résumé concis (2–3 phrases), sans listes ni citations, et n’invente rien.\n\n"
+        "Tu résumes fidèlement un appel en français. "
+        "Écris 2–3 phrases concises, sans listes ni citations, sans ajout d'informations.\n\n"
         f"Transcription:\n{transcript_text}\n\nRésumé:"
     )
-    tok = _vox_processor.tokenizer
     encoded = tok.apply_chat_template(
         [{"role": "user", "content": prompt}],
         add_generation_prompt=True,
@@ -168,30 +131,25 @@ def _summarize_concise(transcript_text: str, max_new_tokens: int = 160) -> str:
             do_sample=False,
             num_beams=1,
         )
-    gen = tok.batch_decode(out[:, encoded.shape[1]:], skip_special_tokens=True)[0]
-    return gen.strip()
+    return tok.batch_decode(out[:, encoded.shape[1]:], skip_special_tokens=True)[0].strip()
 
 def _classify_mood_fr(text: str) -> Dict[str, Any]:
     if not _clf or not text.strip():
-        return {"label_en": "neutral", "label_fr": "neutre", "confidence": 0.0, "scores": {"negative":0.0,"neutral":1.0,"positive":0.0}}
+        return {"label_en":"neutral","label_fr":"neutre","confidence":0.0,"scores":{"negative":0.0,"neutral":1.0,"positive":0.0}}
     res = _clf(text, candidate_labels=["positive","neutral","negative"], multi_label=False)
     if isinstance(res, list):
         res = res[0]
-    labels = res["labels"]
-    scores = res["scores"]
+    labels, scores = res["labels"], res["scores"]
     mapping = {"positive":"bon","neutral":"neutre","negative":"mauvais"}
-    d = dict(zip(labels, scores))
     best = labels[0]
     return {
         "label_en": best,
         "label_fr": mapping.get(best, best),
-        "confidence": float(d.get(best, 0.0)),
-        "scores": {k: float(d.get(k, 0.0)) for k in ["negative","neutral","positive"]},
+        "confidence": float(scores[labels.index(best)]),
+        "scores": {k: float(scores[labels.index(k)]) for k in ["negative","neutral","positive"] if k in labels},
     }
 
-# =========================
-#  Core pipeline
-# =========================
+# --------- Core ---------
 def transcribe_diarized_strict(event_input: Dict[str, Any]) -> Dict[str, Any]:
     language = event_input.get("language") or None
     with_summary = bool(event_input.get("with_summary", True))
@@ -199,12 +157,12 @@ def transcribe_diarized_strict(event_input: Dict[str, Any]) -> Dict[str, Any]:
 
     wav, sr = _load_audio_from_event(event_input)
 
-    # Diarize
+    # diarization strict à 2 speakers
     diar = load_diarizer()
-    diarization = diar({"waveform": torch.tensor(wav).unsqueeze(0), "sample_rate": sr})
+    diarization = diar({"waveform": torch.tensor(wav).unsqueeze(0), "sample_rate": sr,
+                        "min_speakers": MAX_SPEAKERS, "max_speakers": MAX_SPEAKERS})
 
-    # Convert diarization to segments list [{"start":..., "end":..., "speaker":"SPEAKER_00"}...]
-    segments = []
+    segments: List[Dict[str, Any]] = []
     try:
         for segment, _, speaker in diarization.itertracks(yield_label=True):
             segments.append({"start": float(segment.start), "end": float(segment.end), "speaker": str(speaker)})
@@ -213,45 +171,39 @@ def transcribe_diarized_strict(event_input: Dict[str, Any]) -> Dict[str, Any]:
 
     segments.sort(key=lambda s: (s.get("start", 0.0), s.get("end", 0.0)))
 
-    # Limit speakers to MAX_SPEAKERS (2): keep first encountered
-    order = []
+    # garder l'ordre d'apparition pour mapper Agent/Client
+    order: List[str] = []
     for s in segments:
         sp = s["speaker"]
         if sp not in order:
             order.append(sp)
         if len(order) >= MAX_SPEAKERS:
             break
-    if not order:
-        order = ["SPEAKER_00","SPEAKER_01"]
+    # sécurité si pipeline renvoie moins de 2 labels
     while len(order) < MAX_SPEAKERS:
         order.append(f"SPEAKER_{len(order):02d}")
 
-    # Map to Agent/Client
-    role_for = {order[0]: "Agent", order[1]: "Client"} if len(order) >= 2 else {order[0]: "Agent"}
-    default_role = "Agent"
+    role_for = {order[0]: "Agent", order[1]: "Client"}
 
-    # Transcribe each segment (strict)
-    PAD = 0.15
-    MIN_DUR = 0.6
-
+    # Transcription strict sur chaque segment
+    PAD, MIN_DUR = 0.10, 0.60
+    n = len(wav)
     out_segments: List[Dict[str, Any]] = []
     lines: List[str] = []
 
-    n = len(wav)
     for seg in segments:
         spk = seg["speaker"]
         if spk not in role_for:
             continue
-        start = float(seg["start"]); end = float(seg["end"])
-        dur = end - start
-        if dur < MIN_DUR:
+        start, end = float(seg["start"]), float(seg["end"])
+        if end - start < MIN_DUR:
             continue
         s = max(0.0, start - PAD)
         e = min(n / sr, end + PAD)
-        s_idx = int(s * sr); e_idx = int(e * sr)
+        s_idx, e_idx = int(s * sr), int(e * sr)
         chunk = wav[s_idx:e_idx]
         txt = _vox_transcribe_chunk(chunk, sr, language)
-        role = role_for.get(spk, default_role)
+        role = role_for[spk]
         if txt:
             out_segments.append({"start": start, "end": end, "speaker": role, "text": txt})
             lines.append(f"{role}: {txt}")
@@ -259,14 +211,14 @@ def transcribe_diarized_strict(event_input: Dict[str, Any]) -> Dict[str, Any]:
     transcript = "\n".join(lines).strip()
     summary = _summarize_concise(transcript, max_new_tokens=max_new_tokens) if with_summary else ""
 
-    # Mood
+    # Humeur
     mood_overall = _classify_mood_fr(transcript)
-    mood_by_speaker = {}
-    by_role_text = {}
-    for seg in out_segments:
-        by_role_text.setdefault(seg["speaker"], []).append(seg["text"])
-    for role, texts in by_role_text.items():
-        mood_by_speaker[role] = _classify_mood_fr(" ".join(texts))
+    mood_by_speaker: Dict[str, Any] = {}
+    texts_by_role: Dict[str, List[str]] = {}
+    for s in out_segments:
+        texts_by_role.setdefault(s["speaker"], []).append(s["text"])
+    for role, txts in texts_by_role.items():
+        mood_by_speaker[role] = _classify_mood_fr(" ".join(txts))
 
     return {
         "task": "transcribe_diarized",
@@ -277,19 +229,17 @@ def transcribe_diarized_strict(event_input: Dict[str, Any]) -> Dict[str, Any]:
         "mood_by_speaker": mood_by_speaker,
     }
 
-# =========================
-#  RunPod handler
-# =========================
+# --------- RunPod handler ---------
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.time()
     try:
         inp = event.get("input") or {}
         task = (inp.get("task") or "transcribe_diarized").strip().lower()
 
-        if task in ("health","status","ping"):
+        if task in ("health", "status", "ping"):
             info = {
                 "ok": True,
-                "python": sys.version.split()[0],
+                "python": "%s" % (tuple(map(int, torch.__version__.split('+')[0].split('.'))) and __import__('sys').version.split()[0]),
                 "torch": torch.__version__,
                 "cuda_available": torch.cuda.is_available(),
                 "cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
@@ -310,10 +260,8 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         import traceback
         trace = traceback.format_exc()
-        log.error("Handler error: %s", trace)
         return {"status": "FAILED", "error": f"{type(e).__name__}: {e}", "output": {"trace": trace}, "executionTime": int((time.time() - t0) * 1000)}
 
-# For local testing
+# local test
 if __name__ == "__main__":
-    ex = {"input": {"task": "health"}}
-    print(json.dumps(handler(ex), ensure_ascii=False, indent=2))
+    print(json.dumps(handler({"input": {"task": "health"}}), ensure_ascii=False, indent=2))
