@@ -121,32 +121,44 @@ def load_voxtral():
 
     log(f"[INIT] Loading Voxtral: {MODEL_ID}")
 
-    proc_kwargs = {}
-    if HF_TOKEN:
-        proc_kwargs["token"] = HF_TOKEN
-    _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
+    # Chargement du processor avec timeout implicite
+    try:
+        proc_kwargs = {}
+        if HF_TOKEN:
+            proc_kwargs["token"] = HF_TOKEN
+        log("[INIT] Loading processor...")
+        _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
+        log("[INIT] Processor loaded successfully")
+    except Exception as e:
+        log(f"[ERROR] Failed to load processor: {e}")
+        raise
 
     # MÉMOIRE GPU OPTIMISÉE pour Small 24B
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
     log(f"[INIT] Using dtype: {dtype}")
     
     mdl_kwargs = {
-        "torch_dtype": dtype,          # CRUCIAL : force dtype optimal
+        "dtype": dtype,                # CORRIGÉ : utilise dtype au lieu de torch_dtype (déprécié)
         "device_map": "auto",
-        "low_cpu_mem_usage": True,     # NOUVEAU : économise RAM CPU
-        "max_memory": {0: "50GB"}      # NOUVEAU : limite explicite GPU 0
+        "low_cpu_mem_usage": True,
+        # Supprimé max_memory qui peut causer des problèmes de chargement
     }
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
 
-    if _HAS_VOXTRAL_CLASS:
-        _model = VoxtralForConditionalGeneration.from_pretrained(MODEL_ID, **mdl_kwargs)
-    else:
-        raise RuntimeError("Transformers sans VoxtralForConditionalGeneration. Utiliser transformers@main/nightly.")
+    # Chargement du modèle avec gestion d'erreur améliorée
+    try:
+        log("[INIT] Loading model... (this may take several minutes)")
+        if _HAS_VOXTRAL_CLASS:
+            _model = VoxtralForConditionalGeneration.from_pretrained(MODEL_ID, **mdl_kwargs)
+        else:
+            raise RuntimeError("Transformers sans VoxtralForConditionalGeneration. Utiliser transformers@main/nightly.")
+        log("[INIT] Model loaded successfully")
+    except Exception as e:
+        log(f"[ERROR] Failed to load model: {e}")
+        raise
 
-    # PAS de .to() explicite - laisse device_map gérer
-    log("[INIT] Skipping explicit .to() - letting device_map handle placement")
-
+    # Vérification du placement du modèle
     try:
         p = next(_model.parameters())
         log(f"[INIT] Voxtral device={p.device}, dtype={p.dtype}")
@@ -215,28 +227,18 @@ def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict
 
 def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens: int, timeout: int = 45) -> Dict[str, Any]:
     """
-    Wrapper avec timeout pour éviter les requêtes infinies
+    Wrapper simplifié sans signaux Unix (compatibilité améliorée)
     """
-    def timeout_handler(signum, frame):
-        raise TimeoutError(f"Voxtral inference timed out after {timeout}s")
-    
-    # Setup timeout
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(timeout)
-    
     try:
+        log(f"[VOXTRAL] Starting inference (max_tokens={max_new_tokens})")
+        start_time = time.time()
         result = run_voxtral(conversation, max_new_tokens)
-        signal.alarm(0)  # Cancel timeout
+        duration = time.time() - start_time
+        log(f"[VOXTRAL] Completed in {duration:.2f}s")
         return result
-    except TimeoutError as e:
-        log(f"[TIMEOUT] {e}")
-        return {"text": "", "latency_s": timeout}
     except Exception as e:
-        signal.alarm(0)
         log(f"[ERROR] Voxtral inference failed: {e}")
         return {"text": "", "latency_s": 0}
-    finally:
-        signal.signal(signal.SIGALRM, old_handler)
 
 def _build_conv_transcribe(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
     # Force le français si pas spécifié explicitement
@@ -959,15 +961,37 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-# Preload (chaud) avec vérification mémoire
+# Preload conditionnel et sûr
 try:
+    log("[INIT] Starting conditional preload...")
+    
+    # Vérification GPU en premier
     if not check_gpu_memory():
         log("[CRITICAL] Insufficient GPU memory for Voxtral Small - consider using Mini")
-    load_voxtral()
-    load_diarizer()
-    if ENABLE_SENTIMENT:
-        load_sentiment()
+        log("[INIT] Skipping preload due to memory issues")
+    else:
+        # Preload Voxtral seulement si assez de mémoire
+        log("[INIT] Preloading Voxtral...")
+        load_voxtral()
+        
+        # Diarizer (plus léger)
+        log("[INIT] Preloading diarizer...")
+        load_diarizer()
+        
+        # Sentiment (optionnel et sur CPU)
+        if ENABLE_SENTIMENT:
+            log("[INIT] Preloading sentiment...")
+            load_sentiment()
+            
+        log("[INIT] Preload completed successfully")
+        
 except Exception as e:
-    log(f"[WARN] Deferred load: {e}")
+    log(f"[WARN] Preload failed - will load on first request: {e}")
+    # Reset les variables globales si le preload échoue
+    _processor = None
+    _model = None
+    _diarizer = None
+    _sentiment_clf = None
+    _sentiment_zero_shot = None
 
 runpod.serverless.start({"handler": handler})
