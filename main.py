@@ -1164,11 +1164,14 @@ def health():
         "min_speaker_time": MIN_SPEAKER_TIME,  # NOUVEAU
         "merge_consecutive": MERGE_CONSECUTIVE,  # NOUVEAU
         "role_labels": ROLE_LABELS,
+        "hybrid_mode": HYBRID_MODE,  # NOUVEAU
         "optimizations": {  # NOUVEAU : résumé des optimisations
+            "hybrid_transcription": HYBRID_MODE,
+            "global_vs_segments": "1 Voxtral call instead of 10-50+",
             "segment_filtering": f"Ignore segments < {MIN_SEG_DUR}s",
             "speaker_filtering": f"Ignore speakers < {MIN_SPEAKER_TIME}s total",
             "consecutive_merging": MERGE_CONSECUTIVE,
-            "expected_reduction": "60-80% fewer Voxtral calls"
+            "expected_speedup": "10-20x faster" if HYBRID_MODE else "2-3x faster"
         }
     }
     try:
