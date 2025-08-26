@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, time, base64, tempfile, uuid, requests, json, traceback, re, signal
+import os, time, base64, tempfile, uuid, requests, json, traceback, re
 from typing import Optional, List, Dict, Any, Tuple
 
 import torch
@@ -31,35 +31,34 @@ def log(msg: str):
         print(msg, flush=True)
 
 # ---------------------------
-# Env / Config - ULTRA-STRICT OPTIMISÉ
+# Env / Config - MODE HYBRIDE ULTRA-RAPIDE
 # ---------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "ultra-strict-2025-08-25-v2")
+APP_VERSION = os.environ.get("APP_VERSION", "ultra-fast-hybrid-v1.0")
 
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "64"))       # ULTRA-STRICT : 128→64
-MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "300"))      # OPTIMISÉ : 1200→300
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "64"))       
+MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "300"))      
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
 # Sentiment (CPU par défaut)
 SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli").strip()
-SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()  # "zero-shot" | "classifier"
+SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
 SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
 
-# Diarization speaker limit - MODE HYBRIDE ULTRA-RAPIDE
+# Diarization - MODE HYBRIDE ULTRA-RAPIDE
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
 EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"   
-MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "8.0"))         # ULTRA-AGRESSIF : 3.0→8.0
-MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "3.0")) # ULTRA-AGRESSIF : 1.0→3.0
+MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "8.0"))         # ULTRA-AGRESSIF
+MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "3.0")) # ULTRA-AGRESSIF
 MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"  
 HYBRID_MODE = os.environ.get("HYBRID_MODE", "1") == "1"  # NOUVEAU : transcription globale + diarization
 
 # Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
-# NOUVEAU : Mode résumé optimisé
-SMART_SUMMARY = os.environ.get("SMART_SUMMARY", "1") == "1"  # Résumé intelligent par défaut
+SMART_SUMMARY = os.environ.get("SMART_SUMMARY", "1") == "1"  
 EXTRACTIVE_SUMMARY = os.environ.get("EXTRACTIVE_SUMMARY", "0") == "1"
 
 # Libellés des rôles (après mapping)
@@ -105,10 +104,10 @@ def check_gpu_memory():
         
         log(f"[GPU] Total: {total:.1f}GB | Allocated: {allocated:.1f}GB | Cached: {cached:.1f}GB | Free: {free:.1f}GB")
         
-        if total < 45:  # Moins de 45GB = problème pour Small
+        if total < 45:
             log(f"[ERROR] GPU has only {total:.1f}GB - Voxtral Small needs ~55GB minimum")
             return False
-        elif free < 10:  # Moins de 10GB libres
+        elif free < 10:
             log(f"[WARN] Only {free:.1f}GB free - might cause OOM")
             
         return True
@@ -124,7 +123,6 @@ def load_voxtral():
 
     log(f"[INIT] Loading Voxtral: {MODEL_ID}")
 
-    # Chargement du processor avec timeout implicite
     try:
         proc_kwargs = {}
         if HF_TOKEN:
@@ -141,15 +139,13 @@ def load_voxtral():
     log(f"[INIT] Using dtype: {dtype}")
     
     mdl_kwargs = {
-        "dtype": dtype,                # CORRIGÉ : utilise dtype au lieu de torch_dtype (déprécié)
+        "dtype": dtype,
         "device_map": "auto",
         "low_cpu_mem_usage": True,
-        # Supprimé max_memory qui peut causer des problèmes de chargement
     }
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
 
-    # Chargement du modèle avec gestion d'erreur améliorée
     try:
         log("[INIT] Loading model... (this may take several minutes)")
         if _HAS_VOXTRAL_CLASS:
@@ -161,12 +157,10 @@ def load_voxtral():
         log(f"[ERROR] Failed to load model: {e}")
         raise
 
-    # Vérification du placement du modèle
     try:
         p = next(_model.parameters())
         log(f"[INIT] Voxtral device={p.device}, dtype={p.dtype}")
         
-        # Vérification que le modèle est majoritairement sur GPU
         gpu_params = sum(1 for p in _model.parameters() if p.device.type == 'cuda')
         total_params = sum(1 for p in _model.parameters())
         gpu_ratio = gpu_params / total_params if total_params > 0 else 0
@@ -182,7 +176,6 @@ def load_voxtral():
     return _processor, _model
 
 def _move_to_device_no_cast(batch, device: str):
-    # Déplace uniquement sur device, sans modifier dtype
     if hasattr(batch, "to"):
         return batch.to(device)
     if isinstance(batch, dict):
@@ -204,10 +197,9 @@ def _input_len_from_batch(inputs) -> int:
 def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict[str, Any]:
     processor, model = load_voxtral()
     
-    # Voxtral ne supporte pas add_generation_prompt - essai avec, puis sans
     try:
         inputs = processor.apply_chat_template(conversation, add_generation_prompt=True)
-    except (TypeError, ValueError):  # Capture ValueError aussi !
+    except (TypeError, ValueError):
         inputs = processor.apply_chat_template(conversation)
 
     device = _device_str()
@@ -215,7 +207,7 @@ def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict
 
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
-        do_sample=False,     # déterministe pour la transcription
+        do_sample=False,
         temperature=None,
         top_p=None,
     )
@@ -229,9 +221,7 @@ def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict
     return {"text": decoded[0] if decoded else "", "latency_s": dt}
 
 def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens: int, timeout: int = 45) -> Dict[str, Any]:
-    """
-    Wrapper simplifié sans signaux Unix (compatibilité améliorée)
-    """
+    """Wrapper simplifié sans signaux Unix"""
     try:
         log(f"[VOXTRAL] Starting inference (max_tokens={max_new_tokens})")
         start_time = time.time()
@@ -242,35 +232,6 @@ def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens:
     except Exception as e:
         log(f"[ERROR] Voxtral inference failed: {e}")
         return {"text": "", "latency_s": 0}
-
-def _build_conv_transcribe(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
-    # Force le français si pas spécifié explicitement
-    if not language:
-        language = "fr"  # NOUVEAU : force français par défaut
-    
-    lang_prefix = f"lang:{language} " if language else "lang:fr "
-    
-    if STRICT_TRANSCRIPTION:
-        constraints = (
-            "TRANSCRIPTION TEXTUELLE EXACTE UNIQUEMENT. "
-            "Reproduis chaque mot exactement comme prononcé. "
-            "AUCUNE traduction, AUCUN ajout, AUCUNE correction. "
-            "Si c'est du français, reste en français. "
-            "Si inaudible: [inaudible]. "
-            "Pas de ponctuation excessive. "
-            "ZÉRO interprétation."
-        )
-        instruction = f"{lang_prefix}[TRANSCRIBE] {constraints}"
-    else:
-        instruction = f"{lang_prefix}[TRANSCRIBE] Mot à mot, langue originale uniquement."
-    
-    return [{
-        "role": "user",
-        "content": [
-            {"type": "audio", "path": local_path},
-            {"type": "text", "text": instruction},
-        ],
-    }]
 
 def _build_conv_transcribe_ultra_strict(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
     """Version ultra-stricte pour éviter les hallucinations"""
@@ -283,247 +244,46 @@ def _build_conv_transcribe_ultra_strict(local_path: str, language: Optional[str]
     }]
 
 def clean_transcription_result(text: str, duration_s: float) -> str:
-    """
-    Nettoie le résultat de transcription pour éliminer les aberrations
-    """
+    """Nettoie le résultat de transcription pour éliminer les aberrations"""
     if not text:
         return ""
     
     text = text.strip()
     
-    # Filtre 1: Segments suspects (hallucinations communes de Voxtral)
+    # Filtre : Segments suspects (hallucinations communes de Voxtral)
     suspicious_phrases = [
-        "so, you're making",
-        "in fact, i have",
-        "tell me the price",
-        "thank you very much",
-        "i think it's",
-        "after that, it can",
-        "and sometimes it even",
-        "what is your age",
+        "so, you're making", "in fact, i have", "tell me the price", "thank you very much",
+        "i think it's", "after that, it can", "and sometimes it even", "what is your age",
         "a telephone number"
     ]
     
     text_lower = text.lower()
     for phrase in suspicious_phrases:
-        if phrase in text_lower and duration_s < 3.0:  # Phrases longues dans segments courts = suspect
+        if phrase in text_lower and duration_s < 3.0:
             log(f"[FILTER] Suspicious phrase detected: '{text}' (duration: {duration_s:.1f}s)")
-            return ""  # Vide plutôt qu'hallucination
+            return ""
     
-    # Filtre 2: Mots anglais suspects dans conversation française
+    # Filtre : Mots anglais suspects dans conversation française
     english_words = ["for", "this", "week", "yes", "of", "course", "telephone", "number", "what", "age", "please", "right", "side"]
     words = text.lower().split()
     english_ratio = sum(1 for word in words if word in english_words) / max(len(words), 1)
     
-    if english_ratio > 0.4 and duration_s < 4.0:  # Plus de 40% anglais dans segment court
+    if english_ratio > 0.4 and duration_s < 4.0:
         log(f"[FILTER] Too much English detected: '{text}' (ratio: {english_ratio:.1%})")
         return ""
     
-    # Filtre 3: Segments trop longs pour la durée audio (hallucination)
+    # Filtre : Segments trop longs pour la durée audio (hallucination)
     words_count = len(text.split())
-    max_expected_words = int(duration_s * 4)  # ~4 mots/seconde max
+    max_expected_words = int(duration_s * 4)
     
-    if words_count > max_expected_words * 1.5:  # 50% de marge
+    if words_count > max_expected_words * 1.5:
         log(f"[FILTER] Too many words for duration: {words_count} words in {duration_s:.1f}s")
-        return " ".join(text.split()[:max_expected_words])  # Tronquer
+        return " ".join(text.split()[:max_expected_words])
     
     return text
 
 # ---------------------------
-# RÉSUMÉS OPTIMISÉS - VERSION 2.0
-# ---------------------------
-
-def generate_natural_summary(full_transcript: str, language: Optional[str] = None) -> str:
-    """
-    Génère un résumé naturel et utile sans structure artificielle.
-    Instructions simplifiées pour des résultats plus pertinents.
-    """
-    if not full_transcript.strip():
-        return "Conversation vide."
-    
-    # Instructions optimisées pour résumés naturels et utiles
-    lang_prefix = f"lang:{language} " if language else ""
-    
-    # Instruction simple et efficace
-    instruction = (
-        f"{lang_prefix}Résume cette conversation en 1-2 phrases simples et claires. "
-        "Dis juste l'essentiel : qui appelle pourquoi, et ce qui va se passer. "
-        "Sois direct et naturel, sans format particulier."
-    )
-    
-    # Conversation pour Voxtral
-    conversation = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": f"{instruction}\n\nConversation:\n{full_transcript}"}
-        ]
-    }]
-    
-    try:
-        result = run_voxtral_with_timeout(conversation, max_new_tokens=72, timeout=25)
-        summary = (result.get("text") or "").strip()
-        
-        # Validation et nettoyage
-        summary = clean_generated_summary(summary)
-        
-        if not summary or len(summary) < 10:
-            log("[WARN] Generated summary too short, using extractive fallback")
-            return create_extractive_summary(full_transcript)
-        
-        return summary
-        
-    except Exception as e:
-        log(f"[ERROR] Natural summary generation failed: {e}")
-        return create_extractive_summary(full_transcript)
-
-def clean_generated_summary(summary: str) -> str:
-    """
-    Nettoie et valide les résumés générés par Voxtral.
-    """
-    if not summary:
-        return ""
-    
-    # Supprime les phrases d'introduction inutiles
-    unwanted_starts = [
-        "voici un résumé", "résumé de la conversation", "cette conversation",
-        "dans cette conversation", "le résumé", "il s'agit"
-    ]
-    
-    summary_lower = summary.lower().strip()
-    for start in unwanted_starts:
-        if summary_lower.startswith(start):
-            # Trouve la première phrase réelle après
-            sentences = re.split(r'[.!?]+', summary)
-            for sentence in sentences[1:]:
-                cleaned = sentence.strip()
-                if len(cleaned) > 15 and not any(cleaned.lower().startswith(u) for u in unwanted_starts):
-                    summary = cleaned
-                    break
-    
-    # Supprime les formats artificiels
-    patterns_to_remove = [
-        r'décision[/:].*?étape[s]?\s*:', 
-        r'prochaine[s]?\s*étape[s]?\s*:',
-        r'action[s]?\s*à\s*prendre\s*:',
-        r'conclusion\s*:',
-        r'format\s*attendu\s*:'
-    ]
-    
-    for pattern in patterns_to_remove:
-        summary = re.sub(pattern, '', summary, flags=re.IGNORECASE).strip()
-    
-    # Nettoie la ponctuation excessive
-    summary = re.sub(r'\.{2,}', '.', summary)
-    summary = re.sub(r'\s+', ' ', summary).strip()
-    
-    # Supprime les résumés qui semblent artificiels
-    artificial_indicators = [
-        "format attendu", "décision/prochaine étape", "action à prendre",
-        "structure suivante", "points suivants"
-    ]
-    
-    if any(indicator in summary.lower() for indicator in artificial_indicators):
-        return ""
-    
-    return summary
-
-def create_extractive_summary(transcript: str) -> str:
-    """
-    Résumé extractif amélioré basé sur l'analyse du contenu.
-    Plus intelligent que la version précédente.
-    """
-    if not transcript:
-        return "Conversation indisponible."
-    
-    lines = [l.strip() for l in transcript.split('\n') if l.strip() and ':' in l]
-    
-    if not lines:
-        return "Conversation très courte."
-    
-    # Analyse des patterns de conversation
-    summary_parts = []
-    
-    # 1. Identifie le motif de l'appel (client)
-    client_lines = [l for l in lines if l.lower().startswith('client:')]
-    for line in client_lines:
-        text = line.replace('Client:', '').strip().lower()
-        
-        # Motifs d'appel courants
-        if any(kw in text for kw in ['rendez-vous', 'rdv', 'prendre', 'avancer', 'reporter']):
-            summary_parts.append("Appel pour un rendez-vous")
-            break
-        elif any(kw in text for kw in ['information', 'renseignement', 'savoir']):
-            summary_parts.append("Demande d'information")
-            break
-        elif any(kw in text for kw in ['problème', 'souci', 'bug']):
-            summary_parts.append("Signalement d'un problème")
-            break
-    
-    # 2. Identifie la réponse de l'agent
-    agent_lines = [l for l in lines if l.lower().startswith('agent:')]
-    for line in agent_lines:
-        text = line.replace('Agent:', '').strip().lower()
-        
-        if any(kw in text for kw in ['je vais', 'on va', 'nous allons']):
-            action = line.replace('Agent:', '').strip()
-            if len(action) > 10:  # Action substantielle
-                summary_parts.append(f"L'agent va {action.lower()}")
-                break
-        elif any(kw in text for kw in ['pas possible', 'impossible', 'désolé']):
-            summary_parts.append("L'agent ne peut pas satisfaire la demande")
-            break
-        elif any(kw in text for kw in ['disponible', 'libre', 'possible']):
-            summary_parts.append("Créneau trouvé")
-            break
-    
-    # 3. Si pas assez d'éléments, prend les segments les plus informatifs
-    if len(summary_parts) < 2:
-        substantive_lines = []
-        for line in lines:
-            text = line.split(':', 1)[1].strip() if ':' in line else line
-            # Évite les formules de politesse
-            if (len(text) > 15 and 
-                not any(pol in text.lower() for pol in ['bonjour', 'au revoir', 'merci', 'bonne journée'])):
-                substantive_lines.append(text)
-        
-        # Ajoute les 2 plus substantielles
-        for text in substantive_lines[:2]:
-            if len(summary_parts) < 3:
-                summary_parts.append(text)
-    
-    # Construction du résumé final
-    if not summary_parts:
-        return "Conversation brève sans motif identifié."
-    
-    return ". ".join(summary_parts) + "."
-
-def select_best_summary_approach(transcript: str) -> str:
-    """
-    Sélectionne la meilleure approche de résumé selon le contenu.
-    """
-    # Analyse de la qualité du transcript
-    lines = transcript.split('\n')
-    total_words = len(transcript.split())
-    
-    # Si très court, résumé simple
-    if total_words < 20:
-        return "Conversation très brève."
-    
-    # Si transcript de bonne qualité, essaye génératif
-    if total_words > 30 and len(lines) > 3:
-        generative_summary = generate_natural_summary(transcript)
-        
-        # Validation de qualité
-        if (generative_summary and 
-            len(generative_summary) > 15 and 
-            not any(bad in generative_summary.lower() for bad in ['format', 'structure', 'décision/'])):
-            return generative_summary
-    
-    # Fallback extractif
-    return create_extractive_summary(transcript)
-
-# ---------------------------
-# Diarization (inchangé)
+# Diarization
 # ---------------------------
 def load_diarizer():
     global _diarizer
@@ -548,7 +308,7 @@ def load_diarizer():
     return _diarizer
 
 # ---------------------------
-# Sentiment (inchangé)
+# Sentiment
 # ---------------------------
 def load_sentiment():
     global _sentiment_clf, _sentiment_zero_shot
@@ -637,89 +397,170 @@ def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, An
     label_en = max(norm.items(), key=lambda kv: kv[1])[0]
     return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": norm[label_en], "scores": norm}
 
-def merge_consecutive_segments(segments: List[Dict[str, Any]], max_gap: float = 1.0) -> List[Dict[str, Any]]:
-    """
-    Fusionne les segments consécutifs du même speaker pour réduire le nombre d'appels Voxtral.
-    max_gap: gap maximal en secondes entre segments pour les fusionner
-    """
-    if not segments:
-        return segments
+# ---------------------------
+# RÉSUMÉS OPTIMISÉS
+# ---------------------------
+def generate_natural_summary(full_transcript: str, language: Optional[str] = None) -> str:
+    """Génère un résumé naturel et utile sans structure artificielle."""
+    if not full_transcript.strip():
+        return "Conversation vide."
     
-    merged = []
-    current = segments[0].copy()
+    lang_prefix = f"lang:{language} " if language else ""
+    instruction = (
+        f"{lang_prefix}Résume cette conversation en 1-2 phrases simples et claires. "
+        "Dis juste l'essentiel : qui appelle pourquoi, et ce qui va se passer. "
+        "Sois direct et naturel, sans format particulier."
+    )
     
-    log(f"[MERGE] Starting with {len(segments)} segments")
+    conversation = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": f"{instruction}\n\nConversation:\n{full_transcript}"}
+        ]
+    }]
     
-    for next_seg in segments[1:]:
-        # Vérifier si on peut fusionner avec le segment courant
-        same_speaker = current["speaker"] == next_seg["speaker"]
-        gap = float(next_seg["start"]) - float(current["end"])
-        small_gap = gap <= max_gap
+    try:
+        result = run_voxtral_with_timeout(conversation, max_new_tokens=72, timeout=25)
+        summary = (result.get("text") or "").strip()
         
-        if same_speaker and small_gap:
-            # Fusionner : étendre le segment courant
-            current["end"] = next_seg["end"]
-            
-            # Fusionner les textes (si disponibles)
-            current_text = current.get("text", "").strip()
-            next_text = next_seg.get("text", "").strip()
-            
-            if current_text and next_text:
-                current["text"] = f"{current_text} {next_text}"
-            elif next_text:
-                current["text"] = next_text
-                
-            log(f"[MERGE] Merged segments: {current['speaker']} gap={gap:.1f}s")
-        else:
-            # Ne peut pas fusionner : sauver le segment courant et passer au suivant
-            merged.append(current)
-            current = next_seg.copy()
-    
-    # Ajouter le dernier segment
-    merged.append(current)
-    
-    log(f"[MERGE] Result: {len(segments)} → {len(merged)} segments ({100*(1-len(merged)/len(segments)):.1f}% reduction)")
-    return merged
+        summary = clean_generated_summary(summary)
+        
+        if not summary or len(summary) < 10:
+            log("[WARN] Generated summary too short, using extractive fallback")
+            return create_extractive_summary(full_transcript)
+        
+        return summary
+        
+    except Exception as e:
+        log(f"[ERROR] Natural summary generation failed: {e}")
+        return create_extractive_summary(full_transcript)
 
-def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Optimise les segments de diarization pour réduire le nombre d'appels Voxtral.
-    """
-    log(f"[OPTIMIZE] Input: {len(segments)} segments")
+def clean_generated_summary(summary: str) -> str:
+    """Nettoie et valide les résumés générés par Voxtral."""
+    if not summary:
+        return ""
     
-    # Étape 1: Filtrer les segments trop courts
-    filtered = []
-    for seg in segments:
-        duration = float(seg["end"]) - float(seg["start"])
-        if duration >= MIN_SEG_DUR:
-            filtered.append(seg)
-        else:
-            log(f"[OPTIMIZE] Filtered short segment: {duration:.1f}s < {MIN_SEG_DUR}s")
+    unwanted_starts = [
+        "voici un résumé", "résumé de la conversation", "cette conversation",
+        "dans cette conversation", "le résumé", "il s'agit"
+    ]
     
-    log(f"[OPTIMIZE] After filtering: {len(filtered)} segments")
+    summary_lower = summary.lower().strip()
+    for start in unwanted_starts:
+        if summary_lower.startswith(start):
+            sentences = re.split(r'[.!?]+', summary)
+            for sentence in sentences[1:]:
+                cleaned = sentence.strip()
+                if len(cleaned) > 15 and not any(cleaned.lower().startswith(u) for u in unwanted_starts):
+                    summary = cleaned
+                    break
     
-    # Étape 2: Fusionner les segments consécutifs si activé
-    if MERGE_CONSECUTIVE and filtered:
-        filtered = merge_consecutive_segments(filtered, max_gap=2.0)
+    patterns_to_remove = [
+        r'décision[/:].*?étape[s]?\s*:', 
+        r'prochaine[s]?\s*étape[s]?\s*:',
+        r'action[s]?\s*à\s*prendre\s*:',
+        r'conclusion\s*:',
+        r'format\s*attendu\s*:'
+    ]
     
-    # Étape 3: Supprimer les speakers avec trop peu de temps total
-    if MIN_SPEAKER_TIME > 0:
-        speaker_times = {}
-        for seg in filtered:
-            speaker = seg["speaker"]
-            duration = float(seg["end"]) - float(seg["start"])
-            speaker_times[speaker] = speaker_times.get(speaker, 0) + duration
+    for pattern in patterns_to_remove:
+        summary = re.sub(pattern, '', summary, flags=re.IGNORECASE).strip()
+    
+    summary = re.sub(r'\.{2,}', '.', summary)
+    summary = re.sub(r'\s+', ' ', summary).strip()
+    
+    artificial_indicators = [
+        "format attendu", "décision/prochaine étape", "action à prendre",
+        "structure suivante", "points suivants"
+    ]
+    
+    if any(indicator in summary.lower() for indicator in artificial_indicators):
+        return ""
+    
+    return summary
+
+def create_extractive_summary(transcript: str) -> str:
+    """Résumé extractif amélioré basé sur l'analyse du contenu."""
+    if not transcript:
+        return "Conversation indisponible."
+    
+    lines = [l.strip() for l in transcript.split('\n') if l.strip() and ':' in l]
+    
+    if not lines:
+        return "Conversation très courte."
+    
+    summary_parts = []
+    
+    # Identifie le motif de l'appel (client)
+    client_lines = [l for l in lines if l.lower().startswith('client:')]
+    for line in client_lines:
+        text = line.replace('Client:', '').strip().lower()
         
-        # Garder seulement les speakers avec assez de temps
-        valid_speakers = {s for s, t in speaker_times.items() if t >= MIN_SPEAKER_TIME}
-        if valid_speakers:
-            before_count = len(filtered)
-            filtered = [seg for seg in filtered if seg["speaker"] in valid_speakers]
-            log(f"[OPTIMIZE] Kept speakers: {valid_speakers}")
-            log(f"[OPTIMIZE] After speaker filtering: {before_count} → {len(filtered)} segments")
+        if any(kw in text for kw in ['rendez-vous', 'rdv', 'prendre', 'avancer', 'reporter']):
+            summary_parts.append("Appel pour un rendez-vous")
+            break
+        elif any(kw in text for kw in ['information', 'renseignement', 'savoir']):
+            summary_parts.append("Demande d'information")
+            break
+        elif any(kw in text for kw in ['problème', 'souci', 'bug']):
+            summary_parts.append("Signalement d'un problème")
+            break
     
-    log(f"[OPTIMIZE] Final: {len(segments)} → {len(filtered)} segments")
-    return filtered
+    # Identifie la réponse de l'agent
+    agent_lines = [l for l in lines if l.lower().startswith('agent:')]
+    for line in agent_lines:
+        text = line.replace('Agent:', '').strip().lower()
+        
+        if any(kw in text for kw in ['je vais', 'on va', 'nous allons']):
+            action = line.replace('Agent:', '').strip()
+            if len(action) > 10:
+                summary_parts.append(f"L'agent va {action.lower()}")
+                break
+        elif any(kw in text for kw in ['pas possible', 'impossible', 'désolé']):
+            summary_parts.append("L'agent ne peut pas satisfaire la demande")
+            break
+        elif any(kw in text for kw in ['disponible', 'libre', 'possible']):
+            summary_parts.append("Créneau trouvé")
+            break
+    
+    if len(summary_parts) < 2:
+        substantive_lines = []
+        for line in lines:
+            text = line.split(':', 1)[1].strip() if ':' in line else line
+            if (len(text) > 15 and 
+                not any(pol in text.lower() for pol in ['bonjour', 'au revoir', 'merci', 'bonne journée'])):
+                substantive_lines.append(text)
+        
+        for text in substantive_lines[:2]:
+            if len(summary_parts) < 3:
+                summary_parts.append(text)
+    
+    if not summary_parts:
+        return "Conversation brève sans motif identifié."
+    
+    return ". ".join(summary_parts) + "."
+
+def select_best_summary_approach(transcript: str) -> str:
+    """Sélectionne la meilleure approche de résumé selon le contenu."""
+    lines = transcript.split('\n')
+    total_words = len(transcript.split())
+    
+    if total_words < 20:
+        return "Conversation très brève."
+    
+    if total_words > 30 and len(lines) > 3:
+        generative_summary = generate_natural_summary(transcript)
+        
+        if (generative_summary and 
+            len(generative_summary) > 15 and 
+            not any(bad in generative_summary.lower() for bad in ['format', 'structure', 'décision/'])):
+            return generative_summary
+    
+    return create_extractive_summary(transcript)
+
+# ---------------------------
+# Post-traitements segments
+# ---------------------------
 def _enforce_max_two_speakers(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     speakers = list({s["speaker"] for s in segments})
     if len(speakers) <= 2:
@@ -769,8 +610,80 @@ def _map_roles(segments: List[Dict[str, Any]]):
     for s in segments:
         s["speaker"] = mapping.get(s["speaker"], s["speaker"])
 
+def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Optimise les segments de diarization pour réduire le nombre d'appels Voxtral."""
+    log(f"[OPTIMIZE] Input: {len(segments)} segments")
+    
+    # Filtrer les segments trop courts
+    filtered = []
+    for seg in segments:
+        duration = float(seg["end"]) - float(seg["start"])
+        if duration >= MIN_SEG_DUR:
+            filtered.append(seg)
+        else:
+            log(f"[OPTIMIZE] Filtered short segment: {duration:.1f}s < {MIN_SEG_DUR}s")
+    
+    log(f"[OPTIMIZE] After filtering: {len(filtered)} segments")
+    
+    # Fusionner les segments consécutifs si activé
+    if MERGE_CONSECUTIVE and filtered:
+        filtered = merge_consecutive_segments(filtered, max_gap=2.0)
+    
+    # Supprimer les speakers avec trop peu de temps total
+    if MIN_SPEAKER_TIME > 0:
+        speaker_times = {}
+        for seg in filtered:
+            speaker = seg["speaker"]
+            duration = float(seg["end"]) - float(seg["start"])
+            speaker_times[speaker] = speaker_times.get(speaker, 0) + duration
+        
+        valid_speakers = {s for s, t in speaker_times.items() if t >= MIN_SPEAKER_TIME}
+        if valid_speakers:
+            before_count = len(filtered)
+            filtered = [seg for seg in filtered if seg["speaker"] in valid_speakers]
+            log(f"[OPTIMIZE] Kept speakers: {valid_speakers}")
+            log(f"[OPTIMIZE] After speaker filtering: {before_count} → {len(filtered)} segments")
+    
+    log(f"[OPTIMIZE] Final: {len(segments)} → {len(filtered)} segments")
+    return filtered
+
+def merge_consecutive_segments(segments: List[Dict[str, Any]], max_gap: float = 1.0) -> List[Dict[str, Any]]:
+    """Fusionne les segments consécutifs du même speaker pour réduire le nombre d'appels Voxtral."""
+    if not segments:
+        return segments
+    
+    merged = []
+    current = segments[0].copy()
+    
+    log(f"[MERGE] Starting with {len(segments)} segments")
+    
+    for next_seg in segments[1:]:
+        same_speaker = current["speaker"] == next_seg["speaker"]
+        gap = float(next_seg["start"]) - float(current["end"])
+        small_gap = gap <= max_gap
+        
+        if same_speaker and small_gap:
+            current["end"] = next_seg["end"]
+            current_text = current.get("text", "").strip()
+            next_text = next_seg.get("text", "").strip()
+            
+            if current_text and next_text:
+                current["text"] = f"{current_text} {next_text}"
+            elif next_text:
+                current["text"] = next_text
+                
+            log(f"[MERGE] Merged segments: {current['speaker']} gap={gap:.1f}s")
+        else:
+            merged.append(current)
+            current = next_seg.copy()
+    
+    merged.append(current)
+    
+    log(f"[MERGE] Result: {len(segments)} → {len(merged)} segments ({100*(1-len(merged)/len(segments)):.1f}% reduction)")
+    return merged
+
 # ---------------------------
-# Core flow - ULTRA-STRICT avec résumés optimisés
+# MODE HYBRIDE ULTRA-RAPIDE
 # ---------------------------
 def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
     """
@@ -796,7 +709,6 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     # ÉTAPE 1: TRANSCRIPTION GLOBALE (1 SEUL APPEL VOXTRAL)
     log("[HYBRID] Step 1: Global transcription...")
     conv_global = _build_conv_transcribe_ultra_strict(wav_path, language or "fr")
-    # Plus de tokens pour transcription complète
     global_tokens = min(max_new_tokens, int(est_dur * 8))  # ~8 tokens par seconde max
     out_global = run_voxtral_with_timeout(conv_global, max_new_tokens=global_tokens, timeout=60)
     full_text = (out_global.get("text") or "").strip()
@@ -844,7 +756,6 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     total_duration = est_dur
     
     if not optimized_segments:
-        # Fallback : un seul segment avec tout le texte
         segments = [{
             "speaker": "Agent",
             "start": 0.0,
@@ -853,23 +764,19 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
             "mood": classify_sentiment(full_text) if ENABLE_SENTIMENT else None
         }]
     else:
-        # Attribution proportionnelle du texte
         total_seg_duration = sum(seg["end"] - seg["start"] for seg in optimized_segments)
         word_index = 0
         
         for seg in optimized_segments:
             seg_duration = seg["end"] - seg["start"]
             
-            # Proportion de mots pour ce segment
             word_proportion = seg_duration / total_seg_duration if total_seg_duration > 0 else 1.0/len(optimized_segments)
             words_for_segment = max(1, int(len(words) * word_proportion))
             
-            # Extraire les mots pour ce segment
             seg_words = words[word_index:word_index + words_for_segment]
             seg_text = " ".join(seg_words)
             word_index += words_for_segment
             
-            # Créer le segment final
             mood = classify_sentiment(seg_text) if (ENABLE_SENTIMENT and seg_text) else None
             segments.append({
                 "speaker": seg["speaker"],
@@ -910,9 +817,7 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     return result
 
 def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
-    """
-    Mode fallback segment-par-segment (ultra-optimisé) si le mode hybride échoue.
-    """
+    """Mode fallback segment-par-segment (ultra-optimisé) si le mode hybride échoue."""
     log("[FALLBACK] Using segment-by-segment mode with ultra-aggressive filtering")
     
     # Diarization
@@ -989,156 +894,8 @@ def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max
     
     return result
 
-# Alias pour compatibilité si référencé ailleurs
-diarize_then_transcribe = diarize_then_transcribe_hybrid
-    log(f"[WORKFLOW] Starting diarize_then_transcribe: language={language}, summary={with_summary}")
-    # Durée max
-    try:
-        import soundfile as sf
-        info = sf.info(wav_path)
-        est_dur = info.frames / float(info.samplerate or 1)
-        if est_dur > MAX_DURATION_S:
-            return {"error": f"Audio too long ({est_dur:.1f}s). Increase MAX_DURATION_S or send shorter file."}
-    except Exception:
-        pass
-
-    dia = load_diarizer()
-    try:
-        if EXACT_TWO:
-            diarization = dia(wav_path, num_speakers=min(2, MAX_SPEAKERS))
-        else:
-            diarization = dia(wav_path, min_speakers=1, max_speakers=min(2, MAX_SPEAKERS))
-    except TypeError:
-        if EXACT_TWO:
-            diarization = dia(wav_path, min_speakers=min(2, MAX_SPEAKERS), max_speakers=min(2, MAX_SPEAKERS))
-        else:
-            diarization = dia(wav_path, num_speakers=min(2, MAX_SPEAKERS))
-
-    audio = AudioSegment.from_wav(wav_path)
-
-    segments = []
-    transcript_parts = []
-    weighted_moods = []
-    mood_by_speaker_weights = {}
-
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        start_s = float(turn.start)
-        end_s = float(turn.end)
-        dur_s = max(0.0, end_s - start_s)
-        
-        # ULTRA-STRICT : Ignore segments très courts
-        if dur_s < MIN_SEG_DUR:
-            continue
-        
-        # VERSION ULTRA-STRICTE pour éviter hallucinations
-        if dur_s < 2.0:  # Segments courts
-            max_tokens_segment = 24   # RÉDUIT : 32→24
-            timeout_segment = 15
-        else:
-            max_tokens_segment = 48   # RÉDUIT : 64→48  
-            timeout_segment = 25      # RÉDUIT : 30→25
-
-        seg_audio = audio[int(start_s * 1000): int(end_s * 1000)]
-        tmp = os.path.join(tempfile.gettempdir(), f"seg_{speaker}_{int(start_s*1000)}.wav")
-        seg_audio.export(tmp, format="wav")
-
-        # Essai 1 : Version ultra-stricte
-        conv = _build_conv_transcribe_ultra_strict(tmp, "fr")
-        out = run_voxtral_with_timeout(conv, max_new_tokens=max_tokens_segment, timeout=timeout_segment)
-        text = (out.get("text") or "").strip()
-
-        # Fallback seulement si vide ET segment > 1.5s
-        if not text and dur_s >= 1.5:
-            log(f"[FALLBACK] Empty transcription for {dur_s:.1f}s segment")
-            conv2 = [{
-                "role": "user",
-                "content": [
-                    {"type": "audio", "path": tmp},
-                    {"type": "text", "text": "lang:fr [TRANSCRIBE]"}  # Minimal prompt
-                ],
-            }]
-            out2 = run_voxtral_with_timeout(conv2, max_new_tokens=max_tokens_segment, timeout=timeout_segment)
-            text = (out2.get("text") or "").strip()
-
-        # NOUVEAU : Filtre post-transcription pour éliminer aberrations
-        text = clean_transcription_result(text, dur_s)
-        
-        # Logging performance
-        if out.get("latency_s", 0) > 20:
-            log(f"[PERF] Slow transcription: {dur_s:.1f}s audio took {out.get('latency_s', 0):.1f}s")
-
-        mood = classify_sentiment(text) if (ENABLE_SENTIMENT and text) else {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
-
-        seg = {"speaker": speaker, "start": start_s, "end": end_s, "text": text, "mood": mood}
-        segments.append(seg)
-
-        if text:
-            transcript_parts.append(f"{speaker}: {text}")
-            if ENABLE_SENTIMENT and dur_s > 0:
-                weighted_moods.append((mood, dur_s))
-                mood_by_speaker_weights.setdefault(speaker, []).append((mood, dur_s))
-
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-
-    # Safety net 2 speakers + mapping rôles
-    segments = _enforce_max_two_speakers(segments)
-    _map_roles(segments)
-
-    # Transcript final
-    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
-
-    result = {"segments": segments, "transcript": full_transcript}
-
-    # RÉSUMÉS OPTIMISÉS VERSION 2.0
-    if with_summary:
-        if SMART_SUMMARY:
-            # NOUVEAU : Système de résumé intelligent et naturel
-            result["summary"] = select_best_summary_approach(full_transcript)
-        elif EXTRACTIVE_SUMMARY:
-            # Résumé extractif amélioré
-            result["summary"] = create_extractive_summary(full_transcript)
-        else:
-            # Fallback : résumé audio direct (mode original)
-            try:
-                instruction = (
-                    f"lang:{language or 'fr'} "
-                    "Résume cette conversation en 1-2 phrases simples et utiles. "
-                    "Dis juste l'essentiel sans format particulier."
-                )
-                conv_sum = [{
-                    "role": "user",
-                    "content": [
-                        {"type": "audio", "path": wav_path},
-                        {"type": "text", "text": instruction}
-                    ]
-                }]
-                s = run_voxtral_with_timeout(conv_sum, max_new_tokens=72, timeout=25)
-                summary_text = (s.get("text", "") or "").strip()
-                result["summary"] = clean_generated_summary(summary_text) or "Résumé indisponible."
-            except Exception as e:
-                log(f"[ERROR] Audio summary failed: {e}")
-                result["summary"] = create_extractive_summary(full_transcript)
-
-    # Humeurs
-    if ENABLE_SENTIMENT:
-        result["mood_overall"] = aggregate_mood(weighted_moods)
-        per_role = {}
-        for seg in segments:
-            d = float(seg["end"]) - float(seg["start"])
-            m = seg.get("mood")
-            r = seg["speaker"]
-            if not m or not m.get("scores"):
-                continue
-            per_role.setdefault(r, []).append((m, d))
-        result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
-
-    return result
-
 # ---------------------------
-# Health (inchangé)
+# Health
 # ---------------------------
 def health():
     info = {
@@ -1161,11 +918,11 @@ def health():
         "smart_summary": SMART_SUMMARY,
         "extractive_summary": EXTRACTIVE_SUMMARY,
         "min_seg_dur": MIN_SEG_DUR,
-        "min_speaker_time": MIN_SPEAKER_TIME,  # NOUVEAU
-        "merge_consecutive": MERGE_CONSECUTIVE,  # NOUVEAU
+        "min_speaker_time": MIN_SPEAKER_TIME,
+        "merge_consecutive": MERGE_CONSECUTIVE,
         "role_labels": ROLE_LABELS,
-        "hybrid_mode": HYBRID_MODE,  # NOUVEAU
-        "optimizations": {  # NOUVEAU : résumé des optimisations
+        "hybrid_mode": HYBRID_MODE,
+        "optimizations": {
             "hybrid_transcription": HYBRID_MODE,
             "global_vs_segments": "1 Voxtral call instead of 10-50+",
             "segment_filtering": f"Ignore segments < {MIN_SEG_DUR}s",
@@ -1174,17 +931,18 @@ def health():
             "expected_speedup": "10-20x faster" if HYBRID_MODE else "2-3x faster"
         }
     }
+    
     try:
         if _model is not None:
             p = next(_model.parameters())
             info["voxtral_device"] = str(p.device)
-            info["voxtral_dtype"]  = str(p.dtype)
+            info["voxtral_dtype"] = str(p.dtype)
         else:
             info["voxtral_device"] = None
-            info["voxtral_dtype"]  = None
+            info["voxtral_dtype"] = None
     except Exception:
         info["voxtral_device"] = "unknown"
-        info["voxtral_dtype"]  = "unknown"
+        info["voxtral_dtype"] = "unknown"
 
     errors = {}
     try:
@@ -1203,7 +961,7 @@ def health():
     return {"ok": len(errors) == 0, "info": info, "errors": errors}
 
 # ---------------------------
-# Handler (inchangé sauf résumés)
+# Handler
 # ---------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
@@ -1257,10 +1015,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             return {"task": "transcribe_diarized", **out}
         elif task in ("summary", "summarize"):
             log("[HANDLER] Starting summary task...")
-            # Utilise le nouveau système de résumé intelligent
             try:
-                # Lit l'audio d'abord pour faire un transcript
-                temp_result = diarize_then_transcribe(local_path, language, max_new_tokens, False)
+                temp_result = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, False)
                 if "error" in temp_result:
                     return temp_result
                 
@@ -1285,7 +1041,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 return {"task": "summary", **out}
         else:
             log("[HANDLER] Starting simple transcription...")
-            conv = _build_conv_transcribe(local_path, language)
+            conv = _build_conv_transcribe_ultra_strict(local_path, language)
             out = run_voxtral_with_timeout(conv, max_new_tokens=min(max_new_tokens, 64), timeout=30)
             log("[HANDLER] Simple transcription completed")
             return {"task": "transcribe", **out}
@@ -1305,20 +1061,16 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 try:
     log("[INIT] Starting conditional preload...")
     
-    # Vérification GPU en premier
     if not check_gpu_memory():
         log("[CRITICAL] Insufficient GPU memory for Voxtral Small - consider using Mini")
         log("[INIT] Skipping preload due to memory issues")
     else:
-        # Preload Voxtral seulement si assez de mémoire
         log("[INIT] Preloading Voxtral...")
         load_voxtral()
         
-        # Diarizer (plus léger)
         log("[INIT] Preloading diarizer...")
         load_diarizer()
         
-        # Sentiment (optionnel et sur CPU)
         if ENABLE_SENTIMENT:
             log("[INIT] Preloading sentiment...")
             load_sentiment()
@@ -1327,7 +1079,6 @@ try:
         
 except Exception as e:
     log(f"[WARN] Preload failed - will load on first request: {e}")
-    # Reset les variables globales si le preload échoue
     _processor = None
     _model = None
     _diarizer = None
