@@ -48,10 +48,12 @@ SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()  
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
 SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
 
-# Diarization speaker limit
+# Diarization speaker limit - OPTIMISÉ POUR VITESSE
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
 EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"   # force exactement 2 si possible
-MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "1.0"))         # ULTRA-STRICT : 0.8→1.0
+MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "3.0"))         # OPTIMISÉ : 1.0→3.0 (ignore segments < 3s)
+MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "1.0")) # NOUVEAU : temps minimum par speaker
+MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"  # NOUVEAU : fusionne segments consécutifs
 
 # Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
@@ -634,9 +636,89 @@ def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, An
     label_en = max(norm.items(), key=lambda kv: kv[1])[0]
     return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": norm[label_en], "scores": norm}
 
-# ---------------------------
-# Post-traitements segments (inchangé)
-# ---------------------------
+def merge_consecutive_segments(segments: List[Dict[str, Any]], max_gap: float = 1.0) -> List[Dict[str, Any]]:
+    """
+    Fusionne les segments consécutifs du même speaker pour réduire le nombre d'appels Voxtral.
+    max_gap: gap maximal en secondes entre segments pour les fusionner
+    """
+    if not segments:
+        return segments
+    
+    merged = []
+    current = segments[0].copy()
+    
+    log(f"[MERGE] Starting with {len(segments)} segments")
+    
+    for next_seg in segments[1:]:
+        # Vérifier si on peut fusionner avec le segment courant
+        same_speaker = current["speaker"] == next_seg["speaker"]
+        gap = float(next_seg["start"]) - float(current["end"])
+        small_gap = gap <= max_gap
+        
+        if same_speaker and small_gap:
+            # Fusionner : étendre le segment courant
+            current["end"] = next_seg["end"]
+            
+            # Fusionner les textes (si disponibles)
+            current_text = current.get("text", "").strip()
+            next_text = next_seg.get("text", "").strip()
+            
+            if current_text and next_text:
+                current["text"] = f"{current_text} {next_text}"
+            elif next_text:
+                current["text"] = next_text
+                
+            log(f"[MERGE] Merged segments: {current['speaker']} gap={gap:.1f}s")
+        else:
+            # Ne peut pas fusionner : sauver le segment courant et passer au suivant
+            merged.append(current)
+            current = next_seg.copy()
+    
+    # Ajouter le dernier segment
+    merged.append(current)
+    
+    log(f"[MERGE] Result: {len(segments)} → {len(merged)} segments ({100*(1-len(merged)/len(segments)):.1f}% reduction)")
+    return merged
+
+def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Optimise les segments de diarization pour réduire le nombre d'appels Voxtral.
+    """
+    log(f"[OPTIMIZE] Input: {len(segments)} segments")
+    
+    # Étape 1: Filtrer les segments trop courts
+    filtered = []
+    for seg in segments:
+        duration = float(seg["end"]) - float(seg["start"])
+        if duration >= MIN_SEG_DUR:
+            filtered.append(seg)
+        else:
+            log(f"[OPTIMIZE] Filtered short segment: {duration:.1f}s < {MIN_SEG_DUR}s")
+    
+    log(f"[OPTIMIZE] After filtering: {len(filtered)} segments")
+    
+    # Étape 2: Fusionner les segments consécutifs si activé
+    if MERGE_CONSECUTIVE and filtered:
+        filtered = merge_consecutive_segments(filtered, max_gap=2.0)
+    
+    # Étape 3: Supprimer les speakers avec trop peu de temps total
+    if MIN_SPEAKER_TIME > 0:
+        speaker_times = {}
+        for seg in filtered:
+            speaker = seg["speaker"]
+            duration = float(seg["end"]) - float(seg["start"])
+            speaker_times[speaker] = speaker_times.get(speaker, 0) + duration
+        
+        # Garder seulement les speakers avec assez de temps
+        valid_speakers = {s for s, t in speaker_times.items() if t >= MIN_SPEAKER_TIME}
+        if valid_speakers:
+            before_count = len(filtered)
+            filtered = [seg for seg in filtered if seg["speaker"] in valid_speakers]
+            log(f"[OPTIMIZE] Kept speakers: {valid_speakers}")
+            log(f"[OPTIMIZE] After speaker filtering: {before_count} → {len(filtered)} segments")
+    
+    log(f"[OPTIMIZE] Final: {len(segments)} → {len(filtered)} segments")
+    return filtered
 def _enforce_max_two_speakers(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     speakers = list({s["speaker"] for s in segments})
     if len(speakers) <= 2:
@@ -860,7 +942,15 @@ def health():
         "smart_summary": SMART_SUMMARY,
         "extractive_summary": EXTRACTIVE_SUMMARY,
         "min_seg_dur": MIN_SEG_DUR,
+        "min_speaker_time": MIN_SPEAKER_TIME,  # NOUVEAU
+        "merge_consecutive": MERGE_CONSECUTIVE,  # NOUVEAU
         "role_labels": ROLE_LABELS,
+        "optimizations": {  # NOUVEAU : résumé des optimisations
+            "segment_filtering": f"Ignore segments < {MIN_SEG_DUR}s",
+            "speaker_filtering": f"Ignore speakers < {MIN_SPEAKER_TIME}s total",
+            "consecutive_merging": MERGE_CONSECUTIVE,
+            "expected_reduction": "60-80% fewer Voxtral calls"
+        }
     }
     try:
         if _model is not None:
