@@ -48,12 +48,13 @@ SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()  
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
 SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
 
-# Diarization speaker limit - OPTIMISÉ POUR VITESSE
+# Diarization speaker limit - MODE HYBRIDE ULTRA-RAPIDE
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
-EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"   # force exactement 2 si possible
-MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "3.0"))         # OPTIMISÉ : 1.0→3.0 (ignore segments < 3s)
-MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "1.0")) # NOUVEAU : temps minimum par speaker
-MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"  # NOUVEAU : fusionne segments consécutifs
+EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"   
+MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "8.0"))         # ULTRA-AGRESSIF : 3.0→8.0
+MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "3.0")) # ULTRA-AGRESSIF : 1.0→3.0
+MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"  
+HYBRID_MODE = os.environ.get("HYBRID_MODE", "1") == "1"  # NOUVEAU : transcription globale + diarization
 
 # Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
@@ -771,7 +772,225 @@ def _map_roles(segments: List[Dict[str, Any]]):
 # ---------------------------
 # Core flow - ULTRA-STRICT avec résumés optimisés
 # ---------------------------
-def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
+def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
+    """
+    MODE HYBRIDE ULTRA-RAPIDE : 
+    1. Transcription globale complète (1 seul appel Voxtral)
+    2. Diarization pour les timestamps des speakers
+    3. Attribution du texte selon les timestamps
+    """
+    log(f"[HYBRID] Starting ultra-fast hybrid mode: language={language}, summary={with_summary}")
+    
+    # Durée max
+    try:
+        log("[HYBRID] Checking audio duration...")
+        import soundfile as sf
+        info = sf.info(wav_path)
+        est_dur = info.frames / float(info.samplerate or 1)
+        log(f"[HYBRID] Audio duration: {est_dur:.1f}s")
+        if est_dur > MAX_DURATION_S:
+            return {"error": f"Audio too long ({est_dur:.1f}s). Increase MAX_DURATION_S or send shorter file."}
+    except Exception as e:
+        log(f"[HYBRID] Could not check duration: {e}")
+
+    # ÉTAPE 1: TRANSCRIPTION GLOBALE (1 SEUL APPEL VOXTRAL)
+    log("[HYBRID] Step 1: Global transcription...")
+    conv_global = _build_conv_transcribe_ultra_strict(wav_path, language or "fr")
+    # Plus de tokens pour transcription complète
+    global_tokens = min(max_new_tokens, int(est_dur * 8))  # ~8 tokens par seconde max
+    out_global = run_voxtral_with_timeout(conv_global, max_new_tokens=global_tokens, timeout=60)
+    full_text = (out_global.get("text") or "").strip()
+    
+    if not full_text:
+        log("[HYBRID] Empty global transcription, fallback to segment mode")
+        return diarize_then_transcribe_fallback(wav_path, language, max_new_tokens, with_summary)
+    
+    log(f"[HYBRID] Global transcription: {len(full_text)} chars in {out_global.get('latency_s', 0):.1f}s")
+
+    # ÉTAPE 2: DIARIZATION POUR LES TIMESTAMPS
+    log("[HYBRID] Step 2: Diarization for speaker timestamps...")
+    dia = load_diarizer()
+    try:
+        if EXACT_TWO:
+            diarization = dia(wav_path, num_speakers=2, min_speakers=2, max_speakers=2)
+        else:
+            diarization = dia(wav_path, min_speakers=1, max_speakers=MAX_SPEAKERS)
+    except (TypeError, ValueError):
+        if EXACT_TWO:
+            diarization = dia(wav_path, num_speakers=2)
+        else:
+            diarization = dia(wav_path, num_speakers=MAX_SPEAKERS)
+    
+    # Collecter les segments de diarization
+    diar_segments = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        segment = {
+            "speaker": speaker,
+            "start": float(turn.start),
+            "end": float(turn.end)
+        }
+        diar_segments.append(segment)
+    
+    log(f"[HYBRID] Diarization found {len(diar_segments)} raw segments")
+
+    # ÉTAPE 3: OPTIMISATION DES SEGMENTS
+    optimized_segments = optimize_diarization_segments(diar_segments)
+    log(f"[HYBRID] After optimization: {len(optimized_segments)} segments")
+
+    # ÉTAPE 4: ATTRIBUTION DU TEXTE SELON LES TIMESTAMPS
+    log("[HYBRID] Step 3: Attributing text to speakers...")
+    segments = []
+    words = full_text.split()
+    total_duration = est_dur
+    
+    if not optimized_segments:
+        # Fallback : un seul segment avec tout le texte
+        segments = [{
+            "speaker": "Agent",
+            "start": 0.0,
+            "end": total_duration,
+            "text": full_text,
+            "mood": classify_sentiment(full_text) if ENABLE_SENTIMENT else None
+        }]
+    else:
+        # Attribution proportionnelle du texte
+        total_seg_duration = sum(seg["end"] - seg["start"] for seg in optimized_segments)
+        word_index = 0
+        
+        for seg in optimized_segments:
+            seg_duration = seg["end"] - seg["start"]
+            
+            # Proportion de mots pour ce segment
+            word_proportion = seg_duration / total_seg_duration if total_seg_duration > 0 else 1.0/len(optimized_segments)
+            words_for_segment = max(1, int(len(words) * word_proportion))
+            
+            # Extraire les mots pour ce segment
+            seg_words = words[word_index:word_index + words_for_segment]
+            seg_text = " ".join(seg_words)
+            word_index += words_for_segment
+            
+            # Créer le segment final
+            mood = classify_sentiment(seg_text) if (ENABLE_SENTIMENT and seg_text) else None
+            segments.append({
+                "speaker": seg["speaker"],
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg_text,
+                "mood": mood
+            })
+    
+    # ÉTAPE 5: POST-TRAITEMENT STANDARD
+    segments = _enforce_max_two_speakers(segments)
+    _map_roles(segments)
+    
+    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
+    
+    result = {"segments": segments, "transcript": full_transcript}
+    
+    # Résumé
+    if with_summary:
+        log("[HYBRID] Generating summary...")
+        result["summary"] = select_best_summary_approach(full_transcript)
+    
+    # Sentiment global
+    if ENABLE_SENTIMENT:
+        weighted_moods = [(seg.get("mood"), float(seg["end"]) - float(seg["start"])) for seg in segments if seg.get("mood")]
+        result["mood_overall"] = aggregate_mood(weighted_moods)
+        
+        per_role = {}
+        for seg in segments:
+            d = float(seg["end"]) - float(seg["start"])
+            m = seg.get("mood")
+            r = seg["speaker"]
+            if m and m.get("scores"):
+                per_role.setdefault(r, []).append((m, d))
+        result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
+
+    log(f"[HYBRID] Completed: 1 Voxtral call instead of {len(diar_segments)}+ calls")
+    return result
+
+def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
+    """
+    Mode fallback segment-par-segment (ultra-optimisé) si le mode hybride échoue.
+    """
+    log("[FALLBACK] Using segment-by-segment mode with ultra-aggressive filtering")
+    
+    # Diarization
+    dia = load_diarizer()
+    try:
+        if EXACT_TWO:
+            diarization = dia(wav_path, num_speakers=2)
+        else:
+            diarization = dia(wav_path, min_speakers=1, max_speakers=MAX_SPEAKERS)
+    except (TypeError, ValueError):
+        diarization = dia(wav_path, num_speakers=MAX_SPEAKERS)
+    
+    # Collecter et optimiser segments
+    raw_segments = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        segment = {
+            "speaker": speaker,
+            "start": float(turn.start),
+            "end": float(turn.end)
+        }
+        raw_segments.append(segment)
+    
+    # ULTRA-AGRESSIF : garde seulement les 4-6 plus longs segments
+    raw_segments.sort(key=lambda x: x["end"] - x["start"], reverse=True)
+    max_segments = min(6, len(raw_segments))
+    optimized_segments = raw_segments[:max_segments]
+    optimized_segments.sort(key=lambda x: x["start"])  # Retrier par temps
+    
+    log(f"[FALLBACK] Ultra-aggressive: {len(raw_segments)} → {max_segments} segments")
+    
+    # Transcription segment par segment
+    audio = AudioSegment.from_wav(wav_path)
+    segments = []
+    
+    for i, seg in enumerate(optimized_segments):
+        start_s = seg["start"]
+        end_s = seg["end"]
+        dur_s = end_s - start_s
+        speaker = seg["speaker"]
+        
+        # Extraction audio
+        seg_audio = audio[int(start_s * 1000): int(end_s * 1000)]
+        tmp = os.path.join(tempfile.gettempdir(), f"seg_{speaker}_{int(start_s*1000)}.wav")
+        seg_audio.export(tmp, format="wav")
+        
+        # Transcription
+        conv = _build_conv_transcribe_ultra_strict(tmp, "fr")
+        tokens = max(32, min(96, int(dur_s * 8)))
+        out = run_voxtral_with_timeout(conv, max_new_tokens=tokens, timeout=30)
+        text = (out.get("text") or "").strip()
+        
+        segments.append({
+            "speaker": speaker,
+            "start": start_s,
+            "end": end_s,
+            "text": text,
+            "mood": classify_sentiment(text) if ENABLE_SENTIMENT and text else None
+        })
+        
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+    
+    # Post-traitement
+    segments = _enforce_max_two_speakers(segments)
+    _map_roles(segments)
+    
+    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
+    result = {"segments": segments, "transcript": full_transcript}
+    
+    if with_summary:
+        result["summary"] = select_best_summary_approach(full_transcript)
+    
+    return result
+
+# Alias pour compatibilité si référencé ailleurs
+diarize_then_transcribe = diarize_then_transcribe_hybrid
     log(f"[WORKFLOW] Starting diarize_then_transcribe: language={language}, summary={with_summary}")
     # Durée max
     try:
@@ -1021,7 +1240,13 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         if task in ("transcribe_diarized", "diarized", "diarize"):
             log("[HANDLER] Starting diarized transcription...")
-            out = diarize_then_transcribe(local_path, language, max_new_tokens, with_summary)
+            
+            # Choisir le mode selon la configuration
+            if HYBRID_MODE:
+                out = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, with_summary)
+            else:
+                out = diarize_then_transcribe_fallback(local_path, language, max_new_tokens, with_summary)
+                
             if "error" in out:
                 log(f"[HANDLER] Error in diarized transcription: {out['error']}")
                 return out
