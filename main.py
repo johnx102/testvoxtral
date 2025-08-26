@@ -761,30 +761,50 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
             "start": 0.0,
             "end": total_duration,
             "text": full_text,
-            "mood": classify_sentiment(full_text) if ENABLE_SENTIMENT else None
+            "mood": None  # Skip sentiment in hybrid mode for speed
         }]
     else:
         total_seg_duration = sum(seg["end"] - seg["start"] for seg in optimized_segments)
         word_index = 0
         
-        for seg in optimized_segments:
+        log(f"[HYBRID] Processing {len(optimized_segments)} segments for text attribution...")
+        
+        for i, seg in enumerate(optimized_segments):
             seg_duration = seg["end"] - seg["start"]
             
+            # Attribution proportionnelle du texte (plus simple et rapide)
             word_proportion = seg_duration / total_seg_duration if total_seg_duration > 0 else 1.0/len(optimized_segments)
             words_for_segment = max(1, int(len(words) * word_proportion))
             
-            seg_words = words[word_index:word_index + words_for_segment]
-            seg_text = " ".join(seg_words)
-            word_index += words_for_segment
+            # Assurer qu'on ne dépasse pas la fin des mots
+            words_for_segment = min(words_for_segment, len(words) - word_index)
             
-            mood = classify_sentiment(seg_text) if (ENABLE_SENTIMENT and seg_text) else None
+            if words_for_segment > 0:
+                seg_words = words[word_index:word_index + words_for_segment]
+                seg_text = " ".join(seg_words)
+                word_index += words_for_segment
+            else:
+                seg_text = ""
+            
+            # SKIP sentiment in hybrid mode for speed - calculate at the end instead
             segments.append({
                 "speaker": seg["speaker"],
                 "start": seg["start"],
                 "end": seg["end"],
                 "text": seg_text,
-                "mood": mood
+                "mood": None  # Will be calculated globally at the end if needed
             })
+            
+            log(f"[HYBRID] Segment {i+1}/{len(optimized_segments)}: {len(seg_text)} chars assigned to {seg['speaker']}")
+        
+        # Attribution des mots restants au dernier segment si nécessaire
+        if word_index < len(words):
+            remaining_words = words[word_index:]
+            if segments and remaining_words:
+                segments[-1]["text"] += " " + " ".join(remaining_words)
+                log(f"[HYBRID] Added {len(remaining_words)} remaining words to last segment")
+    
+    log("[HYBRID] Text attribution completed")
     
     # ÉTAPE 5: POST-TRAITEMENT STANDARD
     segments = _enforce_max_two_speakers(segments)
@@ -799,19 +819,34 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
         log("[HYBRID] Generating summary...")
         result["summary"] = select_best_summary_approach(full_transcript)
     
-    # Sentiment global
+    # Sentiment global (optimisé pour la vitesse en mode hybride)
     if ENABLE_SENTIMENT:
-        weighted_moods = [(seg.get("mood"), float(seg["end"]) - float(seg["start"])) for seg in segments if seg.get("mood")]
-        result["mood_overall"] = aggregate_mood(weighted_moods)
+        log("[HYBRID] Computing sentiment analysis...")
+        # Calcul du sentiment global sur le texte complet (plus rapide qu'individual)
+        global_mood = classify_sentiment(full_text) if full_text else None
         
-        per_role = {}
+        # Attribution du même sentiment à tous les segments (approximation rapide)
         for seg in segments:
-            d = float(seg["end"]) - float(seg["start"])
-            m = seg.get("mood")
-            r = seg["speaker"]
-            if m and m.get("scores"):
-                per_role.setdefault(r, []).append((m, d))
-        result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
+            if seg.get("text"):
+                seg["mood"] = global_mood
+        
+        # Mood overall basé sur la durée des segments
+        if global_mood and global_mood.get("scores"):
+            weighted_moods = [(global_mood, float(seg["end"]) - float(seg["start"])) for seg in segments if seg.get("text")]
+            result["mood_overall"] = aggregate_mood(weighted_moods)
+            
+            # Mood par speaker (approximation basée sur le global mood)  
+            per_role = {}
+            for seg in segments:
+                d = float(seg["end"]) - float(seg["start"])
+                r = seg["speaker"]
+                if seg.get("text"):
+                    per_role.setdefault(r, []).append((global_mood, d))
+            result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
+        
+        log("[HYBRID] Sentiment analysis completed")
+    else:
+        log("[HYBRID] Sentiment analysis skipped")
 
     log(f"[HYBRID] Completed: 1 Voxtral call instead of {len(diar_segments)}+ calls")
     return result
