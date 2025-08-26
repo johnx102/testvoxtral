@@ -690,6 +690,7 @@ def _map_roles(segments: List[Dict[str, Any]]):
 # Core flow - ULTRA-STRICT avec résumés optimisés
 # ---------------------------
 def diarize_then_transcribe(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
+    log(f"[WORKFLOW] Starting diarize_then_transcribe: language={language}, summary={with_summary}")
     # Durée max
     try:
         import soundfile as sf
@@ -894,12 +895,15 @@ def health():
 # ---------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
+        log(f"[HANDLER] New job received: {job.get('input', {}).get('task', 'unknown')}")
         inp = job.get("input", {}) or {}
 
         if inp.get("ping"):
+            log("[HANDLER] Ping request")
             return {"pong": True}
 
         if inp.get("task") == "health":
+            log("[HANDLER] Health check request")
             return health()
 
         task = (inp.get("task") or "transcribe").lower()
@@ -907,22 +911,34 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         max_new_tokens = int(inp.get("max_new_tokens", MAX_NEW_TOKENS))
         with_summary = bool(inp.get("with_summary", WITH_SUMMARY_DEFAULT))
 
+        log(f"[HANDLER] Task: {task}, language: {language}, max_tokens: {max_new_tokens}, summary: {with_summary}")
+
         local_path, cleanup = None, False
         if inp.get("audio_url"):
             local_path = _download_to_tmp(inp["audio_url"]); cleanup = True
+            log(f"[HANDLER] Downloaded audio from URL: {inp['audio_url']}")
         elif inp.get("audio_b64"):
             local_path = _b64_to_tmp(inp["audio_b64"]); cleanup = True
+            log("[HANDLER] Decoded audio from base64")
         elif inp.get("file_path"):
             local_path = inp["file_path"]
+            log(f"[HANDLER] Using file path: {local_path}")
         elif task not in ("health",):
+            log("[HANDLER] ERROR: No audio input provided")
             return {"error": "Provide 'audio_url', 'audio_b64' or 'file_path'."}
 
+        log(f"[HANDLER] Processing audio file: {local_path}")
+
         if task in ("transcribe_diarized", "diarized", "diarize"):
+            log("[HANDLER] Starting diarized transcription...")
             out = diarize_then_transcribe(local_path, language, max_new_tokens, with_summary)
             if "error" in out:
+                log(f"[HANDLER] Error in diarized transcription: {out['error']}")
                 return out
+            log("[HANDLER] Diarized transcription completed successfully")
             return {"task": "transcribe_diarized", **out}
         elif task in ("summary", "summarize"):
+            log("[HANDLER] Starting summary task...")
             # Utilise le nouveau système de résumé intelligent
             try:
                 # Lit l'audio d'abord pour faire un transcript
@@ -933,6 +949,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 transcript = temp_result.get("transcript", "")
                 summary = select_best_summary_approach(transcript) if transcript else "Audio indisponible."
                 
+                log("[HANDLER] Summary task completed")
                 return {"task": "summary", "text": summary, "latency_s": 0}
             except Exception as e:
                 log(f"[ERROR] Smart summary failed: {e}")
@@ -946,18 +963,23 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     ]
                 }]
                 out = run_voxtral_with_timeout(conv, max_new_tokens=72, timeout=25)
+                log("[HANDLER] Fallback summary completed")
                 return {"task": "summary", **out}
         else:
+            log("[HANDLER] Starting simple transcription...")
             conv = _build_conv_transcribe(local_path, language)
             out = run_voxtral_with_timeout(conv, max_new_tokens=min(max_new_tokens, 64), timeout=30)
+            log("[HANDLER] Simple transcription completed")
             return {"task": "transcribe", **out}
 
     except Exception as e:
+        log(f"[HANDLER] CRITICAL ERROR: {type(e).__name__}: {e}")
         return {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc(limit=3)}
     finally:
         try:
             if 'cleanup' in locals() and cleanup and local_path and os.path.exists(local_path):
                 os.remove(local_path)
+                log("[HANDLER] Cleanup completed")
         except Exception:
             pass
 
