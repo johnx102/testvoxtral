@@ -48,14 +48,16 @@ SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
 SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
 
-# Diarization - MODE CONSERVATEUR POUR MEILLEURE QUALITÉ
+# Diarization - MODES AVANCÉS
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
 EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"   
-MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "5.0"))         # PLUS CONSERVATEUR : 8.0→5.0 mais avec fusion agressive
-MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "8.0")) # PLUS STRICT : 3.0→8.0
+MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "5.0"))         
+MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "8.0")) 
 MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"  
 HYBRID_MODE = os.environ.get("HYBRID_MODE", "1") == "1"
-AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "1"  # NOUVEAU : fusion ultra-agressive
+AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "1"
+VOXTRAL_SPEAKER_ID = os.environ.get("VOXTRAL_SPEAKER_ID", "1") == "1"  # NOUVEAU : Speaker ID par Voxtral
+PYANNOTE_AUTO = os.environ.get("PYANNOTE_AUTO", "0") == "1"  # NOUVEAU : PyAnnote auto pur
 
 # Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
@@ -1208,13 +1210,20 @@ def health():
         "merge_consecutive": MERGE_CONSECUTIVE,
         "role_labels": ROLE_LABELS,
         "hybrid_mode": HYBRID_MODE,
+        "voxtral_speaker_id": VOXTRAL_SPEAKER_ID,  # NOUVEAU
+        "pyannote_auto": PYANNOTE_AUTO,  # NOUVEAU
+        "aggressive_merge": AGGRESSIVE_MERGE,
+        "diarization_modes": {  # NOUVEAU : résumé des modes disponibles
+            "voxtral_speaker_id": VOXTRAL_SPEAKER_ID,
+            "pyannote_auto": PYANNOTE_AUTO, 
+            "hybrid_mode": HYBRID_MODE,
+            "fallback_mode": not (VOXTRAL_SPEAKER_ID or PYANNOTE_AUTO or HYBRID_MODE)
+        },
         "optimizations": {
-            "hybrid_transcription": HYBRID_MODE,
-            "global_vs_segments": "1 Voxtral call instead of 10-50+",
-            "segment_filtering": f"Ignore segments < {MIN_SEG_DUR}s",
-            "speaker_filtering": f"Ignore speakers < {MIN_SPEAKER_TIME}s total",
-            "consecutive_merging": MERGE_CONSECUTIVE,
-            "expected_speedup": "10-20x faster" if HYBRID_MODE else "2-3x faster"
+            "current_mode": "Voxtral Speaker ID" if VOXTRAL_SPEAKER_ID else "PyAnnote Auto" if PYANNOTE_AUTO else "Hybrid" if HYBRID_MODE else "Fallback",
+            "speaker_identification": "Context-based by Voxtral" if VOXTRAL_SPEAKER_ID else "Voice-based by PyAnnote",
+            "expected_quality": "High (contextual)" if VOXTRAL_SPEAKER_ID else "Medium-High (automatic)" if PYANNOTE_AUTO else "Medium (hybrid)",
+            "expected_speed": "Fast (1 Voxtral call)" if VOXTRAL_SPEAKER_ID else "Fast (minimal processing)" if PYANNOTE_AUTO else "Fast (1 Voxtral + PyAnnote)",
         }
     }
     
@@ -1288,10 +1297,18 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         if task in ("transcribe_diarized", "diarized", "diarize"):
             log("[HANDLER] Starting diarized transcription...")
             
-            # Choisir le mode selon la configuration
-            if HYBRID_MODE:
+            # NOUVEAU : Sélection du mode de diarization
+            if VOXTRAL_SPEAKER_ID:
+                log("[HANDLER] Using Voxtral Speaker Identification mode")
+                out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary)
+            elif PYANNOTE_AUTO:
+                log("[HANDLER] Using PyAnnote Auto mode")
+                out = diarize_with_pyannote_auto(local_path, language, max_new_tokens, with_summary)
+            elif HYBRID_MODE:
+                log("[HANDLER] Using Hybrid mode (PyAnnote + Voxtral)")
                 out = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, with_summary)
             else:
+                log("[HANDLER] Using Fallback segment mode")
                 out = diarize_then_transcribe_fallback(local_path, language, max_new_tokens, with_summary)
                 
             if "error" in out:
