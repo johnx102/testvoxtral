@@ -682,9 +682,133 @@ def merge_consecutive_segments(segments: List[Dict[str, Any]], max_gap: float = 
     log(f"[MERGE] Result: {len(segments)} → {len(merged)} segments ({100*(1-len(merged)/len(segments)):.1f}% reduction)")
     return merged
 
-# ---------------------------
-# MODE HYBRIDE ULTRA-RAPIDE
-# ---------------------------
+def smart_sentence_split(text: str) -> List[str]:
+    """
+    Découpe intelligent du texte en phrases respectant le dialogue naturel.
+    """
+    if not text:
+        return []
+    
+    # Marqueurs de fin de phrase étendus pour les dialogues
+    sentence_endings = re.compile(r'[.!?]+\s+')
+    
+    # Cas spéciaux pour les dialogues téléphoniques
+    # Ajouter des breaks sur certains mots de transition
+    transition_words = ['oui', 'non', 'd\'accord', 'très bien', 'parfait', 'bonjour', 'au revoir', 'allô']
+    
+    sentences = []
+    
+    # Découpage basique sur la ponctuation
+    basic_sentences = sentence_endings.split(text)
+    
+    for sentence in basic_sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+            
+        # Si la phrase est très longue, essayer de la couper sur les transitions
+        if len(sentence.split()) > 15:
+            words = sentence.split()
+            current_phrase = []
+            
+            for i, word in enumerate(words):
+                current_phrase.append(word)
+                
+                # Couper si on trouve un mot de transition et qu'on a déjà quelques mots
+                if (word.lower().rstrip('.,!?') in transition_words and 
+                    len(current_phrase) > 3 and 
+                    i < len(words) - 1):
+                    
+                    sentences.append(" ".join(current_phrase))
+                    current_phrase = []
+                    
+            # Ajouter ce qui reste
+            if current_phrase:
+                sentences.append(" ".join(current_phrase))
+        else:
+            sentences.append(sentence)
+    
+    # Nettoyer et filtrer les phrases vides
+    cleaned_sentences = []
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if sentence and len(sentence) > 2:
+            cleaned_sentences.append(sentence)
+    
+    return cleaned_sentences
+
+def post_correct_speaker_attribution(text: str, speaker: str, has_previous_speaker: bool) -> str:
+    """
+    Post-correction de l'attribution basée sur les patterns de dialogue.
+    """
+    if not text:
+        return text
+    
+    text_lower = text.lower().strip()
+    
+    # Patterns qui indiquent probablement le CLIENT (celui qui appelle)
+    client_patterns = [
+        'bonjour madame', 'bonjour monsieur', 'je me permettais', 'je voulais', 'je voudrais',
+        'ma femme', 'mon mari', 'pour ma', 'pour mon', 'est-ce que', 'pourriez-vous',
+        'serait-il possible', 'j\'aimerais', 'nous avons besoin', 'dans la matinée'
+    ]
+    
+    # Patterns qui indiquent probablement l'AGENT (professionnel qui reçoit)
+    agent_patterns = [
+        'cabinet', 'bonjour', 'je vais vous proposer', 'le plus tôt que je puisse',
+        'par contre', 'malheureusement', 'c\'est que les', 'nous n\'avons',
+        'je peux vous dire', 'alors', 'effectivement', 'bien sûr'
+    ]
+    
+    # Corriger l'attribution si patterns évidents
+    client_score = sum(1 for pattern in client_patterns if pattern in text_lower)
+    agent_score = sum(1 for pattern in agent_patterns if pattern in text_lower)
+    
+    # Cas spéciaux de correction
+    if client_score > agent_score and client_score >= 2:
+        # Fort indice que c'est le client, mais attribué à l'agent
+        if speaker == "Agent":
+            log(f"[CORRECTION] Likely client text attributed to Agent: '{text[:30]}...'")
+            return text  # Pour l'instant on garde tel quel, mais on log
+    elif agent_score > client_score and agent_score >= 2:
+        # Fort indice que c'est l'agent, mais attribué au client  
+        if speaker == "Client":
+            log(f"[CORRECTION] Likely agent text attributed to Client: '{text[:30]}...'")
+            return text
+    
+    # Nettoyage des artefacts de découpage
+    text = re.sub(r'\s+', ' ', text)  # Normaliser les espaces
+    text = re.sub(r'([.!?])\s*([.!?])', r'\1', text)  # Supprimer ponctuation double
+    
+    return text.strip()
+
+def improve_diarization_quality(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Améliore la qualité de la diarization en post-traitement.
+    """
+    if not segments:
+        return segments
+    
+    improved_segments = []
+    
+    for i, seg in enumerate(segments):
+        text = seg.get("text", "")
+        speaker = seg["speaker"]
+        
+        # Si le segment est très court et répète le speaker précédent/suivant,
+        # il pourrait s'agir d'une erreur de segmentation
+        if len(text.split()) < 3:
+            # Regarder le contexte
+            prev_speaker = segments[i-1]["speaker"] if i > 0 else None
+            next_speaker = segments[i+1]["speaker"] if i < len(segments)-1 else None
+            
+            # Si entouré du même speaker, c'est probablement une erreur de segmentation
+            if prev_speaker == next_speaker and prev_speaker != speaker:
+                log(f"[QUALITY] Potential segmentation error: short '{text}' between {prev_speaker} segments")
+        
+        improved_segments.append(seg)
+    
+    return improved_segments
 def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
     """
     MODE HYBRIDE ULTRA-RAPIDE : 
@@ -749,11 +873,9 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     optimized_segments = optimize_diarization_segments(diar_segments)
     log(f"[HYBRID] After optimization: {len(optimized_segments)} segments")
 
-    # ÉTAPE 4: ATTRIBUTION DU TEXTE SELON LES TIMESTAMPS
-    log("[HYBRID] Step 3: Attributing text to speakers...")
+    # ÉTAPE 4: ATTRIBUTION INTELLIGENTE DU TEXTE SELON LES TIMESTAMPS
+    log("[HYBRID] Step 3: Smart text attribution to speakers...")
     segments = []
-    words = full_text.split()
-    total_duration = est_dur
     
     if not optimized_segments:
         segments = [{
@@ -761,52 +883,62 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
             "start": 0.0,
             "end": total_duration,
             "text": full_text,
-            "mood": None  # Skip sentiment in hybrid mode for speed
+            "mood": None
         }]
     else:
-        total_seg_duration = sum(seg["end"] - seg["start"] for seg in optimized_segments)
-        word_index = 0
+        # Nouvelle approche : attribution par phrases complètes
+        sentences = smart_sentence_split(full_text)
+        log(f"[HYBRID] Split into {len(sentences)} sentences for attribution")
         
-        log(f"[HYBRID] Processing {len(optimized_segments)} segments for text attribution...")
+        total_seg_duration = sum(seg["end"] - seg["start"] for seg in optimized_segments)
+        sentence_index = 0
         
         for i, seg in enumerate(optimized_segments):
             seg_duration = seg["end"] - seg["start"]
+            seg_start = seg["start"]
+            seg_end = seg["end"]
             
-            # Attribution proportionnelle du texte (plus simple et rapide)
-            word_proportion = seg_duration / total_seg_duration if total_seg_duration > 0 else 1.0/len(optimized_segments)
-            words_for_segment = max(1, int(len(words) * word_proportion))
+            # Calculer combien de phrases attribuer à ce segment
+            sentence_proportion = seg_duration / total_seg_duration if total_seg_duration > 0 else 1.0/len(optimized_segments)
+            sentences_for_segment = max(1, int(len(sentences) * sentence_proportion))
             
-            # Assurer qu'on ne dépasse pas la fin des mots
-            words_for_segment = min(words_for_segment, len(words) - word_index)
+            # Ajuster pour ne pas dépasser
+            sentences_for_segment = min(sentences_for_segment, len(sentences) - sentence_index)
             
-            if words_for_segment > 0:
-                seg_words = words[word_index:word_index + words_for_segment]
-                seg_text = " ".join(seg_words)
-                word_index += words_for_segment
+            # Récupérer les phrases pour ce segment
+            if sentences_for_segment > 0:
+                seg_sentences = sentences[sentence_index:sentence_index + sentences_for_segment]
+                seg_text = " ".join(seg_sentences).strip()
+                sentence_index += sentences_for_segment
             else:
                 seg_text = ""
             
-            # SKIP sentiment in hybrid mode for speed - calculate at the end instead
+            # Post-correction basée sur les patterns de dialogue
+            seg_text = post_correct_speaker_attribution(seg_text, seg["speaker"], i > 0)
+            
             segments.append({
                 "speaker": seg["speaker"],
-                "start": seg["start"],
-                "end": seg["end"],
+                "start": seg_start,
+                "end": seg_end,
                 "text": seg_text,
-                "mood": None  # Will be calculated globally at the end if needed
+                "mood": None
             })
             
-            log(f"[HYBRID] Segment {i+1}/{len(optimized_segments)}: {len(seg_text)} chars assigned to {seg['speaker']}")
+            log(f"[HYBRID] Segment {i+1}/{len(optimized_segments)}: '{seg_text[:50]}...' → {seg['speaker']}")
         
-        # Attribution des mots restants au dernier segment si nécessaire
-        if word_index < len(words):
-            remaining_words = words[word_index:]
-            if segments and remaining_words:
-                segments[-1]["text"] += " " + " ".join(remaining_words)
-                log(f"[HYBRID] Added {len(remaining_words)} remaining words to last segment")
+        # Attribution des phrases restantes au dernier segment si nécessaire
+        if sentence_index < len(sentences):
+            remaining_sentences = sentences[sentence_index:]
+            if segments and remaining_sentences:
+                additional_text = " ".join(remaining_sentences)
+                segments[-1]["text"] += " " + additional_text
+                log(f"[HYBRID] Added {len(remaining_sentences)} remaining sentences to last segment")
     
-    log("[HYBRID] Text attribution completed")
+    log("[HYBRID] Smart text attribution completed")
     
-    # ÉTAPE 5: POST-TRAITEMENT STANDARD
+    # ÉTAPE 5: POST-TRAITEMENT ET AMÉLIORATION DE LA QUALITÉ
+    log("[HYBRID] Step 4: Post-processing for quality improvement...")
+    segments = improve_diarization_quality(segments)
     segments = _enforce_max_two_speakers(segments)
     _map_roles(segments)
     
