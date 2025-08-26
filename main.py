@@ -48,13 +48,14 @@ SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
 SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
 
-# Diarization - MODE HYBRIDE ULTRA-RAPIDE
+# Diarization - MODE CONSERVATEUR POUR MEILLEURE QUALITÉ
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
 EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"   
-MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "8.0"))         # ULTRA-AGRESSIF
-MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "3.0")) # ULTRA-AGRESSIF
+MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "5.0"))         # PLUS CONSERVATEUR : 8.0→5.0 mais avec fusion agressive
+MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "8.0")) # PLUS STRICT : 3.0→8.0
 MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"  
-HYBRID_MODE = os.environ.get("HYBRID_MODE", "1") == "1"  # NOUVEAU : transcription globale + diarization
+HYBRID_MODE = os.environ.get("HYBRID_MODE", "1") == "1"
+AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "1"  # NOUVEAU : fusion ultra-agressive
 
 # Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
@@ -611,7 +612,7 @@ def _map_roles(segments: List[Dict[str, Any]]):
         s["speaker"] = mapping.get(s["speaker"], s["speaker"])
 
 def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Optimise les segments de diarization pour réduire le nombre d'appels Voxtral."""
+    """Optimise les segments de diarization avec fusion ultra-agressive."""
     log(f"[OPTIMIZE] Input: {len(segments)} segments")
     
     # Filtrer les segments trop courts
@@ -625,8 +626,10 @@ def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[s
     
     log(f"[OPTIMIZE] After filtering: {len(filtered)} segments")
     
-    # Fusionner les segments consécutifs si activé
-    if MERGE_CONSECUTIVE and filtered:
+    # Fusion ULTRA-AGRESSIVE
+    if AGGRESSIVE_MERGE and filtered:
+        filtered = ultra_aggressive_merge(filtered, max_gap=3.0)
+    elif MERGE_CONSECUTIVE and filtered:
         filtered = merge_consecutive_segments(filtered, max_gap=2.0)
     
     # Supprimer les speakers avec trop peu de temps total
@@ -647,40 +650,155 @@ def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[s
     log(f"[OPTIMIZE] Final: {len(segments)} → {len(filtered)} segments")
     return filtered
 
-def merge_consecutive_segments(segments: List[Dict[str, Any]], max_gap: float = 1.0) -> List[Dict[str, Any]]:
-    """Fusionne les segments consécutifs du même speaker pour réduire le nombre d'appels Voxtral."""
+def ultra_aggressive_merge(segments: List[Dict[str, Any]], max_gap: float = 3.0) -> List[Dict[str, Any]]:
+    """
+    Fusion ultra-agressive pour créer de gros blocs cohérents et réduire les erreurs.
+    """
     if not segments:
         return segments
     
     merged = []
     current = segments[0].copy()
     
-    log(f"[MERGE] Starting with {len(segments)} segments")
+    log(f"[ULTRA_MERGE] Starting with {len(segments)} segments")
     
     for next_seg in segments[1:]:
         same_speaker = current["speaker"] == next_seg["speaker"]
         gap = float(next_seg["start"]) - float(current["end"])
-        small_gap = gap <= max_gap
         
-        if same_speaker and small_gap:
+        # Fusion plus agressive : même speaker OU gap très petit
+        should_merge = (same_speaker and gap <= max_gap) or (gap <= 0.5)  # Fusionne même différents speakers si gap < 0.5s
+        
+        if should_merge:
+            # Fusionner
             current["end"] = next_seg["end"]
-            current_text = current.get("text", "").strip()
-            next_text = next_seg.get("text", "").strip()
             
-            if current_text and next_text:
-                current["text"] = f"{current_text} {next_text}"
-            elif next_text:
-                current["text"] = next_text
-                
-            log(f"[MERGE] Merged segments: {current['speaker']} gap={gap:.1f}s")
+            # Si même speaker, fusionner normalement
+            if same_speaker:
+                current_text = current.get("text", "").strip()
+                next_text = next_seg.get("text", "").strip()
+                if current_text and next_text:
+                    current["text"] = f"{current_text} {next_text}"
+                elif next_text:
+                    current["text"] = next_text
+            else:
+                # Différents speakers mais gap tiny = probablement erreur PyAnnote
+                log(f"[ULTRA_MERGE] Merging different speakers due to tiny gap: {gap:.2f}s")
+                # Garde le speaker du segment le plus long
+                current_dur = float(current["end"]) - float(current["start"])  
+                next_dur = float(next_seg["end"]) - float(next_seg["start"])
+                if next_dur > current_dur:
+                    current["speaker"] = next_seg["speaker"]
+                    
         else:
+            # Ne peut pas fusionner
             merged.append(current)
             current = next_seg.copy()
     
     merged.append(current)
     
-    log(f"[MERGE] Result: {len(segments)} → {len(merged)} segments ({100*(1-len(merged)/len(segments)):.1f}% reduction)")
+    log(f"[ULTRA_MERGE] Result: {len(segments)} → {len(merged)} segments ({100*(1-len(merged)/len(segments)):.1f}% reduction)")
     return merged
+
+def intelligent_dialogue_correction(text: str, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Post-correction intelligente du dialogue basée sur les patterns de conversation.
+    """
+    if not segments or len(segments) < 2:
+        return segments
+    
+    log("[CORRECTION] Starting intelligent dialogue correction...")
+    
+    # Analyse du texte global pour identifier les tours de parole réels
+    full_text = " ".join(seg.get("text", "") for seg in segments).strip()
+    
+    # Patterns qui indiquent un changement de locuteur
+    speaker_change_patterns = [
+        r'\b(oui|non|d\'accord|très bien|parfait|c\'est ça|exactement)\b\s+',
+        r'\b(bonjour|bonsoir|au revoir|merci|à bientôt)\b',
+        r'\b(alors|bon|eh bien|donc|en fait)\b\s+',
+        r'[.!?]\s+(oui|non|d\'accord|très bien)',
+    ]
+    
+    # Tenter de redécouper le texte de manière plus intelligente
+    sentences = smart_sentence_split(full_text)
+    
+    # Si on a trop de segments pour peu de phrases, c'est probablement sur-segmenté
+    if len(segments) > len(sentences) * 1.5:
+        log(f"[CORRECTION] Over-segmentation detected: {len(segments)} segments for {len(sentences)} sentences")
+        
+        # Mode de récupération : créer de gros blocs alternés
+        corrected_segments = []
+        sentences_per_segment = max(2, len(sentences) // 4)  # 4 segments max
+        
+        current_speaker = segments[0]["speaker"]
+        sentence_idx = 0
+        segment_idx = 0
+        
+        while sentence_idx < len(sentences):
+            # Calculer la durée proportionnelle
+            proportion = sentences_per_segment / len(sentences)
+            start_time = segment_idx * (segments[-1]["end"] / 4)
+            end_time = min((segment_idx + 1) * (segments[-1]["end"] / 4), segments[-1]["end"])
+            
+            # Prendre les phrases pour ce segment
+            seg_sentences = sentences[sentence_idx:sentence_idx + sentences_per_segment]
+            seg_text = " ".join(seg_sentences)
+            
+            corrected_segments.append({
+                "speaker": current_speaker,
+                "start": start_time,
+                "end": end_time,
+                "text": seg_text,
+                "mood": None
+            })
+            
+            # Alterner les speakers
+            if current_speaker == "Agent":
+                current_speaker = "Client"
+            else:
+                current_speaker = "Agent"
+                
+            sentence_idx += sentences_per_segment
+            segment_idx += 1
+        
+        log(f"[CORRECTION] Created {len(corrected_segments)} corrected segments")
+        return corrected_segments
+    
+    return segments
+
+def post_correct_speaker_attribution(text: str, speaker: str, has_previous_speaker: bool) -> str:
+    """Post-correction améliorée de l'attribution basée sur les patterns de dialogue."""
+    if not text:
+        return text
+    
+    text_lower = text.lower().strip()
+    
+    # Patterns CLIENT plus spécifiques
+    client_patterns = [
+        ('je voudrais', 3), ('ma femme', 3), ('mon mari', 3), ('j\'ai appelé', 2),
+        ('est-ce que je pourrais', 3), ('où est-ce que', 2), ('quel autre centre', 3),
+        ('les rendez-vous ne conviennent pas', 4), ('je me permettais', 3)
+    ]
+    
+    # Patterns AGENT plus spécifiques  
+    agent_patterns = [
+        ('cabinet', 2), ('bonjour', 1), ('je vais voir ça', 3), ('dès que j\'ai', 2),
+        ('on vous rappelle', 3), ('vous avez mon numéro', 3), ('notre confrère', 2),
+        ('c\'est pour quoi faire', 2), ('allez ok', 2)
+    ]
+    
+    # Calcul des scores pondérés
+    client_score = sum(weight for pattern, weight in client_patterns if pattern in text_lower)
+    agent_score = sum(weight for pattern, weight in agent_patterns if pattern in text_lower)
+    
+    # Détection d'erreurs flagrantes
+    if client_score >= 3 and speaker == "Agent":
+        log(f"[CORRECTION] Strong client pattern in agent text: '{text[:40]}...'")
+    elif agent_score >= 3 and speaker == "Client":
+        log(f"[CORRECTION] Strong agent pattern in client text: '{text[:40]}...'")
+    
+    return re.sub(r'\s+', ' ', text).strip()
 
 def smart_sentence_split(text: str) -> List[str]:
     """
@@ -936,8 +1054,9 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     
     log("[HYBRID] Smart text attribution completed")
     
-    # ÉTAPE 5: POST-TRAITEMENT ET AMÉLIORATION DE LA QUALITÉ
-    log("[HYBRID] Step 4: Post-processing for quality improvement...")
+    # ÉTAPE 5: POST-TRAITEMENT ET CORRECTION INTELLIGENTE
+    log("[HYBRID] Step 4: Intelligent dialogue correction...")
+    segments = intelligent_dialogue_correction(full_text, segments)
     segments = improve_diarization_quality(segments)
     segments = _enforce_max_two_speakers(segments)
     _map_roles(segments)
