@@ -42,11 +42,8 @@ MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "300"))
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
-# Sentiment (CPU par défaut)
-SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli").strip()
-SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip().lower()
+# Sentiment - NOUVEAU : Analyse par Voxtral
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
-SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 = CPU
 
 # Diarization - MODES AVANCÉS
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
@@ -71,8 +68,6 @@ ROLE_LABELS = [r.strip() for r in os.environ.get("ROLE_LABELS", "Agent,Client").
 _processor = None
 _model = None
 _diarizer = None
-_sentiment_clf = None
-_sentiment_zero_shot = None
 
 # ---------------------------
 # Helpers généraux
@@ -355,34 +350,74 @@ def _label_fr(en_label: str) -> str:
             pass
     return m.get(key, en_label)
 
+def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
+    """
+    Analyse de sentiment par Voxtral - plus adaptée aux conversations téléphoniques professionnelles
+    """
+    if not text.strip():
+        return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
+    
+    # Instruction spécialisée pour l'analyse de sentiment des appels
+    instruction = (
+        "Analyse la qualité de cette conversation téléphonique professionnelle. "
+        "Réponds UNIQUEMENT par un seul mot parmi : satisfaisant, neutre, insatisfaisant\n\n"
+        "Critères :\n"
+        "- satisfaisant : demande traitée, client content, solution trouvée\n"
+        "- neutre : échange poli standard, information donnée\n" 
+        "- insatisfaisant : client frustré, problème non résolu, tension\n\n"
+        f"Conversation : {text[:800]}"  # Limiter pour éviter les tokens
+    )
+    
+    conversation = [{
+        "role": "user", 
+        "content": [{"type": "text", "text": instruction}]
+    }]
+    
+    try:
+        result = run_voxtral_with_timeout(conversation, max_new_tokens=8, timeout=15)  # Très court
+        response = (result.get("text") or "").strip().lower()
+        
+        # Mapping vers les labels standards + français (anciens labels conservés)
+        if "satisfaisant" in response:
+            return {
+                "label_en": "positive", 
+                "label_fr": "bon", 
+                "confidence": 0.85,
+                "scores": {"negative": 0.05, "neutral": 0.10, "positive": 0.85}
+            }
+        elif "insatisfaisant" in response:
+            return {
+                "label_en": "negative", 
+                "label_fr": "mauvais", 
+                "confidence": 0.80,
+                "scores": {"negative": 0.80, "neutral": 0.15, "positive": 0.05}
+            }
+        else:  # neutre ou réponse non comprise
+            return {
+                "label_en": "neutral", 
+                "label_fr": "neutre", 
+                "confidence": 0.75,
+                "scores": {"negative": 0.10, "neutral": 0.75, "positive": 0.15}
+            }
+            
+    except Exception as e:
+        log(f"[SENTIMENT] Voxtral sentiment analysis failed: {e}")
+        # Fallback neutre
+        return {
+            "label_en": "neutral", 
+            "label_fr": "neutre", 
+            "confidence": 0.50,
+            "scores": {"negative": 0.20, "neutral": 0.50, "positive": 0.30}
+        }
+
 def classify_sentiment(text: str) -> Dict[str, Any]:
+    """
+    Interface de sentiment - utilise Voxtral au lieu de mDeBERTa
+    """
     if not ENABLE_SENTIMENT or not text.strip():
         return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
-
-    if SENTIMENT_TYPE == "zero-shot":
-        clf = load_sentiment()
-        res = clf(text.strip(), candidate_labels=["positive", "neutral", "negative"], multi_label=False)
-        scores = {"positive": 0.0, "neutral": 0.0, "negative": 0.0}
-        for lbl, sc in zip(res["labels"], res["scores"]):
-            scores[lbl.lower()] = float(sc)
-        label_en = res["labels"][0].lower()
-        return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": scores[label_en], "scores": scores}
-    else:
-        clf = load_sentiment()
-        res = clf(text.strip())[0]
-        canonical = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
-        for r in res:
-            lbl = r["label"].lower()
-            if lbl.startswith("label_"):
-                try:
-                    idx = int(lbl.split("_")[-1])
-                    lbl = ["negative", "neutral", "positive"][idx]
-                except Exception:
-                    pass
-            if lbl in canonical:
-                canonical[lbl] = float(r["score"])
-        label_en = max(canonical.items(), key=lambda kv: kv[1])[0]
-        return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": canonical[label_en], "scores": canonical}
+    
+    return classify_sentiment_with_voxtral(text)
 
 def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, Any]:
     total = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
@@ -1520,9 +1555,7 @@ def health():
         "hf_token_present": bool(HF_TOKEN),
         "model_id": MODEL_ID,
         "diar_model": DIAR_MODEL,
-        "sentiment_model": SENTIMENT_MODEL if ENABLE_SENTIMENT else None,
-        "sentiment_type": SENTIMENT_TYPE,
-        "sentiment_device": "cpu" if SENTIMENT_DEVICE == -1 else f"cuda:{SENTIMENT_DEVICE}",
+        "sentiment_analysis": "Voxtral-based" if ENABLE_SENTIMENT else "Disabled",
         "max_speakers": MAX_SPEAKERS,
         "exact_two": EXACT_TWO,
         "strict_transcription": STRICT_TRANSCRIPTION,
@@ -1571,11 +1604,7 @@ def health():
         load_diarizer()
     except Exception as e:
         errors["diarizer_load"] = f"{type(e).__name__}: {e}"
-    if ENABLE_SENTIMENT:
-        try:
-            load_sentiment()
-        except Exception as e:
-            errors["sentiment_load"] = f"{type(e).__name__}: {e}"
+    
     return {"ok": len(errors) == 0, "info": info, "errors": errors}
 
 # ---------------------------
@@ -1697,10 +1726,6 @@ try:
         log("[INIT] Preloading diarizer...")
         load_diarizer()
         
-        if ENABLE_SENTIMENT:
-            log("[INIT] Preloading sentiment...")
-            load_sentiment()
-            
         log("[INIT] Preload completed successfully")
         
 except Exception as e:
