@@ -652,7 +652,330 @@ def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[s
     log(f"[OPTIMIZE] Final: {len(segments)} → {len(filtered)} segments")
     return filtered
 
-def ultra_aggressive_merge(segments: List[Dict[str, Any]], max_gap: float = 3.0) -> List[Dict[str, Any]]:
+# ---------------------------
+# MODES DE DIARIZATION AVANCÉS
+# ---------------------------
+
+def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
+    """
+    MODE VOXTRAL SPEAKER ID : 
+    Demande directement à Voxtral d'identifier les speakers par le contexte conversationnel
+    """
+    log(f"[VOXTRAL_ID] Starting Voxtral-based speaker identification: language={language}")
+    
+    # Durée max
+    try:
+        log("[VOXTRAL_ID] Checking audio duration...")
+        import soundfile as sf
+        info = sf.info(wav_path)
+        est_dur = info.frames / float(info.samplerate or 1)
+        log(f"[VOXTRAL_ID] Audio duration: {est_dur:.1f}s")
+        if est_dur > MAX_DURATION_S:
+            return {"error": f"Audio too long ({est_dur:.1f}s). Increase MAX_DURATION_S or send shorter file."}
+    except Exception as e:
+        log(f"[VOXTRAL_ID] Could not check duration: {e}")
+
+    # INSTRUCTION SPÉCIALISÉE POUR IDENTIFICATION DES SPEAKERS
+    instruction = (
+        f"lang:{language or 'fr'} "
+        "Transcris cette conversation téléphonique en identifiant clairement qui parle. "
+        "Format requis:\n"
+        "Agent: [ce que dit l'agent/professionnel]\n"
+        "Client: [ce que dit le client/appelant]\n\n"
+        "Indications pour identifier les speakers:\n"
+        "- Agent = celui qui répond, dit 'bonjour', 'cabinet', 'je vais voir', 'on vous rappelle'\n"
+        "- Client = celui qui appelle, dit 'je voudrais', 'ma femme', 'est-ce que je peux'\n\n"
+        "Transcris mot à mot et sépare clairement chaque prise de parole."
+    )
+    
+    # TRANSCRIPTION AVEC IDENTIFICATION DES SPEAKERS EN UNE PASSE
+    log("[VOXTRAL_ID] Starting transcription with speaker identification...")
+    conv_speaker_id = [{
+        "role": "user",
+        "content": [
+            {"type": "audio", "path": wav_path},
+            {"type": "text", "text": instruction}
+        ]
+    }]
+    
+    # Ajuster les tokens selon la durée
+    speaker_tokens = min(max_new_tokens, int(est_dur * 10))  # Un peu plus pour les labels
+    out_speaker_id = run_voxtral_with_timeout(conv_speaker_id, max_new_tokens=speaker_tokens, timeout=90)
+    speaker_transcript = (out_speaker_id.get("text") or "").strip()
+    
+    if not speaker_transcript:
+        log("[VOXTRAL_ID] Empty speaker identification result, falling back to hybrid mode")
+        return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
+    
+    log(f"[VOXTRAL_ID] Speaker identification completed: {len(speaker_transcript)} chars in {out_speaker_id.get('latency_s', 0):.1f}s")
+
+    # PARSING DU RÉSULTAT AVEC SPEAKERS IDENTIFIÉS
+    log("[VOXTRAL_ID] Parsing speaker-identified transcript...")
+    segments = parse_speaker_identified_transcript(speaker_transcript, est_dur)
+    
+    if not segments:
+        log("[VOXTRAL_ID] Failed to parse speaker transcript, falling back to hybrid mode")
+        return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
+    
+    log(f"[VOXTRAL_ID] Parsed {len(segments)} segments from speaker-identified transcript")
+
+    # POST-TRAITEMENT STANDARD
+    segments = _enforce_max_two_speakers(segments)
+    _map_roles(segments)
+    
+    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
+    result = {"segments": segments, "transcript": full_transcript}
+    
+    # Résumé
+    if with_summary:
+        log("[VOXTRAL_ID] Generating summary...")
+        result["summary"] = select_best_summary_approach(full_transcript)
+    
+    # Sentiment global rapide
+    if ENABLE_SENTIMENT:
+        log("[VOXTRAL_ID] Computing sentiment analysis...")
+        global_mood = classify_sentiment(full_transcript) if full_transcript else None
+        
+        if global_mood and global_mood.get("scores"):
+            # Attribution du sentiment global à tous les segments
+            for seg in segments:
+                if seg.get("text"):
+                    seg["mood"] = global_mood
+            
+            # Mood overall et par speaker
+            weighted_moods = [(global_mood, float(seg["end"]) - float(seg["start"])) for seg in segments if seg.get("text")]
+            result["mood_overall"] = aggregate_mood(weighted_moods)
+            
+            per_role = {}
+            for seg in segments:
+                d = float(seg["end"]) - float(seg["start"])
+                r = seg["speaker"]
+                if seg.get("text"):
+                    per_role.setdefault(r, []).append((global_mood, d))
+            result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
+
+    log("[VOXTRAL_ID] Voxtral speaker identification completed successfully")
+    return result
+
+def parse_speaker_identified_transcript(transcript: str, total_duration: float) -> List[Dict[str, Any]]:
+    """
+    Parse le transcript avec speakers identifiés par Voxtral
+    """
+    if not transcript:
+        return []
+    
+    segments = []
+    lines = transcript.split('\n')
+    current_time = 0.0
+    
+    log(f"[PARSE] Processing {len(lines)} lines from speaker transcript")
+    
+    valid_lines = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Chercher les patterns Speaker: text
+        if ':' in line:
+            parts = line.split(':', 1)
+            if len(parts) == 2:
+                speaker_part = parts[0].strip()
+                text_part = parts[1].strip()
+                
+                # Normaliser les noms de speakers
+                if any(word in speaker_part.lower() for word in ['agent', 'professionnel', 'cabinet', 'secrétaire']):
+                    speaker = "Agent"
+                elif any(word in speaker_part.lower() for word in ['client', 'appelant', 'patient']):
+                    speaker = "Client"
+                elif speaker_part.lower() in ['agent', 'client']:
+                    speaker = speaker_part.capitalize()
+                else:
+                    # Speaker non identifié, essayer de deviner par le contenu
+                    if any(word in text_part.lower() for word in ['cabinet', 'bonjour', 'je vais voir', 'on vous rappelle']):
+                        speaker = "Agent"
+                    elif any(word in text_part.lower() for word in ['je voudrais', 'ma femme', 'est-ce que je peux']):
+                        speaker = "Client"
+                    else:
+                        speaker = "Agent"  # Défaut
+                
+                if text_part:  # Seulement si il y a du texte
+                    valid_lines.append((speaker, text_part))
+    
+    if not valid_lines:
+        log("[PARSE] No valid speaker lines found")
+        return []
+    
+    # Créer les segments avec timestamps approximatifs
+    total_words = sum(len(text.split()) for _, text in valid_lines)
+    
+    for i, (speaker, text) in enumerate(valid_lines):
+        # Calculer la durée basée sur le nombre de mots
+        word_count = len(text.split())
+        segment_duration = (word_count / total_words) * total_duration if total_words > 0 else total_duration / len(valid_lines)
+        
+        start_time = current_time
+        end_time = min(current_time + segment_duration, total_duration)
+        
+        segments.append({
+            "speaker": speaker,
+            "start": start_time,
+            "end": end_time,
+            "text": text,
+            "mood": None
+        })
+        
+        current_time = end_time
+        
+        log(f"[PARSE] Segment {i+1}: {speaker} ({start_time:.1f}s-{end_time:.1f}s) '{text[:30]}...'")
+    
+    return segments
+
+def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
+    """
+    MODE PYANNOTE AUTO PUR : 
+    Laisse PyAnnote décider automatiquement du nombre de speakers
+    """
+    log(f"[PYANNOTE_AUTO] Starting PyAnnote automatic speaker detection")
+    
+    # Durée max
+    try:
+        import soundfile as sf
+        info = sf.info(wav_path)
+        est_dur = info.frames / float(info.samplerate or 1)
+        if est_dur > MAX_DURATION_S:
+            return {"error": f"Audio too long ({est_dur:.1f}s)."}
+    except Exception as e:
+        log(f"[PYANNOTE_AUTO] Could not check duration: {e}")
+
+    # DIARIZATION AUTOMATIQUE (SANS PARAMÈTRES)
+    log("[PYANNOTE_AUTO] Running automatic diarization...")
+    dia = load_diarizer()
+    diarization = dia(wav_path)  # Laisse PyAnnote décider complètement
+    
+    # Collecter tous les segments
+    raw_segments = []
+    speakers_found = set()
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        segment = {
+            "speaker": speaker,
+            "start": float(turn.start),
+            "end": float(turn.end)
+        }
+        raw_segments.append(segment)
+        speakers_found.add(speaker)
+    
+    log(f"[PYANNOTE_AUTO] Auto-detected {len(speakers_found)} speakers: {speakers_found}")
+    log(f"[PYANNOTE_AUTO] Generated {len(raw_segments)} raw segments")
+    
+    # Si trop de speakers détectés, fusionner les moins importants
+    if len(speakers_found) > 3:
+        log(f"[PYANNOTE_AUTO] Too many speakers detected ({len(speakers_found)}), merging...")
+        # Garder seulement les 2 speakers avec le plus de temps de parole
+        speaker_times = {}
+        for seg in raw_segments:
+            duration = seg["end"] - seg["start"]
+            speaker_times[seg["speaker"]] = speaker_times.get(seg["speaker"], 0) + duration
+        
+        top_speakers = sorted(speaker_times.items(), key=lambda x: x[1], reverse=True)[:2]
+        main_speakers = [s[0] for s in top_speakers]
+        
+        log(f"[PYANNOTE_AUTO] Keeping main speakers: {main_speakers}")
+        
+        # Réassigner les speakers mineurs vers les principaux
+        for seg in raw_segments:
+            if seg["speaker"] not in main_speakers:
+                # Trouver le speaker principal le plus proche temporellement
+                seg_mid = (seg["start"] + seg["end"]) / 2
+                best_speaker = main_speakers[0]  # Défaut
+                
+                for main_seg in raw_segments:
+                    if main_seg["speaker"] in main_speakers:
+                        main_mid = (main_seg["start"] + main_seg["end"]) / 2
+                        if abs(main_mid - seg_mid) < 5.0:  # Dans les 5 secondes
+                            best_speaker = main_seg["speaker"]
+                            break
+                
+                seg["speaker"] = best_speaker
+    
+    # Appliquer le mode hybride avec les segments PyAnnote auto
+    return apply_hybrid_workflow_with_segments(wav_path, raw_segments, language, max_new_tokens, with_summary)
+
+def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool):
+    """Applique le workflow hybride avec des segments de diarization fournis"""
+    # Transcription globale
+    conv_global = _build_conv_transcribe_ultra_strict(wav_path, language or "fr")
+    out_global = run_voxtral_with_timeout(conv_global, max_new_tokens=max_new_tokens, timeout=60)
+    full_text = (out_global.get("text") or "").strip()
+    
+    if not full_text:
+        return {"error": "Empty global transcription"}
+    
+    # Optimisation des segments
+    optimized_segments = optimize_diarization_segments(diar_segments)
+    
+    # Attribution du texte (réutilise la logique existante)
+    sentences = smart_sentence_split(full_text)
+    segments = []
+    
+    if optimized_segments:
+        total_seg_duration = sum(seg["end"] - seg["start"] for seg in optimized_segments)
+        sentence_index = 0
+        
+        for seg in optimized_segments:
+            seg_duration = seg["end"] - seg["start"]
+            sentence_proportion = seg_duration / total_seg_duration if total_seg_duration > 0 else 1.0/len(optimized_segments)
+            sentences_for_segment = max(1, int(len(sentences) * sentence_proportion))
+            sentences_for_segment = min(sentences_for_segment, len(sentences) - sentence_index)
+            
+            if sentences_for_segment > 0:
+                seg_sentences = sentences[sentence_index:sentence_index + sentences_for_segment]
+                seg_text = " ".join(seg_sentences).strip()
+                sentence_index += sentences_for_segment
+            else:
+                seg_text = ""
+            
+            segments.append({
+                "speaker": seg["speaker"],
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg_text,
+                "mood": None
+            })
+    
+    # Post-traitement standard
+    segments = _enforce_max_two_speakers(segments)
+    _map_roles(segments)
+    
+    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
+    result = {"segments": segments, "transcript": full_transcript}
+    
+    if with_summary:
+        result["summary"] = select_best_summary_approach(full_transcript)
+    
+    if ENABLE_SENTIMENT:
+        global_mood = classify_sentiment(full_transcript) if full_transcript else None
+        if global_mood:
+            for seg in segments:
+                if seg.get("text"):
+                    seg["mood"] = global_mood
+            
+            weighted_moods = [(global_mood, float(seg["end"]) - float(seg["start"])) for seg in segments if seg.get("text")]
+            result["mood_overall"] = aggregate_mood(weighted_moods)
+            
+            per_role = {}
+            for seg in segments:
+                d = float(seg["end"]) - float(seg["start"])
+                r = seg["speaker"]
+                if seg.get("text"):
+                    per_role.setdefault(r, []).append((global_mood, d))
+            result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
+    
+    return result
+
+# ---------------------------
+# MODE HYBRIDE ULTRA-RAPIDE (fonction principale existante)
+# ---------------------------
     """
     Fusion ultra-agressive pour créer de gros blocs cohérents et réduire les erreurs.
     """
