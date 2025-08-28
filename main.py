@@ -936,6 +936,50 @@ def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_t
     # Appliquer le mode hybride avec les segments PyAnnote auto
     return apply_hybrid_workflow_with_segments(wav_path, raw_segments, language, max_new_tokens, with_summary)
 
+def ultra_aggressive_merge(segments: List[Dict[str, Any]], max_gap: float = 3.0) -> List[Dict[str, Any]]:
+    """
+    Fusion ultra-agressive pour créer de gros blocs cohérents et réduire les erreurs.
+    """
+    if not segments:
+        return segments
+    
+    merged = []
+    current = segments[0].copy()
+    
+    log(f"[ULTRA_MERGE] Starting with {len(segments)} segments")
+    
+    for next_seg in segments[1:]:
+        same_speaker = current["speaker"] == next_seg["speaker"]
+        gap = float(next_seg["start"]) - float(current["end"])
+        
+        # Fusion plus agressive : même speaker OU gap très petit
+        should_merge = (same_speaker and gap <= max_gap) or (gap <= 0.5)
+        
+        if should_merge:
+            # Fusionner
+            current["end"] = next_seg["end"]
+            
+            if same_speaker:
+                current_text = current.get("text", "").strip()
+                next_text = next_seg.get("text", "").strip()
+                if current_text and next_text:
+                    current["text"] = f"{current_text} {next_text}"
+                elif next_text:
+                    current["text"] = next_text
+            else:
+                log(f"[ULTRA_MERGE] Merging different speakers due to tiny gap: {gap:.2f}s")
+                current_dur = float(current["end"]) - float(current["start"])  
+                next_dur = float(next_seg["end"]) - float(next_seg["start"])
+                if next_dur > current_dur:
+                    current["speaker"] = next_seg["speaker"]
+        else:
+            merged.append(current)
+            current = next_seg.copy()
+    
+    merged.append(current)
+    
+    log(f"[ULTRA_MERGE] Result: {len(segments)} → {len(merged)} segments")
+    return merged
 def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool):
     """Applique le workflow hybride avec des segments de diarization fournis"""
     # Transcription globale
