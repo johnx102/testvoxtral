@@ -365,7 +365,7 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
         "- satisfaisant : demande traitée, client content, solution trouvée\n"
         "- neutre : échange poli standard, information donnée\n" 
         "- insatisfaisant : client frustré, problème non résolu, tension\n\n"
-        f"Conversation : {text[:800]}"  # Limiter pour éviter les tokens
+        f"Conversation : {text}"  # Limiter pour éviter les tokens
     )
     
     conversation = [{
@@ -374,7 +374,7 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
     }]
     
     try:
-        result = run_voxtral_with_timeout(conversation, max_new_tokens=8, timeout=15)  # Très court
+        result = run_voxtral_with_timeout(conversation, max_new_tokens=16, timeout=120)  # Très court
         response = (result.get("text") or "").strip().lower()
         
         # Mapping vers les labels standards + français (anciens labels conservés)
