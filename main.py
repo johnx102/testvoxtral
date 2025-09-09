@@ -352,20 +352,68 @@ def _label_fr(en_label: str) -> str:
 
 def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
     """
-    Analyse de sentiment par Voxtral - plus adaptée aux conversations téléphoniques professionnelles
+    Analyse de sentiment par Voxtral - adaptée aux nuances des conversations françaises
     """
     if not text.strip():
         return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
     
-    # Instruction spécialisée pour l'analyse de sentiment des appels
+    # DÉTECTION RAPIDE DES MOTS-CLÉS NÉGATIFS AVANT VOXTRAL
+    negative_keywords = [
+        "pas content", "pas contente", "pas satisfait", "pas satisfaite",
+        "mécontent", "mécontente", "déçu", "déçue", "problème", "souci",
+        "annulé", "annuler", "pas bien", "pas bon", "pas bonne",
+        "se foutre la honte", "la honte", "gêné", "gênée", "embarrassé",
+        "pas possible", "inacceptable", "inadmissible", "catastrophe",
+        "nul", "horrible", "terrible", "décevant", "raté", "échec",
+        "pas normal", "anormal", "bizarre", "étrange", "pas correct",
+        "se plaindre", "plainte", "réclamation", "pas d'accord",
+        "remboursement", "rembourser", "reprendre", "refaire",
+        "urgent", "urgence", "grave", "sérieux", "inquiet", "inquiète"
+    ]
+    
+    text_lower = text.lower()
+    negative_count = sum(1 for keyword in negative_keywords if keyword in text_lower)
+    
+    # Si au moins 2 mots-clés négatifs, c'est négatif
+    if negative_count >= 2:
+        log(f"[SENTIMENT] Direct negative detection: {negative_count} keywords found")
+        return {
+            "label_en": "negative",
+            "label_fr": "mauvais",
+            "confidence": 0.90,
+            "scores": {"negative": 0.90, "neutral": 0.08, "positive": 0.02}
+        }
+    
+    # DÉTECTION DES ACTIONS NÉGATIVES
+    negative_actions = [
+        "annulé", "annuler", "reporter", "partir", "changer de",
+        "aller ailleurs", "voir un autre", "demander remboursement"
+    ]
+    
+    action_found = any(action in text_lower for action in negative_actions)
+    if action_found and ("pas content" in text_lower or "problème" in text_lower):
+        log(f"[SENTIMENT] Negative action + complaint detected")
+        return {
+            "label_en": "negative",
+            "label_fr": "mauvais",
+            "confidence": 0.85,
+            "scores": {"negative": 0.85, "neutral": 0.12, "positive": 0.03}
+        }
+    
+    # Instruction Voxtral AMÉLIORÉE avec plus de nuances
     instruction = (
-        "Analyse la qualité de cette conversation téléphonique professionnelle. "
-        "Réponds UNIQUEMENT par un seul mot parmi : satisfaisant, neutre, insatisfaisant\n\n"
-        "Critères :\n"
-        "- satisfaisant : demande traitée, client content, solution trouvée\n"
-        "- neutre : échange poli standard, information donnée\n" 
-        "- insatisfaisant : client frustré, problème non résolu, tension\n\n"
-        f"Conversation : {text}"  # Limiter pour éviter les tokens
+        "Analyse cette conversation téléphonique et détermine le sentiment du client/patient. "
+        "Réponds UNIQUEMENT par UN SEUL MOT : satisfaisant, neutre, ou insatisfaisant\n\n"
+        "RÈGLES D'ANALYSE :\n"
+        "- insatisfaisant : SI le client/patient exprime TOUT mécontentement, même poli "
+        "(pas content, déçu, problème, annulation à cause d'insatisfaction, gêne, honte, "
+        "demande de parler au responsable, veut une solution)\n"
+        "- satisfaisant : SEULEMENT si le client est clairement content "
+        "(remerciements sincères, compliments, satisfaction exprimée)\n"
+        "- neutre : simple demande d'information sans émotion particulière\n\n"
+        "ATTENTION : Un client poli peut être très mécontent. "
+        "Cherche les indices subtils d'insatisfaction.\n\n"
+        f"Conversation à analyser :\n{text}"
     )
     
     conversation = [{
@@ -374,25 +422,50 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
     }]
     
     try:
-        result = run_voxtral_with_timeout(conversation, max_new_tokens=16, timeout=120)  # Très court
+        result = run_voxtral_with_timeout(
+            conversation, 
+            max_new_tokens=16,
+            timeout=60
+        )
         response = (result.get("text") or "").strip().lower()
         
-        # Mapping vers les labels standards + français (anciens labels conservés)
-        if "satisfaisant" in response:
+        log(f"[SENTIMENT] Text length: {len(text)} chars")
+        log(f"[SENTIMENT] Voxtral response: '{response}'")
+        log(f"[SENTIMENT] Sample text: '{text[:200]}...'")
+        
+        # Mapping avec vérification supplémentaire
+        if "insatisfaisant" in response:
+            return {
+                "label_en": "negative", 
+                "label_fr": "mauvais", 
+                "confidence": 0.85,
+                "scores": {"negative": 0.85, "neutral": 0.12, "positive": 0.03}
+            }
+        elif "satisfaisant" in response and "insatisfaisant" not in response:
+            # Double vérification : pas de mots négatifs évidents
+            if negative_count > 0:
+                log(f"[SENTIMENT] Override: Voxtral said positive but found negative keywords")
+                return {
+                    "label_en": "neutral",
+                    "label_fr": "neutre",
+                    "confidence": 0.60,
+                    "scores": {"negative": 0.35, "neutral": 0.60, "positive": 0.05}
+                }
             return {
                 "label_en": "positive", 
                 "label_fr": "bon", 
                 "confidence": 0.85,
                 "scores": {"negative": 0.05, "neutral": 0.10, "positive": 0.85}
             }
-        elif "insatisfaisant" in response:
-            return {
-                "label_en": "negative", 
-                "label_fr": "mauvais", 
-                "confidence": 0.80,
-                "scores": {"negative": 0.80, "neutral": 0.15, "positive": 0.05}
-            }
-        else:  # neutre ou réponse non comprise
+        else:  # neutre ou non compris
+            # Si on a quand même un mot négatif, pencher vers négatif
+            if negative_count > 0:
+                return {
+                    "label_en": "negative",
+                    "label_fr": "mauvais", 
+                    "confidence": 0.70,
+                    "scores": {"negative": 0.70, "neutral": 0.25, "positive": 0.05}
+                }
             return {
                 "label_en": "neutral", 
                 "label_fr": "neutre", 
@@ -401,8 +474,15 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
             }
             
     except Exception as e:
-        log(f"[SENTIMENT] Voxtral sentiment analysis failed: {e}")
-        # Fallback neutre
+        log(f"[SENTIMENT] Voxtral analysis failed: {e}")
+        # En cas d'erreur, si on a des mots négatifs, on classe négatif
+        if negative_count > 0:
+            return {
+                "label_en": "negative",
+                "label_fr": "mauvais",
+                "confidence": 0.65,
+                "scores": {"negative": 0.65, "neutral": 0.30, "positive": 0.05}
+            }
         return {
             "label_en": "neutral", 
             "label_fr": "neutre", 
@@ -410,14 +490,54 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
             "scores": {"negative": 0.20, "neutral": 0.50, "positive": 0.30}
         }
 
+
+def validate_sentiment_coherence(text: str, sentiment: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Valide et corrige le sentiment si incohérent avec le contenu
+    """
+    if not sentiment or not text:
+        return sentiment
+    
+    # Phrases qui indiquent TOUJOURS un problème
+    strong_negative_phrases = [
+        "pas content", "pas contente",
+        "annulé", "annuler à cause",
+        "se foutre la honte", 
+        "pas satisfait", "pas satisfaite",
+        "je veux parler", "parler avec le responsable",
+        "ce n'est pas normal",
+        "c'est inadmissible"
+    ]
+    
+    text_lower = text.lower()
+    has_strong_negative = any(phrase in text_lower for phrase in strong_negative_phrases)
+    
+    # Si on trouve une phrase fortement négative mais sentiment non négatif
+    if has_strong_negative and sentiment.get("label_fr") != "mauvais":
+        log(f"[SENTIMENT_VALIDATION] Overriding sentiment to negative due to strong negative phrases")
+        return {
+            "label_en": "negative",
+            "label_fr": "mauvais", 
+            "confidence": 0.95,
+            "scores": {"negative": 0.95, "neutral": 0.04, "positive": 0.01}
+        }
+    
+    return sentiment
+    
 def classify_sentiment(text: str) -> Dict[str, Any]:
     """
-    Interface de sentiment - utilise Voxtral au lieu de mDeBERTa
+    Interface de sentiment - utilise Voxtral avec validation
     """
     if not ENABLE_SENTIMENT or not text.strip():
         return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
     
-    return classify_sentiment_with_voxtral(text)
+    # Analyse Voxtral
+    sentiment = classify_sentiment_with_voxtral(text)
+    
+    # Validation et correction si nécessaire
+    sentiment = validate_sentiment_coherence(text, sentiment)
+    
+    return sentiment
 
 def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, Any]:
     total = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
