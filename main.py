@@ -352,31 +352,115 @@ def _label_fr(en_label: str) -> str:
 
 def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
     """
-    Analyse de sentiment par Voxtral - version simplifiée
+    Analyse de sentiment équilibrée pour conversations téléphoniques
     """
     if not text.strip():
         return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
     
     text_lower = text.lower()
     
-    # Détection simple des cas évidents
-    if any(word in text_lower for word in ["pas content", "pas contente", "annulé", "se foutre la honte", "mécontent", "déçu"]):
+    # MOTS VRAIMENT NÉGATIFS (besoin de contexte fort)
+    strong_negative = [
+        "pas content du tout", "vraiment pas content", "pas contente du tout",
+        "très mécontent", "très déçu", "complètement déçu",
+        "annulé à cause", "annuler parce que", "se foutre la honte",
+        "inadmissible", "inacceptable", "catastrophe", "scandaleux"
+    ]
+    
+    # MOTS MOYENNEMENT NÉGATIFS (besoin d'accumulation)
+    mild_negative = [
+        "pas content", "pas satisfait", "déçu", "problème", 
+        "difficile", "compliqué", "pas possible"
+    ]
+    
+    # INDICATEURS POSITIFS (seuil plus bas)
+    positive_indicators = [
+        "merci", "parfait", "très bien", "super", "excellent",
+        "c'est bon", "d'accord", "ça marche", "pas de problème",
+        "bonne journée", "au revoir", "confirmé", "réglé",
+        "je vous remercie", "merci beaucoup", "c'est gentil",
+        "avec plaisir", "volontiers", "pas de souci"
+    ]
+    
+    # PHRASES QUI ANNULENT LE NÉGATIF
+    neutral_phrases = [
+        "c'est bon alors", "ah d'accord", "pas de problème",
+        "c'est réglé", "c'est confirmé", "ça marche"
+    ]
+    
+    # Comptage
+    strong_neg_count = sum(1 for phrase in strong_negative if phrase in text_lower)
+    mild_neg_count = sum(1 for word in mild_negative if word in text_lower)
+    positive_count = sum(1 for word in positive_indicators if word in text_lower)
+    neutral_found = any(phrase in text_lower for phrase in neutral_phrases)
+    
+    # LOGIQUE DE DÉCISION AJUSTÉE
+    
+    # 1. Fort négatif = négatif
+    if strong_neg_count >= 1:
+        log(f"[SENTIMENT] Strong negative: {strong_neg_count} phrases")
         return {
             "label_en": "negative",
             "label_fr": "mauvais",
-            "confidence": 0.85,
-            "scores": {"negative": 0.85, "neutral": 0.12, "positive": 0.03}
+            "confidence": 0.90,
+            "scores": {"negative": 0.90, "neutral": 0.08, "positive": 0.02}
         }
     
-    # Par défaut, appel Voxtral normal
+    # 2. Beaucoup de positifs = positif (SEUIL ABAISSÉ)
+    if positive_count >= 2 and mild_neg_count == 0:
+        log(f"[SENTIMENT] Clear positive: {positive_count} indicators")
+        return {
+            "label_en": "positive",
+            "label_fr": "bon",
+            "confidence": 0.85,
+            "scores": {"negative": 0.05, "neutral": 0.10, "positive": 0.85}
+        }
+    
+    # 3. Phrases neutres qui annulent le négatif
+    if neutral_found and mild_neg_count <= 1:
+        log(f"[SENTIMENT] Neutral phrases override")
+        return {
+            "label_en": "neutral",
+            "label_fr": "neutre",
+            "confidence": 0.80,
+            "scores": {"negative": 0.10, "neutral": 0.80, "positive": 0.10}
+        }
+    
+    # 4. Accumulation de négatifs moyens
+    if mild_neg_count >= 3:
+        log(f"[SENTIMENT] Multiple mild negatives: {mild_neg_count}")
+        return {
+            "label_en": "negative",
+            "label_fr": "mauvais",
+            "confidence": 0.75,
+            "scores": {"negative": 0.75, "neutral": 0.20, "positive": 0.05}
+        }
+    
+    # 5. Appel court et poli = probablement positif
+    word_count = len(text.split())
+    if word_count < 100 and positive_count >= 1 and mild_neg_count == 0:
+        log(f"[SENTIMENT] Short polite call: positive")
+        return {
+            "label_en": "positive",
+            "label_fr": "bon",
+            "confidence": 0.70,
+            "scores": {"negative": 0.10, "neutral": 0.20, "positive": 0.70}
+        }
+    
+    # 6. Voxtral pour les cas ambigus
     instruction = (
-        "Analyse cette conversation téléphonique. "
-        "Réponds par UN MOT : satisfaisant, neutre, ou insatisfaisant\n"
-        f"Conversation : {text[:2000]}"
+        "Analyse le sentiment de cette conversation téléphonique professionnelle.\n"
+        "Réponds par UN SEUL MOT : satisfaisant, neutre, ou insatisfaisant\n\n"
+        "Critères :\n"
+        "- satisfaisant : client content, remerciements, problème résolu, confirmation positive\n"
+        "- insatisfaisant : client mécontent, frustré, problème non résolu\n"
+        "- neutre : simple échange d'information\n\n"
+        "NOTE : La plupart des appels courts et polis sont satisfaisants.\n\n"
+        f"Conversation : {text[:1500]}"
     )
     
     conversation = [{
-        "role": "user", 
+        "role": "user",
         "content": [{"type": "text", "text": instruction}]
     }]
     
@@ -384,35 +468,61 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
         result = run_voxtral_with_timeout(conversation, max_new_tokens=16, timeout=60)
         response = (result.get("text") or "").strip().lower()
         
+        log(f"[SENTIMENT] Voxtral: '{response}' (pos:{positive_count} neg:{mild_neg_count})")
+        
         if "insatisfaisant" in response:
+            # Override si trop de positifs
+            if positive_count >= 2:
+                return {
+                    "label_en": "neutral",
+                    "label_fr": "neutre",
+                    "confidence": 0.65,
+                    "scores": {"negative": 0.25, "neutral": 0.65, "positive": 0.10}
+                }
             return {
-                "label_en": "negative", 
-                "label_fr": "mauvais", 
-                "confidence": 0.80,
-                "scores": {"negative": 0.80, "neutral": 0.15, "positive": 0.05}
+                "label_en": "negative",
+                "label_fr": "mauvais",
+                "confidence": 0.75,
+                "scores": {"negative": 0.75, "neutral": 0.20, "positive": 0.05}
             }
         elif "satisfaisant" in response and "insatisfaisant" not in response:
             return {
-                "label_en": "positive", 
-                "label_fr": "bon", 
-                "confidence": 0.85,
-                "scores": {"negative": 0.05, "neutral": 0.10, "positive": 0.85}
+                "label_en": "positive",
+                "label_fr": "bon",
+                "confidence": 0.80,
+                "scores": {"negative": 0.05, "neutral": 0.15, "positive": 0.80}
             }
         else:
+            # Neutre avec tendance positive si présence de mots positifs
+            if positive_count >= 1:
+                return {
+                    "label_en": "positive",
+                    "label_fr": "bon",
+                    "confidence": 0.65,
+                    "scores": {"negative": 0.10, "neutral": 0.25, "positive": 0.65}
+                }
             return {
-                "label_en": "neutral", 
-                "label_fr": "neutre", 
+                "label_en": "neutral",
+                "label_fr": "neutre",
                 "confidence": 0.75,
-                "scores": {"negative": 0.10, "neutral": 0.75, "positive": 0.15}
+                "scores": {"negative": 0.15, "neutral": 0.75, "positive": 0.10}
             }
             
     except Exception as e:
         log(f"[SENTIMENT] Error: {e}")
+        # Par défaut neutre/positif pour les appels courts
+        if word_count < 100 and positive_count > 0:
+            return {
+                "label_en": "positive",
+                "label_fr": "bon",
+                "confidence": 0.60,
+                "scores": {"negative": 0.10, "neutral": 0.30, "positive": 0.60}
+            }
         return {
-            "label_en": "neutral", 
-            "label_fr": "neutre", 
-            "confidence": 0.50,
-            "scores": {"negative": 0.20, "neutral": 0.50, "positive": 0.30}
+            "label_en": "neutral",
+            "label_fr": "neutre",
+            "confidence": 0.60,
+            "scores": {"negative": 0.20, "neutral": 0.60, "positive": 0.20}
         }
 
 
