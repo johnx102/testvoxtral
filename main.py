@@ -39,7 +39,7 @@ MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip(
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "64"))       
 MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "300"))      
-DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization@2.1").strip()
+DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
 # Sentiment - NOUVEAU : Analyse par Voxtral ou modèle dédié
