@@ -37,16 +37,13 @@ APP_VERSION = os.environ.get("APP_VERSION", "ultra-fast-hybrid-v1.0")
 
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "664"))       
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "694"))       
 MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "900"))      
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
-# Sentiment - NOUVEAU : Analyse par Voxtral ou modèle dédié
+# Sentiment - NOUVEAU : Analyse par Voxtral
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
-SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "nlptown/bert-base-multilingual-uncased-sentiment").strip()
-SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "classifier").strip()  # "classifier" ou "zero-shot"
-SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 => CPU
 
 # Diarization - MODES AVANCÉS
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
@@ -56,7 +53,7 @@ MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "8.0"))
 MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"  
 HYBRID_MODE = os.environ.get("HYBRID_MODE", "1") == "1"
 AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "1"
-VOXTRAL_SPEAKER_ID = os.environ.get("VOXTRAL_SPEAKER_ID", "1") == "0"  # NOUVEAU : Speaker ID par Voxtral
+VOXTRAL_SPEAKER_ID = os.environ.get("VOXTRAL_SPEAKER_ID", "1") == "1"  # NOUVEAU : Speaker ID par Voxtral
 PYANNOTE_AUTO = os.environ.get("PYANNOTE_AUTO", "0") == "1"  # NOUVEAU : PyAnnote auto pur
 
 # Transcription & résumé
@@ -71,8 +68,6 @@ ROLE_LABELS = [r.strip() for r in os.environ.get("ROLE_LABELS", "Agent,Client").
 _processor = None
 _model = None
 _diarizer = None
-_sentiment_clf = None
-_sentiment_zero_shot = None
 
 # ---------------------------
 # Helpers généraux
@@ -564,62 +559,19 @@ def validate_sentiment_coherence(text: str, sentiment: Dict[str, Any]) -> Dict[s
     
     return sentiment
     
-def classify_sentiment_with_model(text: str) -> Dict[str, Any]:
-    """
-    Analyse de sentiment avec modèle dédié (plus rapide et précis pour le français)
-    """
-    if not text.strip():
-        return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
-
-    try:
-        clf = load_sentiment()
-        if clf is None:
-            return classify_sentiment_with_voxtral(text)
-
-        result = clf(text)
-        if SENTIMENT_TYPE == "zero-shot":
-            # Zero-shot retourne une liste de scores
-            scores = {item["label"]: item["score"] for item in result[0]}
-        else:
-            # Classifier retourne scores pour toutes les classes
-            scores = result[0]
-
-        # Normaliser les labels
-        label_mapping = {
-            "1 star": "negative", "2 stars": "negative", "3 stars": "neutral",
-            "4 stars": "positive", "5 stars": "positive",
-            "NEGATIVE": "negative", "NEUTRAL": "neutral", "POSITIVE": "positive"
-        }
-
-        normalized_scores = {}
-        for label, score in scores.items():
-            norm_label = label_mapping.get(label.upper(), label.lower())
-            normalized_scores[norm_label] = normalized_scores.get(norm_label, 0) + score
-
-        best_label = max(normalized_scores.items(), key=lambda x: x[1])
-        return {
-            "label_en": best_label[0],
-            "label_fr": _label_fr(best_label[0]),
-            "confidence": best_label[1],
-            "scores": normalized_scores
-        }
-    except Exception as e:
-        log(f"[SENTIMENT_MODEL] Error: {e}, falling back to Voxtral")
-        return classify_sentiment_with_voxtral(text)
-
 def classify_sentiment(text: str) -> Dict[str, Any]:
     """
-    Interface de sentiment - utilise modèle dédié ou Voxtral avec validation
+    Interface de sentiment - utilise Voxtral avec validation
     """
     if not ENABLE_SENTIMENT or not text.strip():
         return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
-
-    # Essayer d'abord le modèle dédié
-    sentiment = classify_sentiment_with_model(text)
-
+    
+    # Analyse Voxtral
+    sentiment = classify_sentiment_with_voxtral(text)
+    
     # Validation et correction si nécessaire
     sentiment = validate_sentiment_coherence(text, sentiment)
-
+    
     return sentiment
 
 def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, Any]:
@@ -648,9 +600,9 @@ def generate_natural_summary(full_transcript: str, language: Optional[str] = Non
     
     lang_prefix = f"lang:{language} " if language else ""
     instruction = (
-        f"{lang_prefix}Résume cette conversation téléphonique professionnelle en 1-2 phrases naturelles et concises. "
-        "Indique : qui appelle (client ou autre), pourquoi (motif de l'appel), et l'issue ou la prochaine action. "
-        "Sois précis et utilise un langage simple, comme si tu racontais brièvement ce qui s'est passé."
+        f"{lang_prefix}Résume cette conversation en 1-2 phrases simples et claires. "
+        "Dis juste l'essentiel : qui appelle pourquoi, et ce qui va se passer. "
+        "Sois direct et naturel, sans format particulier."
     )
     
     conversation = [{
@@ -865,11 +817,7 @@ def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[s
             log(f"[OPTIMIZE] Filtered short segment: {duration:.1f}s < {MIN_SEG_DUR}s")
     
     log(f"[OPTIMIZE] After filtering: {len(filtered)} segments")
-
-    # Résoudre les chevauchements
-    filtered = resolve_overlaps(filtered)
-    log(f"[OPTIMIZE] After overlap resolution: {len(filtered)} segments")
-
+    
     # Fusion ULTRA-AGRESSIVE
     if AGGRESSIVE_MERGE and filtered:
         filtered = ultra_aggressive_merge(filtered, max_gap=3.0)
@@ -1143,86 +1091,48 @@ def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_t
     # Appliquer le mode hybride avec les segments PyAnnote auto
     return apply_hybrid_workflow_with_segments(wav_path, raw_segments, language, max_new_tokens, with_summary)
 
-def resolve_overlaps(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Résoudre les chevauchements de segments pour éviter les inversions de locuteurs.
-    Garde le segment avec la durée la plus longue en cas de chevauchement.
-    """
-    if not segments:
-        return segments
-
-    # Trier par temps de début
-    segments = sorted(segments, key=lambda s: s["start"])
-    resolved = []
-
-    for seg in segments:
-        if not resolved:
-            resolved.append(seg)
-            continue
-
-        last = resolved[-1]
-        if seg["start"] < last["end"]:  # Chevauchement
-            # Calculer le degré de chevauchement
-            overlap_start = max(last["start"], seg["start"])
-            overlap_end = min(last["end"], seg["end"])
-            overlap_duration = max(0, overlap_end - overlap_start)
-
-            last_dur = last["end"] - last["start"]
-            seg_dur = seg["end"] - seg["start"]
-
-            # Si chevauchement mineur (< 50% de la durée du segment le plus court), ajuster les limites
-            if overlap_duration < 0.5 * min(last_dur, seg_dur):
-                # Étendre le dernier segment pour inclure le nouveau
-                last["end"] = max(last["end"], seg["end"])
-                log(f"[OVERLAP] Minor overlap resolved by extending segment")
-            else:
-                # Chevauchement significatif : garder le segment le plus long
-                if seg_dur > last_dur:
-                    resolved[-1] = seg
-                    log(f"[OVERLAP] Major overlap: replaced with longer segment")
-                else:
-                    log(f"[OVERLAP] Major overlap: kept existing longer segment")
-        else:
-            resolved.append(seg)
-
-    return resolved
-
 def ultra_aggressive_merge(segments: List[Dict[str, Any]], max_gap: float = 3.0) -> List[Dict[str, Any]]:
     """
     Fusion ultra-agressive pour créer de gros blocs cohérents et réduire les erreurs.
-    Évite la fusion de chevauchements entre locuteurs différents.
     """
     if not segments:
         return segments
-
+    
     merged = []
     current = segments[0].copy()
-
+    
     log(f"[ULTRA_MERGE] Starting with {len(segments)} segments")
-
+    
     for next_seg in segments[1:]:
         same_speaker = current["speaker"] == next_seg["speaker"]
         gap = float(next_seg["start"]) - float(current["end"])
-
-        # Fusion seulement si même speaker et gap positif ou très petit
-        should_merge = same_speaker and gap <= max_gap
-
+        
+        # Fusion plus agressive : même speaker OU gap très petit
+        should_merge = (same_speaker and gap <= max_gap) or (gap <= 0.5)
+        
         if should_merge:
             # Fusionner
             current["end"] = next_seg["end"]
-
-            current_text = current.get("text", "").strip()
-            next_text = next_seg.get("text", "").strip()
-            if current_text and next_text:
-                current["text"] = f"{current_text} {next_text}"
-            elif next_text:
-                current["text"] = next_text
+            
+            if same_speaker:
+                current_text = current.get("text", "").strip()
+                next_text = next_seg.get("text", "").strip()
+                if current_text and next_text:
+                    current["text"] = f"{current_text} {next_text}"
+                elif next_text:
+                    current["text"] = next_text
+            else:
+                log(f"[ULTRA_MERGE] Merging different speakers due to tiny gap: {gap:.2f}s")
+                current_dur = float(current["end"]) - float(current["start"])  
+                next_dur = float(next_seg["end"]) - float(next_seg["start"])
+                if next_dur > current_dur:
+                    current["speaker"] = next_seg["speaker"]
         else:
             merged.append(current)
             current = next_seg.copy()
-
+    
     merged.append(current)
-
+    
     log(f"[ULTRA_MERGE] Result: {len(segments)} → {len(merged)} segments")
     return merged
 def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool):
@@ -1844,7 +1754,7 @@ def health():
         "hf_token_present": bool(HF_TOKEN),
         "model_id": MODEL_ID,
         "diar_model": DIAR_MODEL,
-        "sentiment_analysis": f"Model: {SENTIMENT_MODEL} ({SENTIMENT_TYPE})" if ENABLE_SENTIMENT else "Disabled",
+        "sentiment_analysis": "Voxtral-based" if ENABLE_SENTIMENT else "Disabled",
         "max_speakers": MAX_SPEAKERS,
         "exact_two": EXACT_TWO,
         "strict_transcription": STRICT_TRANSCRIPTION,
@@ -2014,11 +1924,7 @@ try:
         
         log("[INIT] Preloading diarizer...")
         load_diarizer()
-
-        if ENABLE_SENTIMENT:
-            log("[INIT] Preloading sentiment model...")
-            load_sentiment()
-
+        
         log("[INIT] Preload completed successfully")
         
 except Exception as e:
