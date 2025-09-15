@@ -3,9 +3,7 @@
 
 import os, time, base64, tempfile, uuid, requests, json, traceback, re
 from typing import Optional, List, Dict, Any, Tuple
-import librosa  # Nouvelle dépendance
-import numpy as np  # Déjà présent probablement
-from scipy import signal
+
 import torch
 from transformers import (
     AutoProcessor, AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline,
@@ -39,7 +37,7 @@ APP_VERSION = os.environ.get("APP_VERSION", "ultra-fast-hybrid-v1.0")
 
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "694"))       
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "964"))       
 MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "900"))      
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
@@ -54,8 +52,8 @@ MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "5.0"))
 MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "8.0")) 
 MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"  
 HYBRID_MODE = os.environ.get("HYBRID_MODE", "1") == "1"
-AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "0"
-VOXTRAL_SPEAKER_ID = os.environ.get("VOXTRAL_SPEAKER_ID", "1") == "0"  # NOUVEAU : Speaker ID par Voxtral
+AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "1"
+VOXTRAL_SPEAKER_ID = os.environ.get("VOXTRAL_SPEAKER_ID", "1") == "1"  # NOUVEAU : Speaker ID par Voxtral
 PYANNOTE_AUTO = os.environ.get("PYANNOTE_AUTO", "0") == "1"  # NOUVEAU : PyAnnote auto pur
 
 # Transcription & résumé
@@ -112,155 +110,7 @@ def check_gpu_memory():
             
         return True
     return False
-def cross_validate_speaker_attribution(segments: List[Dict]) -> List[Dict]:
-    """Valide les attributions avec patterns linguistiques."""
-    agent_indicators = {
-        r'\bcabinet\s+\w+': 5,
-        r'\bbonjour\s+(madame|monsieur)': 3,
-        r'\bje\s+vais\s+(vous\s+)?proposer': 4,
-        r'\ble\s+plus\s+tôt': 3,
-        r'\bc\'est\s+noté': 3,
-    }
-    
-    client_indicators = {
-        r'\bje\s+voudrais': 4,
-        r'\bma\s+femme': 4,
-        r'\bmon\s+mari': 4,
-        r'\bj\'ai\s+besoin': 3,
-    }
-    
-    corrected = []
-    for i, seg in enumerate(segments):
-        text = seg.get("text", "").lower()
-        if not text:
-            corrected.append(seg)
-            continue
-            
-        agent_score = sum(
-            score for pattern, score in agent_indicators.items() 
-            if re.search(pattern, text)
-        )
-        client_score = sum(
-            score for pattern, score in client_indicators.items() 
-            if re.search(pattern, text)
-        )
-        
-        if abs(agent_score - client_score) > 6:
-            seg["speaker"] = "Agent" if agent_score > client_score else "Client"
-            seg["confidence"] = abs(agent_score - client_score) / 10
-        
-        corrected.append(seg)
-    
-    return corrected
 
-def auto_calibrate_diarization_params(audio_path: str) -> Dict:
-    """Ajuste les paramètres selon l'audio."""
-    try:
-        import librosa
-        y, sr = librosa.load(audio_path, sr=16000)
-        duration = len(y) / sr
-        
-        noise_level = np.std(y[:int(0.5 * sr)])
-        intervals = librosa.effects.split(y, top_db=30)
-        num_segments = len(intervals)
-        
-        params = {
-            "min_segment_duration": 3.0 if noise_level > 0.01 else 5.0,
-            "merge_gap": 2.0 if num_segments > 20 else 3.0,
-            "min_speaker_time": 5.0 if duration < 60 else 8.0,
-            "aggressive_merge": num_segments > 30
-        }
-        
-        log(f"[AUTO_CALIBRATE] Adjusted params: {params}")
-        return params
-        
-    except ImportError:
-        log("[AUTO_CALIBRATE] librosa not available, using defaults")
-        return {
-            "min_segment_duration": MIN_SEG_DUR,
-            "merge_gap": 3.0,
-            "min_speaker_time": MIN_SPEAKER_TIME,
-            "aggressive_merge": AGGRESSIVE_MERGE
-        }
-
-def detect_speaker_changes_with_prosody(audio_path: str) -> List[float]:
-    """Détecte changements via prosodie."""
-    try:
-        import librosa
-        y, sr = librosa.load(audio_path, sr=16000)
-        
-        # Analyse basique d'énergie pour détecter les changements
-        hop_length = 512
-        energy = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-        
-        # Détecter les changements brusques d'énergie
-        energy_diff = np.diff(energy)
-        threshold = np.std(energy_diff) * 2
-        changes = np.where(np.abs(energy_diff) > threshold)[0]
-        
-        # Convertir en timestamps
-        timestamps = [c * hop_length / sr for c in changes]
-        return timestamps
-        
-    except ImportError:
-        log("[PROSODY] librosa not available")
-        return []
-
-def enhanced_text_attribution(
-    full_text: str, 
-    segments: List[Dict], 
-    prosody_changes: List[float]
-) -> List[Dict]:
-    """Attribution améliorée du texte."""
-    sentences = smart_sentence_split(full_text)
-    
-    if not segments:
-        return [{
-            "speaker": "Agent",
-            "start": 0.0,
-            "end": 10.0,
-            "text": full_text,
-            "mood": None
-        }]
-    
-    result = []
-    sentence_idx = 0
-    
-    for seg in segments:
-        # Trouver les changements prosodiques dans ce segment
-        seg_changes = [
-            c for c in prosody_changes 
-            if seg["start"] <= c <= seg["end"]
-        ]
-        
-        # Si changement détecté, peut-être mauvaise attribution
-        if len(seg_changes) > 1:
-            log(f"[ATTRIBUTION] Multiple prosody changes in segment {seg['start']}-{seg['end']}")
-        
-        # Attribution proportionnelle (code existant amélioré)
-        seg_duration = seg["end"] - seg["start"]
-        total_duration = sum(s["end"] - s["start"] for s in segments)
-        proportion = seg_duration / total_duration if total_duration > 0 else 1/len(segments)
-        
-        sentences_count = max(1, int(len(sentences) * proportion))
-        sentences_count = min(sentences_count, len(sentences) - sentence_idx)
-        
-        if sentences_count > 0:
-            seg_text = " ".join(sentences[sentence_idx:sentence_idx + sentences_count])
-            sentence_idx += sentences_count
-        else:
-            seg_text = ""
-        
-        result.append({
-            "speaker": seg["speaker"],
-            "start": seg["start"],
-            "end": seg["end"],
-            "text": seg_text,
-            "mood": None,
-            "confidence": seg.get("confidence", 0.7)
-        })
-    
-    return result
 # ---------------------------
 # Voxtral - OPTIMISÉ POUR SMALL
 # ---------------------------
@@ -965,7 +815,7 @@ def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[s
             filtered.append(seg)
         else:
             log(f"[OPTIMIZE] Filtered short segment: {duration:.1f}s < {MIN_SEG_DUR}s")
-    filtered = cross_validate_speaker_attribution(filtered)
+    
     log(f"[OPTIMIZE] After filtering: {len(filtered)} segments")
     
     # Fusion ULTRA-AGRESSIVE
@@ -1656,13 +1506,7 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
             return {"error": f"Audio too long ({est_dur:.1f}s). Increase MAX_DURATION_S or send shorter file."}
     except Exception as e:
         log(f"[HYBRID] Could not check duration: {e}")
-        est_dur = 300  # Estimation par défaut
-    
-    # NOUVEAU : Auto-calibration des paramètres
-    calibrated_params = auto_calibrate_diarization_params(wav_path)
-    global MIN_SEG_DUR
-    MIN_SEG_DUR = calibrated_params["min_segment_duration"]
-    
+
     # ÉTAPE 1: TRANSCRIPTION GLOBALE (1 SEUL APPEL VOXTRAL)
     log("[HYBRID] Step 1: Global transcription...")
     conv_global = _build_conv_transcribe_ultra_strict(wav_path, language or "fr")
@@ -1675,10 +1519,7 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
         return diarize_then_transcribe_fallback(wav_path, language, max_new_tokens, with_summary)
     
     log(f"[HYBRID] Global transcription: {len(full_text)} chars in {out_global.get('latency_s', 0):.1f}s")
-    
-    # NOUVEAU : Détection des changements prosodiques
-    prosody_changes = detect_speaker_changes_with_prosody(wav_path)
-    
+
     # ÉTAPE 2: DIARIZATION POUR LES TIMESTAMPS
     log("[HYBRID] Step 2: Diarization for speaker timestamps...")
     dia = load_diarizer()
@@ -1709,17 +1550,71 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     optimized_segments = optimize_diarization_segments(diar_segments)
     log(f"[HYBRID] After optimization: {len(optimized_segments)} segments")
 
-    # ÉTAPE 4: ATTRIBUTION AMÉLIORÉE
-    segments = enhanced_text_attribution(
-        full_text, 
-        optimized_segments, 
-        prosody_changes
-    )
+    # ÉTAPE 4: ATTRIBUTION INTELLIGENTE DU TEXTE SELON LES TIMESTAMPS
+    log("[HYBRID] Step 3: Smart text attribution to speakers...")
+    segments = []
+    
+    if not optimized_segments:
+        segments = [{
+            "speaker": "Agent",
+            "start": 0.0,
+            "end": total_duration,
+            "text": full_text,
+            "mood": None
+        }]
+    else:
+        # Nouvelle approche : attribution par phrases complètes
+        sentences = smart_sentence_split(full_text)
+        log(f"[HYBRID] Split into {len(sentences)} sentences for attribution")
+        
+        total_seg_duration = sum(seg["end"] - seg["start"] for seg in optimized_segments)
+        sentence_index = 0
+        
+        for i, seg in enumerate(optimized_segments):
+            seg_duration = seg["end"] - seg["start"]
+            seg_start = seg["start"]
+            seg_end = seg["end"]
+            
+            # Calculer combien de phrases attribuer à ce segment
+            sentence_proportion = seg_duration / total_seg_duration if total_seg_duration > 0 else 1.0/len(optimized_segments)
+            sentences_for_segment = max(1, int(len(sentences) * sentence_proportion))
+            
+            # Ajuster pour ne pas dépasser
+            sentences_for_segment = min(sentences_for_segment, len(sentences) - sentence_index)
+            
+            # Récupérer les phrases pour ce segment
+            if sentences_for_segment > 0:
+                seg_sentences = sentences[sentence_index:sentence_index + sentences_for_segment]
+                seg_text = " ".join(seg_sentences).strip()
+                sentence_index += sentences_for_segment
+            else:
+                seg_text = ""
+            
+            # Post-correction basée sur les patterns de dialogue
+            seg_text = post_correct_speaker_attribution(seg_text, seg["speaker"], i > 0)
+            
+            segments.append({
+                "speaker": seg["speaker"],
+                "start": seg_start,
+                "end": seg_end,
+                "text": seg_text,
+                "mood": None
+            })
+            
+            log(f"[HYBRID] Segment {i+1}/{len(optimized_segments)}: '{seg_text[:50]}...' → {seg['speaker']}")
+        
+        # Attribution des phrases restantes au dernier segment si nécessaire
+        if sentence_index < len(sentences):
+            remaining_sentences = sentences[sentence_index:]
+            if segments and remaining_sentences:
+                additional_text = " ".join(remaining_sentences)
+                segments[-1]["text"] += " " + additional_text
+                log(f"[HYBRID] Added {len(remaining_sentences)} remaining sentences to last segment")
     
     log("[HYBRID] Smart text attribution completed")
     
     # ÉTAPE 5: POST-TRAITEMENT ET CORRECTION INTELLIGENTE
-    log("[HYBRID] Step 5: Intelligent dialogue correction...")
+    log("[HYBRID] Step 4: Intelligent dialogue correction...")
     segments = intelligent_dialogue_correction(full_text, segments)
     segments = improve_diarization_quality(segments)
     segments = _enforce_max_two_speakers(segments)
@@ -1765,6 +1660,7 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
 
     log(f"[HYBRID] Completed: 1 Voxtral call instead of {len(diar_segments)}+ calls")
     return result
+
 def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
     """Mode fallback segment-par-segment (ultra-optimisé) si le mode hybride échoue."""
     log("[FALLBACK] Using segment-by-segment mode with ultra-aggressive filtering")
