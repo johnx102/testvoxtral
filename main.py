@@ -54,8 +54,8 @@ MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "5.0"))
 MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "8.0")) 
 MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"  
 HYBRID_MODE = os.environ.get("HYBRID_MODE", "1") == "1"
-AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "1"
-VOXTRAL_SPEAKER_ID = os.environ.get("VOXTRAL_SPEAKER_ID", "1") == "1"  # NOUVEAU : Speaker ID par Voxtral
+AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "0"
+VOXTRAL_SPEAKER_ID = os.environ.get("VOXTRAL_SPEAKER_ID", "1") == "0"  # NOUVEAU : Speaker ID par Voxtral
 PYANNOTE_AUTO = os.environ.get("PYANNOTE_AUTO", "0") == "1"  # NOUVEAU : PyAnnote auto pur
 
 # Transcription & résumé
