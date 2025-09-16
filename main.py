@@ -1189,7 +1189,8 @@ def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict]
         s = compute_summary(full_transcript, segments, with_summary)
         if s is not None:
             result["summary"] = s
-            result["summary_text"] = sif ENABLE_SENTIMENT:
+            result["summary_text"] = s
+            if ENABLE_SENTIMENT:
         global_mood = classify_sentiment(full_transcript) if full_transcript else None
         if global_mood:
             for seg in segments:
