@@ -37,7 +37,7 @@ APP_VERSION = os.environ.get("APP_VERSION", "ultra-fast-hybrid-v1.0")
 
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "964"))       
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "664"))       
 MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "900"))      
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
