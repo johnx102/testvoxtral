@@ -1811,6 +1811,12 @@ def health():
 # ---------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
+        global MAX_DURATION_S
+        MAX_DURATION_S = 9000  # Force à 9000 secondes (2h30)
+        log(f"[HANDLER] MAX_DURATION_S forced to: {MAX_DURATION_S}")
+        
+        log(f"[HANDLER] New job received: {job.get('input', {}).get('task', 'unknown')}")
+        inp = job.get("input", {}) or {}
         log(f"[HANDLER] New job received: {job.get('input', {}).get('task', 'unknown')}")
         inp = job.get("input", {}) or {}
 
