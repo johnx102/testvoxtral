@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import os, time, base64, tempfile, uuid, requests, json, traceback, re
-re
 from typing import Optional, List, Dict, Any, Tuple
 
 import torch
@@ -919,10 +918,10 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     
     # Résumé
     if with_summary:
-        s = compute_summary(full_transcript, segments, with_summary)
-        if s is not None:
-            result["summary"] = s
-            result["summary_text"] = s# Sentiment global rapide
+        log("[VOXTRAL_ID] Generating summary...")
+        result["summary"] = select_best_summary_approach(full_transcript)
+    
+    # Sentiment global rapide
     if ENABLE_SENTIMENT:
         log("[VOXTRAL_ID] Computing sentiment analysis...")
         global_mood = classify_sentiment(full_transcript) if full_transcript else None
@@ -1186,11 +1185,9 @@ def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict]
     result = {"segments": segments, "transcript": full_transcript}
     
     if with_summary:
-        s = compute_summary(full_transcript, segments, with_summary)
-        if s is not None:
-            result["summary"] = s
-            result["summary_text"] = s
-            if ENABLE_SENTIMENT:
+        result["summary"] = select_best_summary_approach(full_transcript)
+    
+    if ENABLE_SENTIMENT:
         global_mood = classify_sentiment(full_transcript) if full_transcript else None
         if global_mood:
             for seg in segments:
@@ -1629,10 +1626,10 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     
     # Résumé
     if with_summary:
-        s = compute_summary(full_transcript, segments, with_summary)
-        if s is not None:
-            result["summary"] = s
-            result["summary_text"] = s# Sentiment global (optimisé pour la vitesse en mode hybride)
+        log("[HYBRID] Generating summary...")
+        result["summary"] = select_best_summary_approach(full_transcript)
+    
+    # Sentiment global (optimisé pour la vitesse en mode hybride)
     if ENABLE_SENTIMENT:
         log("[HYBRID] Computing sentiment analysis...")
         # Calcul du sentiment global sur le texte complet (plus rapide qu'individual)
@@ -1738,10 +1735,9 @@ def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max
     result = {"segments": segments, "transcript": full_transcript}
     
     if with_summary:
-        s = compute_summary(full_transcript, segments, with_summary)
-        if s is not None:
-            result["summary"] = s
-            result["summary_text"] = sreturn result
+        result["summary"] = select_best_summary_approach(full_transcript)
+    
+    return result
 
 # ---------------------------
 # Health
@@ -1885,10 +1881,10 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     return temp_result
                 
                 transcript = temp_result.get("transcript", "")
-                segments = temp_result.get("segments", []) or []
-                s = compute_summary(transcript, segments, True)
+                summary = select_best_summary_approach(transcript) if transcript else "Audio indisponible."
+                
                 log("[HANDLER] Summary task completed")
-                return {"task": "summary", "text": s, "summary_text": s, "latency_s": 0}
+                return {"task": "summary", "text": summary, "latency_s": 0}
             except Exception as e:
                 log(f"[ERROR] Smart summary failed: {e}")
                 # Fallback mode résumé audio direct
@@ -1946,47 +1942,3 @@ except Exception as e:
     _sentiment_zero_shot = None
 
 runpod.serverless.start({"handler": handler})
-
-# --- Auto-added: unified summary (IVR + hard fallback)
-def compute_summary(full_transcript: str, segments: List[Dict[str, Any]], with_summary: bool) -> Optional[str]:
-    """
-    Résumé uniforme + détection IVR mono-locuteur + fallback dur (jamais "")
-    Renvoie None si with_summary == False, sinon une chaîne non vide.
-    """
-    if not with_summary:
-        return None
-
-    txt = (full_transcript or "").strip()
-    if not txt:
-        return "Annonce vocale (aucune interaction)."
-
-    # IVR mono-locuteur ?
-    single_speaker = len({s.get("speaker") for s in segments if (s or {}).get("text")}) == 1
-    is_ivr = False
-    if single_speaker:
-        t = txt.lower()
-        kw = [
-            "bienvenue", "cabinet", "secrétariat", "merci de patienter",
-            "appuyez sur", "horaires", "ligne est occupée",
-            "laissez un message", "répondeur", "notre équipe", "standard",
-            "votre appel a été", "appel a été signalé"
-        ]
-        is_ivr = sum(k in t for k in kw) >= 2
-
-    # Résumé
-    if is_ivr:
-        phrases = [p.strip() for p in re.split(r'[.!?]\s+', txt) if len(p.strip()) > 8]
-        filtres = ("bonjour", "bienvenue", "au revoir", "merci")
-        core = [p for p in phrases if not any(f in p.lower() for f in filtres)]
-        core = core[:2] or phrases[:2] or ["Annonce vocale (accueil / attente)."]
-        s = "Message d’accueil / IVR : " + ". ".join(core) + "."
-    else:
-        s = select_best_summary_approach(txt)
-
-    # Fallback dur (ne jamais renvoyer "")
-    if not s or not s.strip():
-        s = create_extractive_summary(txt)
-        if not s or not s.strip():
-            s = "Annonce vocale (aucune interaction)."
-
-    return s
