@@ -45,6 +45,11 @@ WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 # Sentiment - NOUVEAU : Analyse par Voxtral
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
 
+# Détection des annonces/IVR - NOUVEAU
+ENABLE_SINGLE_VOICE_DETECTION = os.environ.get("ENABLE_SINGLE_VOICE_DETECTION", "1") == "1"
+SINGLE_VOICE_DETECTION_TIMEOUT = int(os.environ.get("SINGLE_VOICE_DETECTION_TIMEOUT", "30"))
+SINGLE_VOICE_SUMMARY_TOKENS = int(os.environ.get("SINGLE_VOICE_SUMMARY_TOKENS", "48"))
+
 # Diarization - MODES AVANCÉS
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
 EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"   
@@ -738,6 +743,15 @@ def select_best_summary_approach(transcript: str) -> str:
     lines = transcript.split('\n')
     total_words = len(transcript.split())
     
+    # Détection des annonces/IVR
+    if len(lines) == 1 and "System:" in transcript:
+        # C'est probablement une annonce
+        content = transcript.replace("System:", "").strip()
+        if len(content) > 20:
+            return f"Annonce automatique: {content[:100]}{'...' if len(content) > 100 else ''}"
+        else:
+            return f"Message système: {content}"
+    
     if total_words < 20:
         return "Conversation très brève."
     
@@ -841,6 +855,129 @@ def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[s
     
     log(f"[OPTIMIZE] Final: {len(segments)} → {len(filtered)} segments")
     return filtered
+
+# ---------------------------
+# DÉTECTION ET TRAITEMENT DES ANNONCES/IVR
+# ---------------------------
+
+def detect_single_voice_content(wav_path: str, language: Optional[str]) -> Dict[str, Any]:
+    """
+    Détecte si l'enregistrement contient une annonce/IVR (une seule voix)
+    et génère un résumé adapté.
+    """
+    log("[SINGLE_VOICE] Detecting single voice content...")
+    
+    # Instruction spécialisée pour détecter le type de contenu
+    instruction = (
+        f"lang:{language or 'fr'} "
+        "Analyse ce contenu audio et détermine s'il s'agit de :\n"
+        "1) Une conversation entre deux personnes (Agent + Client)\n"
+        "2) Une annonce automatique/IVR (une seule voix)\n"
+        "3) Un message vocal laissé par un client\n\n"
+        "Si c'est une annonce/IVR, résume le contenu en 1-2 phrases.\n"
+        "Si c'est une conversation, réponds 'CONVERSATION'.\n"
+        "Si c'est un message vocal, réponds 'MESSAGE_VOCAL'."
+    )
+    
+    conversation = [{
+        "role": "user",
+        "content": [
+            {"type": "audio", "path": wav_path},
+            {"type": "text", "text": instruction}
+        ]
+    }]
+    
+    try:
+        result = run_voxtral_with_timeout(conversation, max_new_tokens=64, timeout=SINGLE_VOICE_DETECTION_TIMEOUT)
+        response = (result.get("text") or "").strip().lower()
+        
+        log(f"[SINGLE_VOICE] Detection result: '{response}'")
+        
+        if "conversation" in response:
+            return {"type": "conversation", "summary": None}
+        elif "message_vocal" in response:
+            return {"type": "voicemail", "summary": response}
+        else:
+            # Probablement une annonce/IVR
+            return {"type": "announcement", "summary": response}
+            
+    except Exception as e:
+        log(f"[SINGLE_VOICE] Detection failed: {e}")
+        return {"type": "unknown", "summary": None}
+
+def transcribe_single_voice_content(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
+    """
+    Mode spécialisé pour les enregistrements à une seule voix (annonces/IVR).
+    """
+    log("[SINGLE_VOICE] Processing single voice content...")
+    
+    # Durée max
+    try:
+        import soundfile as sf
+        info = sf.info(wav_path)
+        est_dur = info.frames / float(info.samplerate or 1)
+        log(f"[SINGLE_VOICE] Audio duration: {est_dur:.1f}s")
+        if est_dur > MAX_DURATION_S:
+            return {"error": f"Audio too long ({est_dur:.1f}s). Increase MAX_DURATION_S or send shorter file."}
+    except Exception as e:
+        log(f"[SINGLE_VOICE] Could not check duration: {e}")
+        est_dur = 180.0  # Durée par défaut
+    
+    # Transcription simple sans diarization
+    conv_simple = _build_conv_transcribe_ultra_strict(wav_path, language or "fr")
+    out_simple = run_voxtral_with_timeout(conv_simple, max_new_tokens=max_new_tokens, timeout=60)
+    full_text = (out_simple.get("text") or "").strip()
+    
+    if not full_text:
+        return {"error": "Empty transcription for single voice content"}
+    
+    # Créer un segment unique
+    segments = [{
+        "speaker": "System",
+        "start": 0.0,
+        "end": est_dur,
+        "text": full_text,
+        "mood": None
+    }]
+    
+    full_transcript = f"System: {full_text}"
+    result = {"segments": segments, "transcript": full_transcript}
+    
+    # Résumé spécialisé pour les annonces
+    if with_summary:
+        log("[SINGLE_VOICE] Generating announcement summary...")
+        summary_instruction = (
+            f"lang:{language or 'fr'} "
+            "Résume cette annonce automatique en 1-2 phrases claires. "
+            "Indique le type d'annonce (accueil, information, etc.) et le message principal."
+        )
+        
+        summary_conv = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"{summary_instruction}\n\nContenu: {full_text}"}
+            ]
+        }]
+        
+        try:
+            summary_result = run_voxtral_with_timeout(summary_conv, max_new_tokens=SINGLE_VOICE_SUMMARY_TOKENS, timeout=20)
+            result["summary"] = (summary_result.get("text") or "").strip()
+        except Exception as e:
+            log(f"[SINGLE_VOICE] Summary generation failed: {e}")
+            result["summary"] = f"Annonce automatique: {full_text[:100]}..."
+    
+    # Sentiment neutre pour les annonces
+    if ENABLE_SENTIMENT:
+        result["mood_overall"] = {
+            "label_en": "neutral",
+            "label_fr": "neutre",
+            "confidence": 0.95,
+            "scores": {"negative": 0.0, "neutral": 0.95, "positive": 0.05}
+        }
+        result["mood_by_speaker"] = {"System": result["mood_overall"]}
+    
+    log("[SINGLE_VOICE] Single voice processing completed")
+    return result
 
 # ---------------------------
 # MODES DE DIARIZATION AVANCÉS
@@ -1768,11 +1905,15 @@ def health():
         "voxtral_speaker_id": VOXTRAL_SPEAKER_ID,  # NOUVEAU
         "pyannote_auto": PYANNOTE_AUTO,  # NOUVEAU
         "aggressive_merge": AGGRESSIVE_MERGE,
+        "single_voice_detection": ENABLE_SINGLE_VOICE_DETECTION,  # NOUVEAU
+        "single_voice_detection_timeout": SINGLE_VOICE_DETECTION_TIMEOUT,  # NOUVEAU
+        "single_voice_summary_tokens": SINGLE_VOICE_SUMMARY_TOKENS,  # NOUVEAU
         "diarization_modes": {  # NOUVEAU : résumé des modes disponibles
             "voxtral_speaker_id": VOXTRAL_SPEAKER_ID,
             "pyannote_auto": PYANNOTE_AUTO, 
             "hybrid_mode": HYBRID_MODE,
-            "fallback_mode": not (VOXTRAL_SPEAKER_ID or PYANNOTE_AUTO or HYBRID_MODE)
+            "fallback_mode": not (VOXTRAL_SPEAKER_ID or PYANNOTE_AUTO or HYBRID_MODE),
+            "single_voice_detection": ENABLE_SINGLE_VOICE_DETECTION
         },
         "optimizations": {
             "current_mode": "Voxtral Speaker ID" if VOXTRAL_SPEAKER_ID else "PyAnnote Auto" if PYANNOTE_AUTO else "Hybrid" if HYBRID_MODE else "Fallback",
@@ -1854,19 +1995,44 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         if task in ("transcribe_diarized", "diarized", "diarize"):
             log("[HANDLER] Starting diarized transcription...")
             
-            # NOUVEAU : Sélection du mode de diarization
-            if VOXTRAL_SPEAKER_ID:
-                log("[HANDLER] Using Voxtral Speaker Identification mode")
-                out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary)
-            elif PYANNOTE_AUTO:
-                log("[HANDLER] Using PyAnnote Auto mode")
-                out = diarize_with_pyannote_auto(local_path, language, max_new_tokens, with_summary)
-            elif HYBRID_MODE:
-                log("[HANDLER] Using Hybrid mode (PyAnnote + Voxtral)")
-                out = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, with_summary)
+            # NOUVEAU : Détection précoce du type de contenu (si activée)
+            if ENABLE_SINGLE_VOICE_DETECTION:
+                content_type = detect_single_voice_content(local_path, language)
+                
+                if content_type["type"] == "announcement":
+                    log("[HANDLER] Detected announcement/IVR, using single voice mode")
+                    out = transcribe_single_voice_content(local_path, language, max_new_tokens, with_summary)
+                elif content_type["type"] == "voicemail":
+                    log("[HANDLER] Detected voicemail, using single voice mode")
+                    out = transcribe_single_voice_content(local_path, language, max_new_tokens, with_summary)
+                else:
+                    # Mode normal pour les conversations (PIPELINE EXISTANT INCHANGÉ)
+                    if VOXTRAL_SPEAKER_ID:
+                        log("[HANDLER] Using Voxtral Speaker Identification mode")
+                        out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary)
+                    elif PYANNOTE_AUTO:
+                        log("[HANDLER] Using PyAnnote Auto mode")
+                        out = diarize_with_pyannote_auto(local_path, language, max_new_tokens, with_summary)
+                    elif HYBRID_MODE:
+                        log("[HANDLER] Using Hybrid mode (PyAnnote + Voxtral)")
+                        out = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, with_summary)
+                    else:
+                        log("[HANDLER] Using Fallback segment mode")
+                        out = diarize_then_transcribe_fallback(local_path, language, max_new_tokens, with_summary)
             else:
-                log("[HANDLER] Using Fallback segment mode")
-                out = diarize_then_transcribe_fallback(local_path, language, max_new_tokens, with_summary)
+                # Détection désactivée - utiliser le pipeline existant (COMPORTEMENT ORIGINAL)
+                if VOXTRAL_SPEAKER_ID:
+                    log("[HANDLER] Using Voxtral Speaker Identification mode")
+                    out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary)
+                elif PYANNOTE_AUTO:
+                    log("[HANDLER] Using PyAnnote Auto mode")
+                    out = diarize_with_pyannote_auto(local_path, language, max_new_tokens, with_summary)
+                elif HYBRID_MODE:
+                    log("[HANDLER] Using Hybrid mode (PyAnnote + Voxtral)")
+                    out = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, with_summary)
+                else:
+                    log("[HANDLER] Using Fallback segment mode")
+                    out = diarize_then_transcribe_fallback(local_path, language, max_new_tokens, with_summary)
                 
             if "error" in out:
                 log(f"[HANDLER] Error in diarized transcription: {out['error']}")
