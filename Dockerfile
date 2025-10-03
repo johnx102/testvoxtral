@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -22,8 +22,8 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python && \
 WORKDIR /app
 
 # Torch (CUDA 12.1)
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
-    torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+    torch==2.7.0 torchaudio==2.7.0
 
 # Requirements
 COPY requirements.txt /app/requirements.txt
