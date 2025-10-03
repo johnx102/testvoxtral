@@ -23,7 +23,7 @@ WORKDIR /app
 
 # Torch (CUDA 12.1)
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
-    torch==2.7.0 torchaudio==2.7.0
+    torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
 
 # Requirements
 COPY requirements.txt /app/requirements.txt
