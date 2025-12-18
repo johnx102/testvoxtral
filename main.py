@@ -295,7 +295,7 @@ def load_diarizer():
     log(f"[INIT] Loading diarization: {DIAR_MODEL}")
     kwargs = {}
     if HF_TOKEN:
-        kwargs["use_auth_token"] = HF_TOKEN
+        kwargs["token"] = HF_TOKEN
     _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
     try:
         if torch.cuda.is_available():
