@@ -49,6 +49,7 @@ SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip()
 SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 => CPU
 
 # Détection des annonces/IVR - NOUVEAU
+ENABLE_DIARIZATION = os.environ.get("ENABLE_DIARIZATION", "1") == "1"  # Peut être désactivé si les modèles sont inaccessibles
 ENABLE_SINGLE_VOICE_DETECTION = os.environ.get("ENABLE_SINGLE_VOICE_DETECTION", "0") == "1"  # Désactivé par défaut
 SINGLE_VOICE_DETECTION_TIMEOUT = int(os.environ.get("SINGLE_VOICE_DETECTION_TIMEOUT", "30"))
 SINGLE_VOICE_SUMMARY_TOKENS = int(os.environ.get("SINGLE_VOICE_SUMMARY_TOKENS", "48"))
@@ -132,11 +133,12 @@ def load_voxtral():
     log(f"[INIT] Loading Voxtral: {MODEL_ID}")
 
     try:
-        proc_kwargs = {}
-        if HF_TOKEN:
-            proc_kwargs["token"] = HF_TOKEN
         log("[INIT] Loading processor...")
-        _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
+        # Approche simplifiée sans kwargs problématiques
+        if HF_TOKEN:
+            _processor = AutoProcessor.from_pretrained(MODEL_ID, token=HF_TOKEN)
+        else:
+            _processor = AutoProcessor.from_pretrained(MODEL_ID)
         log("[INIT] Processor loaded successfully")
     except Exception as e:
         log(f"[ERROR] Failed to load processor: {e}")
@@ -297,11 +299,46 @@ def load_diarizer():
     global _diarizer
     if _diarizer is not None:
         return _diarizer
+    
+    if not ENABLE_DIARIZATION:
+        log("[INIT] Diarization disabled via ENABLE_DIARIZATION=0")
+        _diarizer = None
+        return _diarizer
+        
     log(f"[INIT] Loading diarization: {DIAR_MODEL}")
-    kwargs = {}
-    if HF_TOKEN:
-        kwargs["token"] = HF_TOKEN
-    _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
+    
+    try:
+        kwargs = {}
+        if HF_TOKEN:
+            kwargs["token"] = HF_TOKEN
+        _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
+    except Exception as e:
+        log(f"[WARN] Failed to load {DIAR_MODEL}: {e}")
+        # Fallback vers un modèle public qui ne dépend pas de modèles gated
+        log("[INIT] Trying fallback diarization model...")
+        fallback_models = [
+            "pyannote/speaker-diarization@2022-07-15",  # Version stable plus ancienne
+            "pyannote/speaker-diarization-3.0",        # Version alternative
+        ]
+        
+        for fallback_model in fallback_models:
+            try:
+                kwargs = {}
+                if HF_TOKEN:
+                    kwargs["token"] = HF_TOKEN
+                log(f"[INIT] Trying {fallback_model}...")
+                _diarizer = Pipeline.from_pretrained(fallback_model, **kwargs)
+                log(f"[INIT] Fallback model {fallback_model} loaded successfully")
+                break
+            except Exception as e2:
+                log(f"[WARN] Fallback model {fallback_model} failed: {e2}")
+                continue
+        else:
+            # Si tous les fallbacks échouent
+            log(f"[ERROR] All diarization models failed. Last error: {e}")
+            log("[WARN] Disabling diarization due to model loading failures")
+            _diarizer = None
+            return _diarizer
     try:
         if torch.cuda.is_available():
             try:
@@ -311,6 +348,9 @@ def load_diarizer():
             log("[INIT] Diarizer moved to CUDA.")
         else:
             log("[INIT] CUDA not available; diarizer on CPU.")
+    except Exception as e:
+        log(f"[WARN] Could not move diarizer to CUDA: {e}. Keeping on CPU.")
+    return _diarizer
     except Exception as e:
         log(f"[WARN] Could not move diarizer to CUDA: {e}. Keeping on CPU.")
     return _diarizer
@@ -1204,6 +1244,12 @@ def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_t
     # DIARIZATION AUTOMATIQUE (SANS PARAMÈTRES)
     log("[PYANNOTE_AUTO] Running automatic diarization...")
     dia = load_diarizer()
+    
+    # Si la diarisation est désactivée ou a échoué à charger
+    if dia is None:
+        log("[PYANNOTE_AUTO] Diarization unavailable, falling back to simple transcription")
+        return transcribe_simple_mode_with_fallback(wav_path, language, max_new_tokens, with_summary)
+    
     diarization = dia(wav_path)  # Laisse PyAnnote décider complètement
     
     # Collecter tous les segments
@@ -1664,6 +1710,12 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     # ÉTAPE 2: DIARIZATION POUR LES TIMESTAMPS
     log("[HYBRID] Step 2: Diarization for speaker timestamps...")
     dia = load_diarizer()
+    
+    # Si la diarisation est désactivée ou a échoué à charger
+    if dia is None:
+        log("[HYBRID] Diarization unavailable, falling back to simple transcription")
+        return transcribe_simple_mode_with_fallback(wav_path, language, max_new_tokens, with_summary)
+    
     try:
         if EXACT_TWO:
             diarization = dia(wav_path, num_speakers=2, min_speakers=2, max_speakers=2)
@@ -1808,6 +1860,12 @@ def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max
     
     # Diarization
     dia = load_diarizer()
+    
+    # Si la diarisation est désactivée ou a échoué à charger
+    if dia is None:
+        log("[FALLBACK] Diarization unavailable, falling back to simple transcription")
+        return transcribe_simple_mode_with_fallback(wav_path, language, max_new_tokens, with_summary)
+    
     try:
         if EXACT_TWO:
             diarization = dia(wav_path, num_speakers=2)
