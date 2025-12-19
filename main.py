@@ -133,6 +133,20 @@ def load_voxtral():
         log("[INIT] Loading processor...")
         _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
         log("[INIT] Processor loaded successfully")
+    except ValueError as ve:
+        if "not supported by" in str(ve) and "MistralCommonBackend" in str(ve):
+            log(f"[WARN] MistralCommonBackend kwargs issue: {ve}")
+            log("[INIT] Trying to load processor without token parameter...")
+            try:
+                # Essayer sans le paramètre token explicite - il sera lu via l'environnement
+                _processor = AutoProcessor.from_pretrained(MODEL_ID)
+                log("[INIT] Processor loaded successfully without explicit token")
+            except Exception as e2:
+                log(f"[ERROR] Both processor loading attempts failed. Last error: {e2}")
+                raise ve
+        else:
+            log(f"[ERROR] Failed to load processor: {ve}")
+            raise ve
     except Exception as e:
         log(f"[ERROR] Failed to load processor: {e}")
         raise
