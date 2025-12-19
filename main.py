@@ -134,48 +134,24 @@ def load_voxtral():
 
     try:
         log("[INIT] Loading processor...")
-        
-        # Patch temporaire pour filtrer les kwargs problématiques
-        import inspect
-        from transformers.models.auto.processing_auto import AutoProcessor
-        
-        # Méthode de chargement avec filtrage des kwargs
-        kwargs = {}
-        if HF_TOKEN:
-            kwargs["token"] = HF_TOKEN
-        
-        # Charger en forçant la suppression des kwargs automatiques
-        try:
-            # Essayer sans aucun kwargs automatique
-            _processor = AutoProcessor.from_pretrained(MODEL_ID, **kwargs)
-        except ValueError as ve:
-            if "not supported by" in str(ve) and "MistralCommonBackend" in str(ve):
-                log("[INIT] MistralCommonBackend error, trying manual processor loading...")
-                # Charger les composants individuellement
-                from transformers import AutoTokenizer
-                
-                tokenizer_kwargs = {}
-                if HF_TOKEN:
-                    tokenizer_kwargs["token"] = HF_TOKEN
-                
-                # Charger uniquement le tokenizer sans les kwargs problématiques  
-                tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, **tokenizer_kwargs)
-                
-                # Pour le processor, utiliser une approche minimale
-                class MinimalProcessor:
-                    def __init__(self, tokenizer):
-                        self.tokenizer = tokenizer
-                    
-                    def __call__(self, *args, **kwargs):
-                        # Implémentation minimale pour la compatibilité
-                        return self.tokenizer(*args, **kwargs)
-                
-                _processor = MinimalProcessor(tokenizer)
-                log("[INIT] Manual processor created successfully")
-            else:
-                raise ve
-        
+        # Exactement comme l'original, mais avec gestion de l'erreur MistralCommonBackend
+        _processor = AutoProcessor.from_pretrained(MODEL_ID, token=HF_TOKEN)
         log("[INIT] Processor loaded successfully")
+    except ValueError as ve:
+        if "not supported by" in str(ve) and "MistralCommonBackend" in str(ve):
+            log(f"[WARN] MistralCommonBackend error: {ve}")
+            log("[INIT] This error may be related to transformers version compatibility")
+            log("[INIT] Trying without explicit token parameter...")
+            try:
+                # Essayer de charger sans le paramètre token explicite
+                # Le token sera lu depuis l'environnement
+                _processor = AutoProcessor.from_pretrained(MODEL_ID)
+                log("[INIT] Processor loaded successfully without explicit token")
+            except Exception as e2:
+                log(f"[ERROR] Both loading methods failed: {e2}")
+                raise ve  # Relancer l'erreur originale
+        else:
+            raise ve
     except Exception as e:
         log(f"[ERROR] Failed to load processor: {e}")
         raise
