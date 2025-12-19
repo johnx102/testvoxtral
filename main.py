@@ -44,6 +44,9 @@ WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
 # Sentiment - NOUVEAU : Analyse par Voxtral
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
+SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli").strip()
+SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip()
+SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 => CPU
 
 # Détection des annonces/IVR - NOUVEAU
 ENABLE_SINGLE_VOICE_DETECTION = os.environ.get("ENABLE_SINGLE_VOICE_DETECTION", "1") == "1"
@@ -73,6 +76,8 @@ ROLE_LABELS = [r.strip() for r in os.environ.get("ROLE_LABELS", "Agent,Client").
 _processor = None
 _model = None
 _diarizer = None
+_sentiment_clf = None
+_sentiment_zero_shot = None
 
 # ---------------------------
 # Helpers généraux
@@ -129,7 +134,7 @@ def load_voxtral():
     try:
         proc_kwargs = {}
         if HF_TOKEN:
-            proc_kwargs["use_auth_token"] = HF_TOKEN
+            proc_kwargs["token"] = HF_TOKEN
         log("[INIT] Loading processor...")
         _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
         log("[INIT] Processor loaded successfully")
@@ -327,8 +332,7 @@ def load_sentiment():
             "zero-shot-classification",
             model=SENTIMENT_MODEL,
             tokenizer=SENTIMENT_MODEL,
-            device=device_idx,
-            model_kwargs={"use_safetensors": True}
+            device=device_idx
         )
         log("[INIT] Zero-shot sentiment ready.")
         return _sentiment_zero_shot
@@ -336,8 +340,8 @@ def load_sentiment():
         if _sentiment_clf is not None:
             return _sentiment_clf
         log(f"[INIT] Loading classifier sentiment on device {device_idx}: {SENTIMENT_MODEL}")
-        tok = AutoTokenizer.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
-        mdl = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
+        tok = AutoTokenizer.from_pretrained(SENTIMENT_MODEL)
+        mdl = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL)
         _sentiment_clf = TextClassificationPipeline(
             model=mdl, tokenizer=tok, device=device_idx, return_all_scores=True, truncation=True
         )
@@ -1228,6 +1232,36 @@ def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_t
     # Appliquer le mode hybride avec les segments PyAnnote auto
     return apply_hybrid_workflow_with_segments(wav_path, raw_segments, language, max_new_tokens, with_summary)
 
+def merge_consecutive_segments(segments: List[Dict[str, Any]], max_gap: float = 2.0) -> List[Dict[str, Any]]:
+    """
+    Fusionne les segments consécutifs du même speaker avec un gap maximum.
+    """
+    if not segments:
+        return segments
+    
+    merged = []
+    current = segments[0].copy()
+    
+    for next_seg in segments[1:]:
+        same_speaker = current["speaker"] == next_seg["speaker"]
+        gap = float(next_seg["start"]) - float(current["end"])
+        
+        if same_speaker and gap <= max_gap:
+            # Fusionner
+            current["end"] = next_seg["end"]
+            current_text = current.get("text", "").strip()
+            next_text = next_seg.get("text", "").strip()
+            if current_text and next_text:
+                current["text"] = f"{current_text} {next_text}"
+            elif next_text:
+                current["text"] = next_text
+        else:
+            merged.append(current)
+            current = next_seg.copy()
+    
+    merged.append(current)
+    return merged
+
 def ultra_aggressive_merge(segments: List[Dict[str, Any]], max_gap: float = 3.0) -> List[Dict[str, Any]]:
     """
     Fusion ultra-agressive pour créer de gros blocs cohérents et réduire les erreurs.
@@ -1343,58 +1377,6 @@ def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict]
             result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
     
     return result
-
-# ---------------------------
-# MODE HYBRIDE ULTRA-RAPIDE (fonction principale existante)
-# ---------------------------
-    """
-    Fusion ultra-agressive pour créer de gros blocs cohérents et réduire les erreurs.
-    """
-    if not segments:
-        return segments
-    
-    merged = []
-    current = segments[0].copy()
-    
-    log(f"[ULTRA_MERGE] Starting with {len(segments)} segments")
-    
-    for next_seg in segments[1:]:
-        same_speaker = current["speaker"] == next_seg["speaker"]
-        gap = float(next_seg["start"]) - float(current["end"])
-        
-        # Fusion plus agressive : même speaker OU gap très petit
-        should_merge = (same_speaker and gap <= max_gap) or (gap <= 0.5)  # Fusionne même différents speakers si gap < 0.5s
-        
-        if should_merge:
-            # Fusionner
-            current["end"] = next_seg["end"]
-            
-            # Si même speaker, fusionner normalement
-            if same_speaker:
-                current_text = current.get("text", "").strip()
-                next_text = next_seg.get("text", "").strip()
-                if current_text and next_text:
-                    current["text"] = f"{current_text} {next_text}"
-                elif next_text:
-                    current["text"] = next_text
-            else:
-                # Différents speakers mais gap tiny = probablement erreur PyAnnote
-                log(f"[ULTRA_MERGE] Merging different speakers due to tiny gap: {gap:.2f}s")
-                # Garde le speaker du segment le plus long
-                current_dur = float(current["end"]) - float(current["start"])  
-                next_dur = float(next_seg["end"]) - float(next_seg["start"])
-                if next_dur > current_dur:
-                    current["speaker"] = next_seg["speaker"]
-                    
-        else:
-            # Ne peut pas fusionner
-            merged.append(current)
-            current = next_seg.copy()
-    
-    merged.append(current)
-    
-    log(f"[ULTRA_MERGE] Result: {len(segments)} → {len(merged)} segments ({100*(1-len(merged)/len(segments)):.1f}% reduction)")
-    return merged
 
 def intelligent_dialogue_correction(text: str, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
