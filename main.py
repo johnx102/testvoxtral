@@ -351,9 +351,6 @@ def load_diarizer():
     except Exception as e:
         log(f"[WARN] Could not move diarizer to CUDA: {e}. Keeping on CPU.")
     return _diarizer
-    except Exception as e:
-        log(f"[WARN] Could not move diarizer to CUDA: {e}. Keeping on CPU.")
-    return _diarizer
 
 # ---------------------------
 # Sentiment
