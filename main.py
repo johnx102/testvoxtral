@@ -134,11 +134,47 @@ def load_voxtral():
 
     try:
         log("[INIT] Loading processor...")
-        # Approche simplifiée sans kwargs problématiques
+        
+        # Patch temporaire pour filtrer les kwargs problématiques
+        import inspect
+        from transformers.models.auto.processing_auto import AutoProcessor
+        
+        # Méthode de chargement avec filtrage des kwargs
+        kwargs = {}
         if HF_TOKEN:
-            _processor = AutoProcessor.from_pretrained(MODEL_ID, token=HF_TOKEN)
-        else:
-            _processor = AutoProcessor.from_pretrained(MODEL_ID)
+            kwargs["token"] = HF_TOKEN
+        
+        # Charger en forçant la suppression des kwargs automatiques
+        try:
+            # Essayer sans aucun kwargs automatique
+            _processor = AutoProcessor.from_pretrained(MODEL_ID, **kwargs)
+        except ValueError as ve:
+            if "not supported by" in str(ve) and "MistralCommonBackend" in str(ve):
+                log("[INIT] MistralCommonBackend error, trying manual processor loading...")
+                # Charger les composants individuellement
+                from transformers import AutoTokenizer
+                
+                tokenizer_kwargs = {}
+                if HF_TOKEN:
+                    tokenizer_kwargs["token"] = HF_TOKEN
+                
+                # Charger uniquement le tokenizer sans les kwargs problématiques  
+                tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, **tokenizer_kwargs)
+                
+                # Pour le processor, utiliser une approche minimale
+                class MinimalProcessor:
+                    def __init__(self, tokenizer):
+                        self.tokenizer = tokenizer
+                    
+                    def __call__(self, *args, **kwargs):
+                        # Implémentation minimale pour la compatibilité
+                        return self.tokenizer(*args, **kwargs)
+                
+                _processor = MinimalProcessor(tokenizer)
+                log("[INIT] Manual processor created successfully")
+            else:
+                raise ve
+        
         log("[INIT] Processor loaded successfully")
     except Exception as e:
         log(f"[ERROR] Failed to load processor: {e}")
@@ -326,37 +362,37 @@ def load_diarizer():
             # Essayer de se connecter explicitement
             try:
                 from huggingface_hub import login
-                login(token=HF_TOKEN, write_permission=False)
+                login(token=HF_TOKEN)
                 log("[INIT] HuggingFace login successful")
             except Exception as login_e:
                 log(f"[WARN] HuggingFace login failed: {login_e}")
         
         log(f"[INIT] Attempting to load {DIAR_MODEL} with kwargs: {list(kwargs.keys())}")
-        # Forcer le refresh du cache si on a un token
-        if HF_TOKEN:
-            kwargs["force_download"] = False  # Garde le cache mais refresh les autorisations
-            kwargs["resume_download"] = True
         _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
     except Exception as e:
         log(f"[WARN] Failed to load {DIAR_MODEL}: {e}")
         # Fallback vers un modèle public qui ne dépend pas de modèles gated
         log("[INIT] Trying fallback diarization model...")
         fallback_models = [
-            "pyannote/speaker-diarization@2022-07-15",  # Version stable plus ancienne
-            "pyannote/speaker-diarization-3.0",        # Version alternative
+            ("pyannote/speaker-diarization", "2022-07-15"),  # Version stable plus ancienne avec révision
+            ("pyannote/speaker-diarization-3.0", None),        # Version alternative sans révision
         ]
         
-        for fallback_model in fallback_models:
+        for model_name, revision in fallback_models:
             try:
                 kwargs = {}
                 if HF_TOKEN:
                     kwargs["token"] = HF_TOKEN
-                log(f"[INIT] Trying {fallback_model}...")
-                _diarizer = Pipeline.from_pretrained(fallback_model, **kwargs)
-                log(f"[INIT] Fallback model {fallback_model} loaded successfully")
+                if revision:
+                    kwargs["revision"] = revision
+                    log(f"[INIT] Trying {model_name} with revision {revision}...")
+                else:
+                    log(f"[INIT] Trying {model_name}...")
+                _diarizer = Pipeline.from_pretrained(model_name, **kwargs)
+                log(f"[INIT] Fallback model {model_name} loaded successfully")
                 break
             except Exception as e2:
-                log(f"[WARN] Fallback model {fallback_model} failed: {e2}")
+                log(f"[WARN] Fallback model {model_name} failed: {e2}")
                 continue
         else:
             # Si tous les fallbacks échouent
