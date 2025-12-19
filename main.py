@@ -129,7 +129,7 @@ def load_voxtral():
     try:
         proc_kwargs = {}
         if HF_TOKEN:
-            proc_kwargs["token"] = HF_TOKEN
+            proc_kwargs["use_auth_token"] = HF_TOKEN
         log("[INIT] Loading processor...")
         _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
         log("[INIT] Processor loaded successfully")
