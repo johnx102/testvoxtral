@@ -234,6 +234,7 @@ def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens:
     """Wrapper simplifié sans signaux Unix"""
     try:
         log(f"[VOXTRAL] Starting inference (max_tokens={max_new_tokens})")
+        log("[VOXTRAL] Calling load_voxtral()...")
         start_time = time.time()
         result = run_voxtral(conversation, max_new_tokens)
         duration = time.time() - start_time
@@ -241,6 +242,8 @@ def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens:
         return result
     except Exception as e:
         log(f"[ERROR] Voxtral inference failed: {e}")
+        import traceback
+        log(f"[ERROR] Traceback: {traceback.format_exc()}")
         return {"text": "", "latency_s": 0}
 
 def _build_conv_transcribe_ultra_strict(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
@@ -307,10 +310,32 @@ def load_diarizer():
         
     log(f"[INIT] Loading diarization: {DIAR_MODEL}")
     
+    # Diagnostics token
+    if HF_TOKEN:
+        token_preview = HF_TOKEN[:8] + "..." + HF_TOKEN[-4:] if len(HF_TOKEN) > 12 else "short_token"
+        log(f"[INIT] Using HF_TOKEN: {token_preview}")
+    else:
+        log("[INIT] No HF_TOKEN provided")
+    
     try:
         kwargs = {}
         if HF_TOKEN:
             kwargs["token"] = HF_TOKEN
+            # Aussi mettre le token dans l'environnement au cas où PyAnnote l'utilise différemment
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
+            # Essayer de se connecter explicitement
+            try:
+                from huggingface_hub import login
+                login(token=HF_TOKEN, write_permission=False)
+                log("[INIT] HuggingFace login successful")
+            except Exception as login_e:
+                log(f"[WARN] HuggingFace login failed: {login_e}")
+        
+        log(f"[INIT] Attempting to load {DIAR_MODEL} with kwargs: {list(kwargs.keys())}")
+        # Forcer le refresh du cache si on a un token
+        if HF_TOKEN:
+            kwargs["force_download"] = False  # Garde le cache mais refresh les autorisations
+            kwargs["resume_download"] = True
         _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
     except Exception as e:
         log(f"[WARN] Failed to load {DIAR_MODEL}: {e}")
@@ -1057,13 +1082,19 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     try:
         log("[VOXTRAL_ID] Checking audio duration...")
         import soundfile as sf
+        log("[VOXTRAL_ID] soundfile imported successfully")
         info = sf.info(wav_path)
+        log(f"[VOXTRAL_ID] Audio info retrieved: {info}")
         est_dur = info.frames / float(info.samplerate or 1)
         log(f"[VOXTRAL_ID] Audio duration: {est_dur:.1f}s")
         if est_dur > MAX_DURATION_S:
             return {"error": f"Audio too long ({est_dur:.1f}s). Increase MAX_DURATION_S or send shorter file."}
+    except ImportError as e:
+        log(f"[VOXTRAL_ID] soundfile not available: {e}. Skipping duration check.")
+        est_dur = 60.0  # Estimation par défaut
     except Exception as e:
-        log(f"[VOXTRAL_ID] Could not check duration: {e}")
+        log(f"[VOXTRAL_ID] Could not check duration: {e}. Using fallback.")
+        est_dur = 60.0  # Estimation par défaut
 
     # INSTRUCTION SPÉCIALISÉE POUR IDENTIFICATION DES SPEAKERS
     instruction = (
@@ -1080,6 +1111,9 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     
     # TRANSCRIPTION AVEC IDENTIFICATION DES SPEAKERS EN UNE PASSE
     log("[VOXTRAL_ID] Starting transcription with speaker identification...")
+    log(f"[VOXTRAL_ID] Audio file path: {wav_path}")
+    log(f"[VOXTRAL_ID] Estimated duration: {est_dur:.1f}s")
+    
     conv_speaker_id = [{
         "role": "user",
         "content": [
@@ -1088,8 +1122,12 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
         ]
     }]
     
+    log("[VOXTRAL_ID] Conversation object created, calling run_voxtral_with_timeout...")
+    
     # Ajuster les tokens selon la durée
     speaker_tokens = min(max_new_tokens, int(est_dur * 10))  # Un peu plus pour les labels
+    log(f"[VOXTRAL_ID] Using {speaker_tokens} tokens (max={max_new_tokens})")
+    
     out_speaker_id = run_voxtral_with_timeout(conv_speaker_id, max_new_tokens=speaker_tokens, timeout=90)
     speaker_transcript = (out_speaker_id.get("text") or "").strip()
     
@@ -1245,7 +1283,7 @@ def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_t
     # Si la diarisation est désactivée ou a échoué à charger
     if dia is None:
         log("[PYANNOTE_AUTO] Diarization unavailable, falling back to simple transcription")
-        return transcribe_simple_mode_with_fallback(wav_path, language, max_new_tokens, with_summary)
+        return transcribe_single_voice_content(wav_path, language, max_new_tokens, with_summary)
     
     diarization = dia(wav_path)  # Laisse PyAnnote décider complètement
     
@@ -1711,7 +1749,7 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     # Si la diarisation est désactivée ou a échoué à charger
     if dia is None:
         log("[HYBRID] Diarization unavailable, falling back to simple transcription")
-        return transcribe_simple_mode_with_fallback(wav_path, language, max_new_tokens, with_summary)
+        return transcribe_single_voice_content(wav_path, language, max_new_tokens, with_summary)
     
     try:
         if EXACT_TWO:
@@ -1861,7 +1899,7 @@ def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max
     # Si la diarisation est désactivée ou a échoué à charger
     if dia is None:
         log("[FALLBACK] Diarization unavailable, falling back to simple transcription")
-        return transcribe_simple_mode_with_fallback(wav_path, language, max_new_tokens, with_summary)
+        return transcribe_single_voice_content(wav_path, language, max_new_tokens, with_summary)
     
     try:
         if EXACT_TWO:
