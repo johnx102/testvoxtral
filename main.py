@@ -44,13 +44,9 @@ WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
 # Sentiment - NOUVEAU : Analyse par Voxtral
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
-SENTIMENT_MODEL = os.environ.get("SENTIMENT_MODEL", "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli").strip()
-SENTIMENT_TYPE = os.environ.get("SENTIMENT_TYPE", "zero-shot").strip()
-SENTIMENT_DEVICE = int(os.environ.get("SENTIMENT_DEVICE", "-1"))  # -1 => CPU
 
 # Détection des annonces/IVR - NOUVEAU
-ENABLE_DIARIZATION = os.environ.get("ENABLE_DIARIZATION", "1") == "1"  # Peut être désactivé si les modèles sont inaccessibles
-ENABLE_SINGLE_VOICE_DETECTION = os.environ.get("ENABLE_SINGLE_VOICE_DETECTION", "0") == "1"  # Désactivé par défaut
+ENABLE_SINGLE_VOICE_DETECTION = os.environ.get("ENABLE_SINGLE_VOICE_DETECTION", "1") == "1"
 SINGLE_VOICE_DETECTION_TIMEOUT = int(os.environ.get("SINGLE_VOICE_DETECTION_TIMEOUT", "30"))
 SINGLE_VOICE_SUMMARY_TOKENS = int(os.environ.get("SINGLE_VOICE_SUMMARY_TOKENS", "48"))
 
@@ -77,8 +73,6 @@ ROLE_LABELS = [r.strip() for r in os.environ.get("ROLE_LABELS", "Agent,Client").
 _processor = None
 _model = None
 _diarizer = None
-_sentiment_clf = None
-_sentiment_zero_shot = None
 
 # ---------------------------
 # Helpers généraux
@@ -133,25 +127,12 @@ def load_voxtral():
     log(f"[INIT] Loading Voxtral: {MODEL_ID}")
 
     try:
+        proc_kwargs = {}
+        if HF_TOKEN:
+            proc_kwargs["token"] = HF_TOKEN
         log("[INIT] Loading processor...")
-        # Exactement comme l'original, mais avec gestion de l'erreur MistralCommonBackend
-        _processor = AutoProcessor.from_pretrained(MODEL_ID, token=HF_TOKEN)
+        _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
         log("[INIT] Processor loaded successfully")
-    except ValueError as ve:
-        if "not supported by" in str(ve) and "MistralCommonBackend" in str(ve):
-            log(f"[WARN] MistralCommonBackend error: {ve}")
-            log("[INIT] This error may be related to transformers version compatibility")
-            log("[INIT] Trying without explicit token parameter...")
-            try:
-                # Essayer de charger sans le paramètre token explicite
-                # Le token sera lu depuis l'environnement
-                _processor = AutoProcessor.from_pretrained(MODEL_ID)
-                log("[INIT] Processor loaded successfully without explicit token")
-            except Exception as e2:
-                log(f"[ERROR] Both loading methods failed: {e2}")
-                raise ve  # Relancer l'erreur originale
-        else:
-            raise ve
     except Exception as e:
         log(f"[ERROR] Failed to load processor: {e}")
         raise
@@ -246,7 +227,6 @@ def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens:
     """Wrapper simplifié sans signaux Unix"""
     try:
         log(f"[VOXTRAL] Starting inference (max_tokens={max_new_tokens})")
-        log("[VOXTRAL] Calling load_voxtral()...")
         start_time = time.time()
         result = run_voxtral(conversation, max_new_tokens)
         duration = time.time() - start_time
@@ -254,8 +234,6 @@ def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens:
         return result
     except Exception as e:
         log(f"[ERROR] Voxtral inference failed: {e}")
-        import traceback
-        log(f"[ERROR] Traceback: {traceback.format_exc()}")
         return {"text": "", "latency_s": 0}
 
 def _build_conv_transcribe_ultra_strict(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
@@ -314,68 +292,11 @@ def load_diarizer():
     global _diarizer
     if _diarizer is not None:
         return _diarizer
-    
-    if not ENABLE_DIARIZATION:
-        log("[INIT] Diarization disabled via ENABLE_DIARIZATION=0")
-        _diarizer = None
-        return _diarizer
-        
     log(f"[INIT] Loading diarization: {DIAR_MODEL}")
-    
-    # Diagnostics token
+    kwargs = {}
     if HF_TOKEN:
-        token_preview = HF_TOKEN[:8] + "..." + HF_TOKEN[-4:] if len(HF_TOKEN) > 12 else "short_token"
-        log(f"[INIT] Using HF_TOKEN: {token_preview}")
-    else:
-        log("[INIT] No HF_TOKEN provided")
-    
-    try:
-        kwargs = {}
-        if HF_TOKEN:
-            kwargs["token"] = HF_TOKEN
-            # Aussi mettre le token dans l'environnement au cas où PyAnnote l'utilise différemment
-            os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
-            # Essayer de se connecter explicitement
-            try:
-                from huggingface_hub import login
-                login(token=HF_TOKEN)
-                log("[INIT] HuggingFace login successful")
-            except Exception as login_e:
-                log(f"[WARN] HuggingFace login failed: {login_e}")
-        
-        log(f"[INIT] Attempting to load {DIAR_MODEL} with kwargs: {list(kwargs.keys())}")
-        _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
-    except Exception as e:
-        log(f"[WARN] Failed to load {DIAR_MODEL}: {e}")
-        # Fallback vers un modèle public qui ne dépend pas de modèles gated
-        log("[INIT] Trying fallback diarization model...")
-        fallback_models = [
-            ("pyannote/speaker-diarization", "2022-07-15"),  # Version stable plus ancienne avec révision
-            ("pyannote/speaker-diarization-3.0", None),        # Version alternative sans révision
-        ]
-        
-        for model_name, revision in fallback_models:
-            try:
-                kwargs = {}
-                if HF_TOKEN:
-                    kwargs["token"] = HF_TOKEN
-                if revision:
-                    kwargs["revision"] = revision
-                    log(f"[INIT] Trying {model_name} with revision {revision}...")
-                else:
-                    log(f"[INIT] Trying {model_name}...")
-                _diarizer = Pipeline.from_pretrained(model_name, **kwargs)
-                log(f"[INIT] Fallback model {model_name} loaded successfully")
-                break
-            except Exception as e2:
-                log(f"[WARN] Fallback model {model_name} failed: {e2}")
-                continue
-        else:
-            # Si tous les fallbacks échouent
-            log(f"[ERROR] All diarization models failed. Last error: {e}")
-            log("[WARN] Disabling diarization due to model loading failures")
-            _diarizer = None
-            return _diarizer
+        kwargs["token"] = HF_TOKEN
+    _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
     try:
         if torch.cuda.is_available():
             try:
@@ -406,7 +327,8 @@ def load_sentiment():
             "zero-shot-classification",
             model=SENTIMENT_MODEL,
             tokenizer=SENTIMENT_MODEL,
-            device=device_idx
+            device=device_idx,
+            model_kwargs={"use_safetensors": True}
         )
         log("[INIT] Zero-shot sentiment ready.")
         return _sentiment_zero_shot
@@ -414,8 +336,8 @@ def load_sentiment():
         if _sentiment_clf is not None:
             return _sentiment_clf
         log(f"[INIT] Loading classifier sentiment on device {device_idx}: {SENTIMENT_MODEL}")
-        tok = AutoTokenizer.from_pretrained(SENTIMENT_MODEL)
-        mdl = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL)
+        tok = AutoTokenizer.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
+        mdl = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
         _sentiment_clf = TextClassificationPipeline(
             model=mdl, tokenizer=tok, device=device_idx, return_all_scores=True, truncation=True
         )
@@ -966,24 +888,18 @@ def detect_single_voice_content(wav_path: str, language: Optional[str]) -> Dict[
     }]
     
     try:
-        # Timeout plus court pour éviter les blocages
-        detection_timeout = min(SINGLE_VOICE_DETECTION_TIMEOUT, 15)  # Max 15 secondes
-        result = run_voxtral_with_timeout(conversation, max_new_tokens=64, timeout=detection_timeout)
+        result = run_voxtral_with_timeout(conversation, max_new_tokens=64, timeout=SINGLE_VOICE_DETECTION_TIMEOUT)
         response = (result.get("text") or "").strip().lower()
         
         log(f"[SINGLE_VOICE] Detection result: '{response}'")
         
-        # Détection plus conservative
         if "conversation" in response:
             return {"type": "conversation", "summary": None}
         elif "message_vocal" in response:
             return {"type": "voicemail", "summary": response}
-        elif any(keyword in response for keyword in ["annonce", "automatique", "ivr", "système"]):
-            return {"type": "announcement", "summary": response}
         else:
-            # Par défaut, traiter comme une conversation pour éviter les erreurs
-            log(f"[SINGLE_VOICE] Ambiguous detection result: '{response}', defaulting to conversation")
-            return {"type": "conversation", "summary": None}
+            # Probablement une annonce/IVR
+            return {"type": "announcement", "summary": response}
             
     except Exception as e:
         log(f"[SINGLE_VOICE] Detection failed: {e}")
@@ -1007,29 +923,13 @@ def transcribe_single_voice_content(wav_path: str, language: Optional[str], max_
         log(f"[SINGLE_VOICE] Could not check duration: {e}")
         est_dur = 180.0  # Durée par défaut
     
-    # Transcription simple sans diarization - avec fallback
+    # Transcription simple sans diarization
     conv_simple = _build_conv_transcribe_ultra_strict(wav_path, language or "fr")
     out_simple = run_voxtral_with_timeout(conv_simple, max_new_tokens=max_new_tokens, timeout=60)
     full_text = (out_simple.get("text") or "").strip()
     
-    # Si transcription vide, essayer avec une approche différente
     if not full_text:
-        log("[SINGLE_VOICE] Empty transcription, trying fallback approach...")
-        # Essayer avec une instruction plus simple
-        conv_fallback = [{
-            "role": "user",
-            "content": [
-                {"type": "audio", "path": wav_path},
-                {"type": "text", "text": "Transcris exactement ce qui est dit dans cet audio."}
-            ]
-        }]
-        out_fallback = run_voxtral_with_timeout(conv_fallback, max_new_tokens=max_new_tokens, timeout=60)
-        full_text = (out_fallback.get("text") or "").strip()
-        
-        if not full_text:
-            # Si toujours vide, créer une réponse par défaut
-            log("[SINGLE_VOICE] Still empty, creating default response")
-            full_text = "Audio détecté mais contenu non transcriptible ou silencieux"
+        return {"error": "Empty transcription for single voice content"}
     
     # Créer un segment unique
     segments = [{
@@ -1094,19 +994,13 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     try:
         log("[VOXTRAL_ID] Checking audio duration...")
         import soundfile as sf
-        log("[VOXTRAL_ID] soundfile imported successfully")
         info = sf.info(wav_path)
-        log(f"[VOXTRAL_ID] Audio info retrieved: {info}")
         est_dur = info.frames / float(info.samplerate or 1)
         log(f"[VOXTRAL_ID] Audio duration: {est_dur:.1f}s")
         if est_dur > MAX_DURATION_S:
             return {"error": f"Audio too long ({est_dur:.1f}s). Increase MAX_DURATION_S or send shorter file."}
-    except ImportError as e:
-        log(f"[VOXTRAL_ID] soundfile not available: {e}. Skipping duration check.")
-        est_dur = 60.0  # Estimation par défaut
     except Exception as e:
-        log(f"[VOXTRAL_ID] Could not check duration: {e}. Using fallback.")
-        est_dur = 60.0  # Estimation par défaut
+        log(f"[VOXTRAL_ID] Could not check duration: {e}")
 
     # INSTRUCTION SPÉCIALISÉE POUR IDENTIFICATION DES SPEAKERS
     instruction = (
@@ -1123,9 +1017,6 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     
     # TRANSCRIPTION AVEC IDENTIFICATION DES SPEAKERS EN UNE PASSE
     log("[VOXTRAL_ID] Starting transcription with speaker identification...")
-    log(f"[VOXTRAL_ID] Audio file path: {wav_path}")
-    log(f"[VOXTRAL_ID] Estimated duration: {est_dur:.1f}s")
-    
     conv_speaker_id = [{
         "role": "user",
         "content": [
@@ -1134,12 +1025,8 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
         ]
     }]
     
-    log("[VOXTRAL_ID] Conversation object created, calling run_voxtral_with_timeout...")
-    
     # Ajuster les tokens selon la durée
     speaker_tokens = min(max_new_tokens, int(est_dur * 10))  # Un peu plus pour les labels
-    log(f"[VOXTRAL_ID] Using {speaker_tokens} tokens (max={max_new_tokens})")
-    
     out_speaker_id = run_voxtral_with_timeout(conv_speaker_id, max_new_tokens=speaker_tokens, timeout=90)
     speaker_transcript = (out_speaker_id.get("text") or "").strip()
     
@@ -1291,12 +1178,6 @@ def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_t
     # DIARIZATION AUTOMATIQUE (SANS PARAMÈTRES)
     log("[PYANNOTE_AUTO] Running automatic diarization...")
     dia = load_diarizer()
-    
-    # Si la diarisation est désactivée ou a échoué à charger
-    if dia is None:
-        log("[PYANNOTE_AUTO] Diarization unavailable, falling back to simple transcription")
-        return transcribe_single_voice_content(wav_path, language, max_new_tokens, with_summary)
-    
     diarization = dia(wav_path)  # Laisse PyAnnote décider complètement
     
     # Collecter tous les segments
@@ -1346,36 +1227,6 @@ def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_t
     
     # Appliquer le mode hybride avec les segments PyAnnote auto
     return apply_hybrid_workflow_with_segments(wav_path, raw_segments, language, max_new_tokens, with_summary)
-
-def merge_consecutive_segments(segments: List[Dict[str, Any]], max_gap: float = 2.0) -> List[Dict[str, Any]]:
-    """
-    Fusionne les segments consécutifs du même speaker avec un gap maximum.
-    """
-    if not segments:
-        return segments
-    
-    merged = []
-    current = segments[0].copy()
-    
-    for next_seg in segments[1:]:
-        same_speaker = current["speaker"] == next_seg["speaker"]
-        gap = float(next_seg["start"]) - float(current["end"])
-        
-        if same_speaker and gap <= max_gap:
-            # Fusionner
-            current["end"] = next_seg["end"]
-            current_text = current.get("text", "").strip()
-            next_text = next_seg.get("text", "").strip()
-            if current_text and next_text:
-                current["text"] = f"{current_text} {next_text}"
-            elif next_text:
-                current["text"] = next_text
-        else:
-            merged.append(current)
-            current = next_seg.copy()
-    
-    merged.append(current)
-    return merged
 
 def ultra_aggressive_merge(segments: List[Dict[str, Any]], max_gap: float = 3.0) -> List[Dict[str, Any]]:
     """
@@ -1492,6 +1343,58 @@ def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict]
             result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
     
     return result
+
+# ---------------------------
+# MODE HYBRIDE ULTRA-RAPIDE (fonction principale existante)
+# ---------------------------
+    """
+    Fusion ultra-agressive pour créer de gros blocs cohérents et réduire les erreurs.
+    """
+    if not segments:
+        return segments
+    
+    merged = []
+    current = segments[0].copy()
+    
+    log(f"[ULTRA_MERGE] Starting with {len(segments)} segments")
+    
+    for next_seg in segments[1:]:
+        same_speaker = current["speaker"] == next_seg["speaker"]
+        gap = float(next_seg["start"]) - float(current["end"])
+        
+        # Fusion plus agressive : même speaker OU gap très petit
+        should_merge = (same_speaker and gap <= max_gap) or (gap <= 0.5)  # Fusionne même différents speakers si gap < 0.5s
+        
+        if should_merge:
+            # Fusionner
+            current["end"] = next_seg["end"]
+            
+            # Si même speaker, fusionner normalement
+            if same_speaker:
+                current_text = current.get("text", "").strip()
+                next_text = next_seg.get("text", "").strip()
+                if current_text and next_text:
+                    current["text"] = f"{current_text} {next_text}"
+                elif next_text:
+                    current["text"] = next_text
+            else:
+                # Différents speakers mais gap tiny = probablement erreur PyAnnote
+                log(f"[ULTRA_MERGE] Merging different speakers due to tiny gap: {gap:.2f}s")
+                # Garde le speaker du segment le plus long
+                current_dur = float(current["end"]) - float(current["start"])  
+                next_dur = float(next_seg["end"]) - float(next_seg["start"])
+                if next_dur > current_dur:
+                    current["speaker"] = next_seg["speaker"]
+                    
+        else:
+            # Ne peut pas fusionner
+            merged.append(current)
+            current = next_seg.copy()
+    
+    merged.append(current)
+    
+    log(f"[ULTRA_MERGE] Result: {len(segments)} → {len(merged)} segments ({100*(1-len(merged)/len(segments)):.1f}% reduction)")
+    return merged
 
 def intelligent_dialogue_correction(text: str, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -1757,12 +1660,6 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     # ÉTAPE 2: DIARIZATION POUR LES TIMESTAMPS
     log("[HYBRID] Step 2: Diarization for speaker timestamps...")
     dia = load_diarizer()
-    
-    # Si la diarisation est désactivée ou a échoué à charger
-    if dia is None:
-        log("[HYBRID] Diarization unavailable, falling back to simple transcription")
-        return transcribe_single_voice_content(wav_path, language, max_new_tokens, with_summary)
-    
     try:
         if EXACT_TWO:
             diarization = dia(wav_path, num_speakers=2, min_speakers=2, max_speakers=2)
@@ -1907,12 +1804,6 @@ def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max
     
     # Diarization
     dia = load_diarizer()
-    
-    # Si la diarisation est désactivée ou a échoué à charger
-    if dia is None:
-        log("[FALLBACK] Diarization unavailable, falling back to simple transcription")
-        return transcribe_single_voice_content(wav_path, language, max_new_tokens, with_summary)
-    
     try:
         if EXACT_TWO:
             diarization = dia(wav_path, num_speakers=2)
@@ -2104,36 +1995,32 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         if task in ("transcribe_diarized", "diarized", "diarize"):
             log("[HANDLER] Starting diarized transcription...")
             
-            # Initialiser out pour éviter les erreurs
-            out = None
-            
-            # NOUVEAU : Détection précoce du type de contenu (si activée) avec fallback
+            # NOUVEAU : Détection précoce du type de contenu (si activée)
             if ENABLE_SINGLE_VOICE_DETECTION:
-                try:
-                    content_type = detect_single_voice_content(local_path, language)
-                    
-                    if content_type["type"] == "announcement":
-                        log("[HANDLER] Detected announcement/IVR, using single voice mode")
-                        out = transcribe_single_voice_content(local_path, language, max_new_tokens, with_summary)
-                        # Si erreur dans le mode single voice, fallback vers mode normal
-                        if "error" in out:
-                            log("[HANDLER] Single voice mode failed, falling back to normal mode")
-                            out = None  # Reset pour utiliser le mode normal
-                    elif content_type["type"] == "voicemail":
-                        log("[HANDLER] Detected voicemail, using single voice mode")
-                        out = transcribe_single_voice_content(local_path, language, max_new_tokens, with_summary)
-                        # Si erreur dans le mode single voice, fallback vers mode normal
-                        if "error" in out:
-                            log("[HANDLER] Single voice mode failed, falling back to normal mode")
-                            out = None  # Reset pour utiliser le mode normal
-                    
-                except Exception as e:
-                    log(f"[HANDLER] Single voice detection failed: {e}, using normal mode")
-                    out = None
-            
-            # Si pas encore de résultat, utiliser le mode normal
-            if out is None:
-                # Mode normal pour les conversations (PIPELINE EXISTANT)
+                content_type = detect_single_voice_content(local_path, language)
+                
+                if content_type["type"] == "announcement":
+                    log("[HANDLER] Detected announcement/IVR, using single voice mode")
+                    out = transcribe_single_voice_content(local_path, language, max_new_tokens, with_summary)
+                elif content_type["type"] == "voicemail":
+                    log("[HANDLER] Detected voicemail, using single voice mode")
+                    out = transcribe_single_voice_content(local_path, language, max_new_tokens, with_summary)
+                else:
+                    # Mode normal pour les conversations (PIPELINE EXISTANT INCHANGÉ)
+                    if VOXTRAL_SPEAKER_ID:
+                        log("[HANDLER] Using Voxtral Speaker Identification mode")
+                        out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary)
+                    elif PYANNOTE_AUTO:
+                        log("[HANDLER] Using PyAnnote Auto mode")
+                        out = diarize_with_pyannote_auto(local_path, language, max_new_tokens, with_summary)
+                    elif HYBRID_MODE:
+                        log("[HANDLER] Using Hybrid mode (PyAnnote + Voxtral)")
+                        out = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, with_summary)
+                    else:
+                        log("[HANDLER] Using Fallback segment mode")
+                        out = diarize_then_transcribe_fallback(local_path, language, max_new_tokens, with_summary)
+            else:
+                # Détection désactivée - utiliser le pipeline existant (COMPORTEMENT ORIGINAL)
                 if VOXTRAL_SPEAKER_ID:
                     log("[HANDLER] Using Voxtral Speaker Identification mode")
                     out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary)
