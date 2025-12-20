@@ -23,6 +23,3 @@ speechbrain==0.5.16
 # API et utils
 requests==2.31.0
 runpod==1.6.2
-
-# FFmpeg pour torchcodec (éviter les warnings)
-av==10.0.0
