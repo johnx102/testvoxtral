@@ -26,6 +26,13 @@ import runpod
 # Configuration des warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*torchcodec.*")
+warnings.filterwarnings("ignore", message=".*libtorchcodec.*")
+
+# Suppression des warnings torchcodec spécifiquement
+import logging
+torchcodec_logger = logging.getLogger("pyannote.audio.core.io")
+torchcodec_logger.setLevel(logging.ERROR)
 
 # Configuration du logging
 logging.basicConfig(
