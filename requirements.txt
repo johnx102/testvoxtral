@@ -10,6 +10,9 @@ huggingface_hub>=0.26.0
 scipy>=1.10.1
 sentencepiece>=0.2.0
 
+# Mistral/Voxtral tokenizer dependency (OBLIGATOIRE pour Voxtral)
+mistral-common>=1.4.0
+
 # Audio processing
 soundfile>=0.12.1
 librosa>=0.10.1
