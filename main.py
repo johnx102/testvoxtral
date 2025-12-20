@@ -85,23 +85,24 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
         logger.info("[VOXTRAL] Chargement du processor...")
         
         try:
+            # Chargement direct du processor Voxtral
+            from transformers import VoxtralProcessor
+            
             if hf_token:
-                voxtral_processor = AutoProcessor.from_pretrained(
+                voxtral_processor = VoxtralProcessor.from_pretrained(
                     VOXTRAL_MODEL,
                     token=hf_token,
-                    trust_remote_code=True,
-                    fix_mistral_regex=True  # Fix pour le regex pattern incorrect
+                    trust_remote_code=True
                 )
             else:
-                voxtral_processor = AutoProcessor.from_pretrained(
+                voxtral_processor = VoxtralProcessor.from_pretrained(
                     VOXTRAL_MODEL,
-                    trust_remote_code=True,
-                    fix_mistral_regex=True  # Fix pour le regex pattern incorrect
+                    trust_remote_code=True
                 )
-            logger.info("[VOXTRAL] ✓ Processor chargé avec succès")
+            logger.info("[VOXTRAL] ✓ Processor chargé avec VoxtralProcessor")
         except Exception as e:
-            logger.warning(f"[VOXTRAL] ⚠ Erreur avec fix_mistral_regex: {e}")
-            logger.info("[VOXTRAL] Tentative sans fix_mistral_regex...")
+            logger.warning(f"[VOXTRAL] ⚠ Erreur VoxtralProcessor: {e}")
+            logger.info("[VOXTRAL] Fallback vers AutoProcessor...")
             try:
                 if hf_token:
                     voxtral_processor = AutoProcessor.from_pretrained(
@@ -114,7 +115,7 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                         VOXTRAL_MODEL,
                         trust_remote_code=True
                     )
-                logger.info("[VOXTRAL] ✓ Processor chargé (sans regex fix)")
+                logger.info("[VOXTRAL] ✓ Processor chargé avec AutoProcessor")
             except Exception as e2:
                 logger.error(f"[VOXTRAL] ✗ Erreur processor: {e2}")
                 return None, None
@@ -195,7 +196,7 @@ def load_diarizer() -> Optional[Pipeline]:
         if hf_token:
             diarizer = Pipeline.from_pretrained(
                 DIARIZATION_MODEL,
-                use_auth_token=hf_token
+                token=hf_token
             )
         else:
             diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
