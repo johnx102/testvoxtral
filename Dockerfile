@@ -10,11 +10,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTORCH_JIT=0 \
     APP_VERSION=2025-12-20-stable
 
-# System deps avec FFmpeg pour torchcodec
+# System deps avec FFmpeg et outils de compilation
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
-    ffmpeg libavformat-dev libavcodec-dev libavutil-dev \
+    ffmpeg libavformat-dev libavcodec-dev libavutil-dev libavdevice-dev \
     libsndfile1 git ca-certificates curl \
+    pkg-config build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python && \
@@ -33,20 +34,10 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # App
 COPY main.py /app/main.py
 
-ENV MODEL_ID="mistralai/Voxtral-Small-24B-2507" \
-    MAX_NEW_TOKENS="512" \
-    TEMPERATURE="0.0" \
-    TOP_P="0.95" \
-    HF_TOKEN="" \
-    MAX_DURATION_S="1200" \
-    DIAR_MODEL="pyannote/speaker-diarization-3.1" \
-    WITH_SUMMARY_DEFAULT="1" \
-    SENTIMENT_MODEL="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli" \
-    SENTIMENT_TYPE="zero-shot" \
-    ENABLE_SENTIMENT="1" \
-    SENTIMENT_DEVICE="-1" \
-    ENABLE_DIARIZATION="1" \
-    ENABLE_SINGLE_VOICE_DETECTION="0" \
-    LOG_LEVEL="INFO"
+# Variables d'environnement pour le service
+ENV HF_TOKEN="" \
+    MAX_DURATION_S="9000" \
+    LOG_LEVEL="INFO" \
+    PYTHONPATH="/app"
 
 ENTRYPOINT ["python", "-u", "main.py"]
