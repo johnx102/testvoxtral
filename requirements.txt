@@ -1,5 +1,5 @@
-# Version récente avec support Mistral/Voxtral
-git+https://github.com/huggingface/transformers.git
+# Version spécifique avec support Voxtral stable
+transformers>=4.46.0,<4.48.0
 torch==2.4.0
 torchvision==0.19.0
 torchaudio==2.4.0
