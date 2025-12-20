@@ -122,6 +122,7 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
         # Chargement du modèle
         logger.info("[VOXTRAL] Chargement du modèle...")
         try:
+            # Première tentative avec AutoModelForCausalLM
             if hf_token:
                 voxtral_model = AutoModelForCausalLM.from_pretrained(
                     VOXTRAL_MODEL,
@@ -137,12 +138,40 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                     device_map="auto",
                     trust_remote_code=True
                 )
-            logger.info("[VOXTRAL] ✓ Modèle chargé avec succès")
+            logger.info("[VOXTRAL] ✓ Modèle chargé avec AutoModelForCausalLM")
             log_gpu_memory()
             return voxtral_model, voxtral_processor
             
         except Exception as e:
-            logger.error(f"[VOXTRAL] ✗ Erreur modèle: {e}")
+            if "Unrecognized configuration class" in str(e):
+                logger.warning(f"[VOXTRAL] AutoModelForCausalLM échoué, tentative avec chargement direct: {e}")
+                try:
+                    # Tentative avec chargement direct via la classe VoxtralForConditionalGeneration
+                    from transformers import VoxtralForConditionalGeneration
+                    
+                    if hf_token:
+                        voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
+                            VOXTRAL_MODEL,
+                            token=hf_token,
+                            torch_dtype=torch.bfloat16,
+                            device_map="auto",
+                            trust_remote_code=True
+                        )
+                    else:
+                        voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
+                            VOXTRAL_MODEL,
+                            torch_dtype=torch.bfloat16,
+                            device_map="auto",
+                            trust_remote_code=True
+                        )
+                    logger.info("[VOXTRAL] ✓ Modèle chargé avec VoxtralForConditionalGeneration")
+                    log_gpu_memory()
+                    return voxtral_model, voxtral_processor
+                    
+                except Exception as e2:
+                    logger.error(f"[VOXTRAL] ✗ Échec chargement direct: {e2}")
+            else:
+                logger.error(f"[VOXTRAL] ✗ Erreur modèle: {e}")
             voxtral_processor = None
             return None, None
             
