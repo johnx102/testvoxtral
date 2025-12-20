@@ -89,17 +89,35 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                 voxtral_processor = AutoProcessor.from_pretrained(
                     VOXTRAL_MODEL,
                     token=hf_token,
-                    trust_remote_code=True
+                    trust_remote_code=True,
+                    fix_mistral_regex=True  # Fix pour le regex pattern incorrect
                 )
             else:
                 voxtral_processor = AutoProcessor.from_pretrained(
                     VOXTRAL_MODEL,
-                    trust_remote_code=True
+                    trust_remote_code=True,
+                    fix_mistral_regex=True  # Fix pour le regex pattern incorrect
                 )
             logger.info("[VOXTRAL] ✓ Processor chargé avec succès")
         except Exception as e:
-            logger.error(f"[VOXTRAL] ✗ Erreur processor: {e}")
-            return None, None
+            logger.warning(f"[VOXTRAL] ⚠ Erreur avec fix_mistral_regex: {e}")
+            logger.info("[VOXTRAL] Tentative sans fix_mistral_regex...")
+            try:
+                if hf_token:
+                    voxtral_processor = AutoProcessor.from_pretrained(
+                        VOXTRAL_MODEL,
+                        token=hf_token,
+                        trust_remote_code=True
+                    )
+                else:
+                    voxtral_processor = AutoProcessor.from_pretrained(
+                        VOXTRAL_MODEL,
+                        trust_remote_code=True
+                    )
+                logger.info("[VOXTRAL] ✓ Processor chargé (sans regex fix)")
+            except Exception as e2:
+                logger.error(f"[VOXTRAL] ✗ Erreur processor: {e2}")
+                return None, None
         
         # Chargement du modèle
         logger.info("[VOXTRAL] Chargement du modèle...")
@@ -166,6 +184,7 @@ def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
     Transcrit un fichier audio avec Voxtral
     """
     try:
+        logger.info(f"[VOXTRAL] Début transcription: {audio_path}")
         model, processor = load_voxtral_model()
         if model is None or processor is None:
             raise Exception("Impossible de charger Voxtral")
@@ -173,27 +192,36 @@ def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
         logger.info(f"[VOXTRAL] Transcription (max_tokens={max_tokens})")
         
         # Chargement de l'audio
+        logger.info("[VOXTRAL] Lecture du fichier audio...")
         audio, sample_rate = sf.read(audio_path)
+        logger.info(f"[VOXTRAL] Audio: {len(audio)} samples @ {sample_rate}Hz")
+        
         if len(audio.shape) > 1:
             audio = audio.mean(axis=1)
+            logger.info("[VOXTRAL] Audio converti en mono")
         
         # Conversion au sample rate attendu (16kHz généralement)
         if sample_rate != 16000:
+            logger.info(f"[VOXTRAL] Resampling {sample_rate}Hz -> 16000Hz")
             audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
             sample_rate = 16000
         
         # Préparation des inputs
+        logger.info("[VOXTRAL] Préparation des inputs...")
         inputs = processor(
             audio=audio,
             sampling_rate=sample_rate,
             return_tensors="pt"
         )
+        logger.info(f"[VOXTRAL] Inputs préparés: {list(inputs.keys())}")
         
         # Déplacement vers GPU si disponible
         if DEVICE == "cuda":
+            logger.info("[VOXTRAL] Déplacement vers GPU...")
             inputs = {k: v.to("cuda") for k, v in inputs.items()}
         
         # Génération
+        logger.info("[VOXTRAL] Génération en cours...")
         with torch.no_grad():
             generated_ids = model.generate(
                 **inputs,
@@ -203,6 +231,7 @@ def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
                 pad_token_id=processor.tokenizer.eos_token_id
             )
         
+        logger.info("[VOXTRAL] Décodage...")
         # Décodage
         transcription = processor.batch_decode(
             generated_ids,
@@ -210,10 +239,13 @@ def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
         )[0]
         
         logger.info(f"[VOXTRAL] ✓ Transcription terminée ({len(transcription)} caractères)")
+        logger.info(f"[VOXTRAL] Aperçu: {transcription[:100]}...")
         return transcription.strip()
         
     except Exception as e:
         logger.error(f"[VOXTRAL] ✗ Erreur transcription: {e}")
+        import traceback
+        traceback.print_exc()
         return ""
 
 def perform_diarization(audio_path: str) -> List[Dict]:
@@ -472,8 +504,23 @@ def handler(job):
     """
     Handler principal pour RunPod serverless
     """
-    job_input = job.get("input", {})
-    return process_audio_request(job_input)
+    try:
+        logger.info(f"[HANDLER] Nouveau job reçu: {job}")
+        job_input = job.get("input", {})
+        
+        if not job_input:
+            logger.error("[HANDLER] ✗ Pas d'input dans le job")
+            return {"error": "Pas d'input fourni"}
+        
+        result = process_audio_request(job_input)
+        logger.info(f"[HANDLER] ✓ Job terminé. Résultat: {len(str(result))} caractères")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[HANDLER] ✗ Erreur dans handler: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": f"Erreur handler: {str(e)}"}
 
 if __name__ == "__main__":
     # Test local ou démarrage RunPod
