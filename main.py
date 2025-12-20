@@ -19,7 +19,7 @@ import torch
 import soundfile as sf
 import librosa
 import numpy as np
-from transformers import AutoProcessor, MistralForConditionalGeneration
+from transformers import AutoProcessor, AutoModelForCausalLM
 from pyannote.audio import Pipeline
 import runpod
 
@@ -105,7 +105,7 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
         logger.info("[VOXTRAL] Chargement du modèle...")
         try:
             if hf_token:
-                voxtral_model = MistralForConditionalGeneration.from_pretrained(
+                voxtral_model = AutoModelForCausalLM.from_pretrained(
                     VOXTRAL_MODEL,
                     token=hf_token,
                     torch_dtype=torch.bfloat16,
@@ -113,7 +113,7 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                     trust_remote_code=True
                 )
             else:
-                voxtral_model = MistralForConditionalGeneration.from_pretrained(
+                voxtral_model = AutoModelForCausalLM.from_pretrained(
                     VOXTRAL_MODEL,
                     torch_dtype=torch.bfloat16,
                     device_map="auto",
