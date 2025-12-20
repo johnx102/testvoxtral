@@ -1,5 +1,5 @@
-# Version récente avec support architecture Voxtral
-transformers>=4.48.0
+# Version de développement transformers avec support complet Voxtral
+git+https://github.com/huggingface/transformers.git
 torch==2.4.0
 torchvision==0.19.0
 torchaudio==2.4.0
