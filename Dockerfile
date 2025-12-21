@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
     TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
-    APP_VERSION=2025-12-21-v6
+    APP_VERSION=2025-12-21-v7
 
 # System deps - INCLUT LLVM pour numba
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -60,16 +60,24 @@ RUN pip install --no-cache-dir \
 # TRANSFORMERS DEPUIS GITHUB - Version dev avec support Voxtral
 RUN pip install --no-cache-dir git+https://github.com/huggingface/transformers.git
 
-# Mistral tokenizer (requis pour Voxtral)
+# Mistral tokenizer (requis pour Voxtral) - version stable
 RUN pip install --no-cache-dir mistral-common==1.5.1
 
 # Matplotlib (requis par pyannote.audio)
 RUN pip install --no-cache-dir matplotlib==3.8.2
 
-# PyAnnote 3.3+ utilise 'token' au lieu de 'use_auth_token'
-RUN pip install --no-cache-dir \
-    pyannote.audio==3.3.2 \
-    speechbrain==1.0.0
+# PyAnnote - installer avec --no-deps puis les deps séparément pour éviter conflits
+RUN pip install --no-cache-dir --no-deps pyannote.audio==3.3.2 && \
+    pip install --no-cache-dir \
+    pyannote.core>=5.0.0 \
+    pyannote.database>=5.1.0 \
+    pyannote.pipeline>=3.0.1 \
+    pytorch-lightning>=2.0.1 \
+    pytorch-metric-learning>=2.3.0 \
+    rich>=13.3.3
+
+# Speechbrain compatible
+RUN pip install --no-cache-dir speechbrain==1.0.0
 
 # API et utils
 RUN pip install --no-cache-dir \
@@ -84,6 +92,7 @@ RUN pip install --no-cache-dir "numpy>=1.26.0,<2.0.0" --force-reinstall
 RUN python -c "import numpy; print(f'NumPy version: {numpy.__version__}')" && \
     python -c "import torch; print(f'PyTorch version: {torch.__version__}')" && \
     python -c "import transformers; print(f'Transformers version: {transformers.__version__}')" && \
+    python -c "from transformers import VoxtralForConditionalGeneration; print('VoxtralForConditionalGeneration: OK')" && \
     python -c "import pyannote.audio; print(f'PyAnnote version: {pyannote.audio.__version__}')"
 
 # App et scripts
