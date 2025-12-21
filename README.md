@@ -1,6 +1,6 @@
 # Voxtral Serverless Worker
 
-Service de transcription audio avec diarisation, résumé et analyse de sentiment.
+Service de transcription audio avec diarisation, résumé et analyse de sentiment.c
 
 ## Architecture
 
