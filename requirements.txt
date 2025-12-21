@@ -11,7 +11,7 @@ scipy>=1.10.1
 sentencepiece>=0.2.0
 
 # Mistral/Voxtral tokenizer dependency (OBLIGATOIRE pour Voxtral)
-mistral-common>=1.4.0
+mistral-common>=1.8.6
 
 # Audio processing
 soundfile>=0.12.1
