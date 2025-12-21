@@ -31,6 +31,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*torchcodec.*")
 warnings.filterwarnings("ignore", message=".*libtorchcodec.*")
+warnings.filterwarnings("ignore", message=".*TRANSFORMERS_CACHE.*")
 
 # Suppression des warnings torchcodec spécifiquement
 torchcodec_logger = logging.getLogger("pyannote.audio.core.io")

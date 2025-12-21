@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
     TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
-    APP_VERSION=2025-12-21-v3
+    APP_VERSION=2025-12-21-v4
 
 # System deps - INCLUT LLVM pour numba
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -38,7 +38,7 @@ RUN pip install --no-cache-dir \
 
 # Numpy et numba d'abord (versions pré-compilées compatibles)
 RUN pip install --no-cache-dir \
-    numpy==1.26.4 \
+    "numpy>=1.26.0,<2.0.0" \
     llvmlite==0.43.0 \
     numba==0.60.0
 
@@ -74,6 +74,15 @@ RUN pip install --no-cache-dir \
     runpod==1.7.0 \
     psutil==5.9.8
 
+# CRITICAL: Forcer numpy < 2.0 après toutes les installations
+# pyannote.audio utilise np.NaN qui n'existe plus dans numpy 2.0
+RUN pip install --no-cache-dir "numpy>=1.26.0,<2.0.0" --force-reinstall
+
+# Vérification des versions critiques
+RUN python -c "import numpy; print(f'NumPy version: {numpy.__version__}')" && \
+    python -c "import torch; print(f'PyTorch version: {torch.__version__}')" && \
+    python -c "import transformers; print(f'Transformers version: {transformers.__version__}')"
+
 # App et scripts
 COPY main.py /app/main.py
 COPY diagnostic.py /app/diagnostic.py
@@ -83,11 +92,10 @@ COPY diagnostic.py /app/diagnostic.py
 ENV MAX_DURATION_S="9000" \
     LOG_LEVEL="INFO" \
     PYTHONPATH="/app" \
-    HF_HUB_CACHE="/app/.cache/huggingface" \
-    TRANSFORMERS_CACHE="/app/.cache/transformers"
+    HF_HOME="/app/.cache/huggingface"
 
 # Créer les dossiers de cache
-RUN mkdir -p /app/.cache/huggingface /app/.cache/transformers && \
+RUN mkdir -p /app/.cache/huggingface && \
     chmod -R 777 /app/.cache
 
 ENTRYPOINT ["python", "-u", "main.py"]
