@@ -62,11 +62,6 @@ def timeout(duration):
     
     try:
         yield
-    finally:
-        # Nettoyer
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
-
 @contextmanager
 def timeout(duration):
     """Context manager pour timeout sur le téléchargement de modèles"""
@@ -83,6 +78,52 @@ def timeout(duration):
         # Nettoyer
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
+
+def warm_model_cache():
+    """Pré-télécharge le modèle Voxtral pour accélérer le démarrage"""
+    from huggingface_hub import snapshot_download, scan_cache_dir
+    
+    logger.info("=== Voxtral Cache Warming ===")
+    
+    # Vérifier le cache existant
+    try:
+        cache_info = scan_cache_dir()
+        cached_repos = [repo.repo_id for repo in cache_info.repos]
+        
+        if VOXTRAL_MODEL in cached_repos:
+            logger.info(f"✅ Modèle {VOXTRAL_MODEL} déjà en cache")
+            for repo in cache_info.repos:
+                if repo.repo_id == VOXTRAL_MODEL:
+                    logger.info(f"   Taille: {repo.size_on_disk_str}")
+            return True
+        else:
+            logger.info(f"📥 Modèle {VOXTRAL_MODEL} non trouvé en cache, téléchargement...")
+    except Exception as e:
+        logger.warning(f"Impossible de vérifier le cache: {e}")
+    
+    # Télécharger le modèle
+    try:
+        hf_token = os.getenv("HF_TOKEN")
+        start_time = time.time()
+        
+        logger.info("🚀 Début du téléchargement...")
+        
+        snapshot_path = snapshot_download(
+            repo_id=VOXTRAL_MODEL,
+            token=hf_token,
+            cache_dir=None,
+            resume_download=True,
+            local_files_only=False
+        )
+        
+        elapsed = time.time() - start_time
+        logger.info(f"✅ Téléchargement terminé en {elapsed:.1f}s")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur lors du téléchargement: {e}")
+        return False
 MAX_DURATION = int(os.getenv("MAX_DURATION_S", "9000"))
 
 # Variables globales pour le cache des modèles
@@ -691,6 +732,13 @@ def handler(job):
         return {"error": f"Erreur handler: {str(e)}"}
 
 if __name__ == "__main__":
+    import sys
+    
+    # Support pour cache warming
+    if len(sys.argv) > 1 and sys.argv[1] == "warm_cache":
+        success = warm_model_cache()
+        sys.exit(0 if success else 1)
+    
     # Test local ou démarrage RunPod
     if os.getenv("RUNPOD_DEBUG"):
         # Mode debug local
