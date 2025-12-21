@@ -124,11 +124,19 @@ def load_audio_mono(path: str):
 def transcribe_with_voxtral(audio_path: str, language: str = "fr", max_new_tokens: int = 2500) -> str:
     model, processor = load_voxtral_model()
 
+    # Ensure 16kHz wav for best results
     audio, sr = load_audio_mono(audio_path)
+    tmp16 = None
     if sr != 16000:
         LOG.info(f"[VOXTRAL] Resampling {sr}Hz -> 16000Hz")
         audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
         sr = 16000
+        fd, tmp16 = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        sf.write(tmp16, audio, sr)
+        audio_path_for_model = tmp16
+    else:
+        audio_path_for_model = audio_path
 
     duration = len(audio) / float(sr)
     LOG.info(f"[VOXTRAL] Audio prêt: {duration:.1f}s @ {sr}Hz")
@@ -138,19 +146,16 @@ def transcribe_with_voxtral(audio_path: str, language: str = "fr", max_new_token
         "Ne rajoute rien. Retourne uniquement le texte."
     )
 
+    # For your stack: audio must be provided as a PATH, not as array
     conversation = [
         {"role": "user", "content": [
-            {"type": "audio", "array": audio, "sampling_rate": sr},
+            {"type": "audio", "path": audio_path_for_model},
             {"type": "text", "text": prompt},
         ]}
     ]
 
     LOG.info("[VOXTRAL] Préparation des inputs (apply_chat_template)...")
-    # IMPORTANT: do NOT pass add_generation_prompt (unsupported by MistralCommonTokenizer in your stack)
-    input_ids = processor.apply_chat_template(
-        conversation,
-        return_tensors="pt",
-    )
+    input_ids = processor.apply_chat_template(conversation, return_tensors="pt")
 
     import torch
     if torch.cuda.is_available():
@@ -167,6 +172,13 @@ def transcribe_with_voxtral(audio_path: str, language: str = "fr", max_new_token
     text = processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
     if prompt in text:
         text = text.split(prompt, 1)[-1].strip()
+
+    if tmp16:
+        try:
+            os.remove(tmp16)
+        except Exception:
+            pass
+
     return text
 
 

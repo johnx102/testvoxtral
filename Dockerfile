@@ -14,13 +14,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# --- PyTorch CUDA 12.1 stack (new enough for transformers 4.56.x) ---
+# PyTorch CUDA 12.1 stack (works with transformers 4.56.x)
 RUN python3 -m pip install --no-cache-dir \
   --index-url https://download.pytorch.org/whl/cu121 \
   torch==2.3.1 \
   torchaudio==2.3.1
 
-# Pin NumPy <2.0 (pyannote + deps not compatible with NumPy 2 yet)
+# Pin NumPy <2.0 for pyannote ecosystem
 RUN python3 -m pip install --no-cache-dir numpy==1.26.4
 
 # Core deps
@@ -39,10 +39,10 @@ RUN python3 -m pip install --no-cache-dir \
 RUN python3 -m pip install --no-cache-dir transformers==4.56.1
 RUN python3 -m pip install --no-cache-dir --upgrade "mistral-common[audio]==1.8.6"
 
-# Pyannote diarization
-RUN python3 -m pip install --no-cache-dir pyannote.audio==3.1.1
+# Pyannote diarization + runtime deps
+RUN python3 -m pip install --no-cache-dir pyannote.audio==3.1.1 matplotlib==3.8.4
 
-# Re-force NumPy pin AFTER pyannote install (some deps may try to upgrade it)
+# Re-force NumPy pin (some deps may try to upgrade it)
 RUN python3 -m pip install --no-cache-dir numpy==1.26.4
 
 # RunPod worker
@@ -51,16 +51,13 @@ RUN python3 -m pip install --no-cache-dir runpod==1.7.0
 COPY main.py /app/main.py
 COPY diagnostic.py /app/diagnostic.py
 
-# Never fail build if optional imports behave differently
 RUN python3 - <<'PY' || true
 try:
     import torch, torchaudio, transformers, numpy
-    import mistral_common
     print("torch:", torch.__version__, "cuda:", torch.version.cuda)
     print("torchaudio:", torchaudio.__version__)
     print("transformers:", transformers.__version__)
     print("numpy:", numpy.__version__)
-    print("mistral_common:", mistral_common.__version__)
 except Exception as e:
     print("Version check skipped:", repr(e))
 PY
