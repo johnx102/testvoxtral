@@ -219,27 +219,27 @@ def load_diarizer() -> Optional[Pipeline]:
         hf_token = os.getenv("HF_TOKEN")
         
         try:
-            # Première tentative avec use_auth_token (ancienne API)
+            # Première tentative avec token (nouvelle API)
             if hf_token:
                 diarizer = Pipeline.from_pretrained(
                     DIARIZATION_MODEL,
-                    use_auth_token=hf_token
+                    token=hf_token
                 )
             else:
                 diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
         except Exception as e1:
-            logger.warning(f"[DIARIZER] ⚠ use_auth_token échoué: {e1}")
+            logger.warning(f"[DIARIZER] ⚠ token échoué: {e1}")
             try:
-                # Deuxième tentative avec token (nouvelle API)
+                # Deuxième tentative avec use_auth_token (ancienne API)
                 if hf_token:
                     diarizer = Pipeline.from_pretrained(
                         DIARIZATION_MODEL,
-                        token=hf_token
+                        use_auth_token=hf_token
                     )
                 else:
                     diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
             except Exception as e2:
-                logger.warning(f"[DIARIZER] ⚠ token échoué: {e2}")
+                logger.warning(f"[DIARIZER] ⚠ use_auth_token échoué: {e2}")
                 # Troisième tentative sans authentification
                 diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
             
