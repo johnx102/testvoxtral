@@ -1,47 +1,61 @@
-# Voxtral Serverless Worker
+# WhisperX Worker - Transcription + Diarisation + Résumé + Sentiment
 
-Service de transcription audio avec diarisation, résumé et analyse de sentiment.c
+Worker RunPod Serverless basé sur [WhisperX](https://github.com/m-bain/whisperX) avec fonctionnalités additionnelles.
 
-## Architecture
+## Fonctionnalités
 
-- **vLLM** : Sert le modèle Voxtral pour transcription/résumé/sentiment
-- **Pyannote** : Diarisation des speakers
-- **RunPod** : Framework serverless
-
-## Modèles utilisés
-
-| Composant | Modèle | VRAM requise |
-|-----------|--------|--------------|
-| Transcription | Voxtral-Mini-3B | ~10 GB |
-| Diarisation | pyannote/speaker-diarization-3.1 | ~2 GB |
-
-**Note** : Pour utiliser Voxtral-Small-24B (meilleure qualité), changez `VOXTRAL_MODEL` et prévoyez ~55 GB de VRAM.
+- ✅ **Transcription** - Whisper large-v3 (meilleure qualité)
+- ✅ **Alignement** - Timestamps précis au niveau des mots
+- ✅ **Diarisation** - Identification des speakers (Pyannote)
+- ✅ **Résumé** - Extraction des points clés
+- ✅ **Sentiment** - Analyse de la satisfaction client
 
 ## Configuration RunPod
 
-### Variables d'environnement requises
+### Variables d'environnement
 
-| Variable | Description | Exemple |
-|----------|-------------|---------|
-| `HF_TOKEN` | Token HuggingFace (requis) | `hf_xxx...` |
-| `VOXTRAL_MODEL` | Modèle Voxtral à utiliser | `mistralai/Voxtral-Mini-3B-2507` |
-| `VLLM_PORT` | Port interne vLLM | `8000` |
+| Variable | Description | Défaut |
+|----------|-------------|--------|
+| `HF_TOKEN` | Token HuggingFace (requis pour diarisation) | - |
+| `WHISPER_MODEL` | Modèle Whisper | `large-v3` |
+| `BATCH_SIZE` | Taille des batchs | `16` |
 | `MAX_DURATION_S` | Durée max audio (secondes) | `9000` |
 
 ### GPU recommandé
 
-- **Voxtral-Mini-3B** : RTX 3090/4090 (24GB) ou A10 (24GB)
-- **Voxtral-Small-24B** : A100 80GB ou 2x A100 40GB
+- Minimum: 16GB VRAM (RTX 4080, A10)
+- Recommandé: 24GB+ (RTX 4090, A100)
 
 ## API
 
-### Endpoint
-
-```
-POST /run
-```
-
 ### Paramètres d'entrée
+
+| Paramètre | Type | Requis | Description |
+|-----------|------|--------|-------------|
+| `audio_url` / `audio_file` | string | Oui | URL du fichier audio |
+| `language` | string | Non | Code langue (ex: `fr`, `en`). Auto-détection si absent |
+| `task` | string | Non | `transcribe` ou `transcribe_diarized` |
+| `diarization` | bool | Non | Activer la diarisation |
+| `align_output` | bool | Non | Activer l'alignement mot-à-mot (défaut: true) |
+| `summary` / `with_summary` | bool | Non | Générer un résumé |
+| `sentiment` | bool | Non | Analyser le sentiment |
+| `batch_size` | int | Non | Taille des batchs (défaut: 16) |
+| `min_speakers` | int | Non | Nombre min de speakers |
+| `max_speakers` | int | Non | Nombre max de speakers |
+| `huggingface_access_token` | string | Non | Token HF (sinon utilise `HF_TOKEN` env) |
+
+### Exemple - Transcription simple
+
+```json
+{
+  "input": {
+    "audio_url": "https://example.com/audio.wav",
+    "language": "fr"
+  }
+}
+```
+
+### Exemple - Transcription avec diarisation
 
 ```json
 {
@@ -55,72 +69,103 @@ POST /run
 }
 ```
 
-| Paramètre | Type | Description |
-|-----------|------|-------------|
-| `audio_url` | string | URL du fichier audio (requis) |
-| `task` | string | `transcribe` ou `transcribe_diarized` |
-| `language` | string | Code langue ISO (ex: `fr`, `en`) |
-| `summary` | boolean | Inclure un résumé |
-| `sentiment` | boolean | Inclure l'analyse de sentiment |
-
-### Exemple de réponse
+### Exemple - Configuration complète
 
 ```json
 {
-  "task": "transcribe_diarized",
-  "language": "fr",
-  "duration": 179.2,
-  "transcriptions": [
-    {
-      "speaker": "SPEAKER_00",
-      "start": 0.5,
-      "end": 5.2,
-      "text": "Bonjour, je vous appelle concernant..."
-    },
-    {
-      "speaker": "SPEAKER_01", 
-      "start": 5.5,
-      "end": 12.1,
-      "text": "Oui bonjour, comment puis-je vous aider?"
-    }
-  ],
-  "summary": "Résumé: L'appelant contacte le service client...",
+  "input": {
+    "audio_url": "https://example.com/audio.wav",
+    "language": "fr",
+    "diarization": true,
+    "align_output": true,
+    "batch_size": 32,
+    "min_speakers": 2,
+    "max_speakers": 5,
+    "summary": true,
+    "sentiment": true
+  }
+}
+```
+
+## Réponse
+
+### Sans diarisation
+
+```json
+{
+  "transcription": "Texte complet de la transcription...",
+  "detected_language": "fr",
+  "summary": "Résumé: Points clés de la conversation...",
   "sentiment": {
     "sentiment": "positif",
-    "score": 0.75,
-    "emotions": ["satisfaction", "politesse"],
+    "score": 0.72,
+    "satisfaction_client": "satisfait",
+    "details": {"positif": 5, "negatif": 1}
+  }
+}
+```
+
+### Avec diarisation
+
+```json
+{
+  "segments": [
+    {
+      "start": 0.5,
+      "end": 5.2,
+      "text": "Bonjour, je vous appelle concernant...",
+      "speaker": "SPEAKER_00",
+      "words": [
+        {"word": "Bonjour", "start": 0.5, "end": 0.9, "speaker": "SPEAKER_00"},
+        {"word": "je", "start": 1.0, "end": 1.1, "speaker": "SPEAKER_00"}
+      ]
+    },
+    {
+      "start": 5.5,
+      "end": 12.1,
+      "text": "Oui bonjour, comment puis-je vous aider?",
+      "speaker": "SPEAKER_01"
+    }
+  ],
+  "transcriptions": [...],
+  "detected_language": "fr",
+  "summary": "Résumé: ...",
+  "sentiment": {
+    "sentiment": "positif",
+    "score": 0.72,
     "satisfaction_client": "satisfait"
   }
 }
 ```
 
-## Build local
+## Build Docker
 
 ```bash
-docker build -t voxtral-serverless .
+docker build -t whisperx-worker .
+```
 
-# Test local
+## Test local
+
+```bash
 docker run --gpus all \
   -e HF_TOKEN="hf_xxx" \
   -e RUNPOD_DEBUG=1 \
-  -p 8000:8000 \
-  voxtral-serverless
+  whisperx-worker
 ```
 
-## Temps de démarrage
+## Avantages vs autres solutions
 
-- Premier démarrage : ~5-10 minutes (téléchargement des modèles)
-- Démarrages suivants : ~2-3 minutes (chargement depuis cache)
+| Feature | Ce worker | Whisper simple | faster-whisper |
+|---------|-----------|----------------|----------------|
+| Qualité transcription | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+| Vitesse | ⭐⭐⭐⭐ | ⭐⭐ | ⭐⭐⭐⭐⭐ |
+| Timestamps mots | ✅ Précis | ❌ | ⚠️ Approximatif |
+| Diarisation | ✅ Intégrée | ❌ | ❌ |
+| Résumé | ✅ | ❌ | ❌ |
+| Sentiment | ✅ | ❌ | ❌ |
 
-## Formats audio supportés
+## Crédits
 
-- WAV (recommandé)
-- MP3
-- OGG
-- Autres formats convertibles par librosa
-
-## Limitations
-
-- Durée max par défaut : 2h30 (9000 secondes)
-- Taille max audio : dépend de la RAM disponible
-- Concurrent requests : 1 (serverless)
+- [WhisperX](https://github.com/m-bain/whisperx) - Transcription + alignement
+- [Pyannote](https://github.com/pyannote/pyannote-audio) - Diarisation
+- [RunPod](https://runpod.io) - Plateforme serverless

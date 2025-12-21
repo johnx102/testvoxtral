@@ -1,27 +1,17 @@
-# PyTorch - installé séparément dans Dockerfile pour CUDA
-# torch==2.1.0
-# torchaudio==2.1.0
+# PyTorch - installed separately for CUDA
+# torch==2.1.2
+# torchaudio==2.1.2
 
-# Whisper (faster-whisper = optimisé CTranslate2)
-faster-whisper==1.0.3
+# WhisperX (includes faster-whisper, pyannote, etc.)
+whisperx @ git+https://github.com/m-bain/whisperx.git
 
-# Numpy compatible (< 2.0 pour pyannote)
+# Additional deps
+runpod>=1.6.2
+requests>=2.31.0
+soundfile>=0.12.1
 numpy>=1.24.0,<2.0.0
 
-# Audio processing
-soundfile==0.12.1
-librosa==0.10.2
-pydub==0.25.1
-
-# HuggingFace
-huggingface_hub>=0.20.0
+# For summarization
 transformers>=4.36.0
-
-# Diarisation
-pyannote.audio==3.1.1
-speechbrain==0.5.16
-
-# API et utils
-requests>=2.31.0
-runpod>=1.6.2
-psutil>=5.9.0
+sentencepiece>=0.1.99
+accelerate>=0.25.0
