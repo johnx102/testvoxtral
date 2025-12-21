@@ -82,97 +82,122 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
         
         # Chargement du processor avec gestion HF token
         hf_token = os.getenv("HF_TOKEN")
+        # Chargement du processor Voxtral - approche simplifiée sans arguments problématiques
         logger.info("[VOXTRAL] Chargement du processor...")
         
         try:
-            # Chargement direct du processor Voxtral
-            from transformers import VoxtralProcessor
+            # Approche directe sans passer par AutoProcessor qui ajoute des kwargs problématiques
+            from transformers.models.voxtral import VoxtralProcessor
             
-            if hf_token:
-                voxtral_processor = VoxtralProcessor.from_pretrained(
-                    VOXTRAL_MODEL,
-                    token=hf_token,
-                    trust_remote_code=True
-                )
-            else:
-                voxtral_processor = VoxtralProcessor.from_pretrained(
-                    VOXTRAL_MODEL,
-                    trust_remote_code=True
-                )
-            logger.info("[VOXTRAL] ✓ Processor chargé avec VoxtralProcessor")
+            # Chargement sans les kwargs qui posent problème
+            voxtral_processor = VoxtralProcessor.from_pretrained(VOXTRAL_MODEL)
+            logger.info("[VOXTRAL] ✓ VoxtralProcessor chargé directement")
+            
         except Exception as e:
-            logger.warning(f"[VOXTRAL] ⚠ Erreur VoxtralProcessor: {e}")
-            logger.info("[VOXTRAL] Fallback vers AutoProcessor...")
+            logger.warning(f"[VOXTRAL] ⚠ VoxtralProcessor direct échoué: {e}")
             try:
+                # Fallback: chargement manuel des composants
+                from transformers import AutoTokenizer, AutoFeatureExtractor
+                
+                logger.info("[VOXTRAL] Chargement des composants individuels...")
+                
                 if hf_token:
-                    voxtral_processor = AutoProcessor.from_pretrained(
+                    tokenizer = AutoTokenizer.from_pretrained(VOXTRAL_MODEL, token=hf_token)
+                    feature_extractor = AutoFeatureExtractor.from_pretrained(VOXTRAL_MODEL, token=hf_token)
+                else:
+                    tokenizer = AutoTokenizer.from_pretrained(VOXTRAL_MODEL)
+                    feature_extractor = AutoFeatureExtractor.from_pretrained(VOXTRAL_MODEL)
+                
+                # Création manuelle d'un objet processor
+                class VoxtralProcessorManual:
+                    def __init__(self, tokenizer, feature_extractor):
+                        self.tokenizer = tokenizer
+                        self.feature_extractor = feature_extractor
+                    
+                    def __call__(self, audio=None, text=None, sampling_rate=16000, return_tensors="pt"):
+                        result = {}
+                        if audio is not None:
+                            # Process audio through feature extractor
+                            audio_features = self.feature_extractor(
+                                audio, 
+                                sampling_rate=sampling_rate, 
+                                return_tensors=return_tensors
+                            )
+                            result.update(audio_features)
+                        if text is not None:
+                            # Process text through tokenizer
+                            text_features = self.tokenizer(
+                                text, 
+                                return_tensors=return_tensors,
+                                padding=True,
+                                truncation=True
+                            )
+                            result.update(text_features)
+                        return result
+                    
+                    def batch_decode(self, *args, **kwargs):
+                        return self.tokenizer.batch_decode(*args, **kwargs)
+                
+                voxtral_processor = VoxtralProcessorManual(tokenizer, feature_extractor)
+                logger.info("[VOXTRAL] ✓ Processor manuel créé")
+                
+            except Exception as e2:
+                logger.error(f"[VOXTRAL] ✗ Erreur processor manuel: {e2}")
+                return None, None
+        
+        # Chargement du modèle avec approche simplifiée
+        logger.info("[VOXTRAL] Chargement du modèle...")
+        try:
+            # Chargement du vrai modèle Voxtral avec approche directe
+            logger.info("[VOXTRAL] Chargement du modèle Voxtral...")
+            
+            try:
+                # Première tentative: import direct de VoxtralForConditionalGeneration
+                from transformers.models.voxtral import VoxtralForConditionalGeneration
+                
+                if hf_token:
+                    voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
                         VOXTRAL_MODEL,
                         token=hf_token,
+                        torch_dtype=torch.bfloat16,
+                        device_map="auto"
+                    )
+                else:
+                    voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
+                        VOXTRAL_MODEL,
+                        torch_dtype=torch.bfloat16,
+                        device_map="auto"
+                    )
+                
+                logger.info("[VOXTRAL] ✓ VoxtralForConditionalGeneration chargé")
+                
+            except ImportError:
+                logger.warning("[VOXTRAL] ⚠ VoxtralForConditionalGeneration non disponible, tentative AutoModel...")
+                
+                # Deuxième tentative: utilisation d'AutoModel avec trust_remote_code
+                if hf_token:
+                    voxtral_model = AutoModelForCausalLM.from_pretrained(
+                        VOXTRAL_MODEL,
+                        token=hf_token,
+                        torch_dtype=torch.bfloat16,
+                        device_map="auto",
                         trust_remote_code=True
                     )
                 else:
-                    voxtral_processor = AutoProcessor.from_pretrained(
+                    voxtral_model = AutoModelForCausalLM.from_pretrained(
                         VOXTRAL_MODEL,
+                        torch_dtype=torch.bfloat16,
+                        device_map="auto",
                         trust_remote_code=True
                     )
-                logger.info("[VOXTRAL] ✓ Processor chargé avec AutoProcessor")
-            except Exception as e2:
-                logger.error(f"[VOXTRAL] ✗ Erreur processor: {e2}")
-                return None, None
-        
-        # Chargement du modèle
-        logger.info("[VOXTRAL] Chargement du modèle...")
-        try:
-            # Première tentative avec AutoModelForCausalLM
-            if hf_token:
-                voxtral_model = AutoModelForCausalLM.from_pretrained(
-                    VOXTRAL_MODEL,
-                    token=hf_token,
-                    torch_dtype=torch.bfloat16,
-                    device_map="auto",
-                    trust_remote_code=True
-                )
-            else:
-                voxtral_model = AutoModelForCausalLM.from_pretrained(
-                    VOXTRAL_MODEL,
-                    torch_dtype=torch.bfloat16,
-                    device_map="auto",
-                    trust_remote_code=True
-                )
-            logger.info("[VOXTRAL] ✓ Modèle chargé avec AutoModelForCausalLM")
+                
+                logger.info("[VOXTRAL] ✓ AutoModelForCausalLM avec trust_remote_code chargé")
+            
             log_gpu_memory()
             return voxtral_model, voxtral_processor
             
         except Exception as e:
-            if "Unrecognized configuration class" in str(e):
-                logger.warning(f"[VOXTRAL] AutoModelForCausalLM échoué, tentative avec chargement direct: {e}")
-                try:
-                    # Tentative avec chargement direct via la classe VoxtralForConditionalGeneration
-                    from transformers import VoxtralForConditionalGeneration
-                    
-                    if hf_token:
-                        voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
-                            VOXTRAL_MODEL,
-                            token=hf_token,
-                            torch_dtype=torch.bfloat16,
-                            device_map="auto",
-                            trust_remote_code=True
-                        )
-                    else:
-                        voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
-                            VOXTRAL_MODEL,
-                            torch_dtype=torch.bfloat16,
-                            device_map="auto",
-                            trust_remote_code=True
-                        )
-                    logger.info("[VOXTRAL] ✓ Modèle chargé avec VoxtralForConditionalGeneration")
-                    log_gpu_memory()
-                    return voxtral_model, voxtral_processor
-                    
-                except Exception as e2:
-                    logger.error(f"[VOXTRAL] ✗ Échec chargement direct: {e2}")
-            else:
-                logger.error(f"[VOXTRAL] ✗ Erreur modèle: {e}")
+            logger.error(f"[VOXTRAL] ✗ Erreur modèle: {e}")
             voxtral_processor = None
             return None, None
             
@@ -182,7 +207,7 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
 
 def load_diarizer() -> Optional[Pipeline]:
     """
-    Charge le pipeline de diarisation PyAnnote
+    Charge le pipeline de diarisation PyAnnote avec gestion des versions d'API
     """
     global diarizer
     
@@ -193,13 +218,30 @@ def load_diarizer() -> Optional[Pipeline]:
         logger.info(f"[DIARIZER] Chargement: {DIARIZATION_MODEL}")
         hf_token = os.getenv("HF_TOKEN")
         
-        if hf_token:
-            diarizer = Pipeline.from_pretrained(
-                DIARIZATION_MODEL,
-                token=hf_token
-            )
-        else:
-            diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
+        try:
+            # Première tentative avec use_auth_token (ancienne API)
+            if hf_token:
+                diarizer = Pipeline.from_pretrained(
+                    DIARIZATION_MODEL,
+                    use_auth_token=hf_token
+                )
+            else:
+                diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
+        except Exception as e1:
+            logger.warning(f"[DIARIZER] ⚠ use_auth_token échoué: {e1}")
+            try:
+                # Deuxième tentative avec token (nouvelle API)
+                if hf_token:
+                    diarizer = Pipeline.from_pretrained(
+                        DIARIZATION_MODEL,
+                        token=hf_token
+                    )
+                else:
+                    diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
+            except Exception as e2:
+                logger.warning(f"[DIARIZER] ⚠ token échoué: {e2}")
+                # Troisième tentative sans authentification
+                diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
             
         diarizer.to(torch.device(DEVICE))
         logger.info("[DIARIZER] ✓ Diarizer chargé avec succès")
@@ -236,7 +278,7 @@ def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
             audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
             sample_rate = 16000
         
-        # Préparation des inputs
+        # Préparation des inputs avec le processor
         logger.info("[VOXTRAL] Préparation des inputs...")
         inputs = processor(
             audio=audio,
@@ -250,7 +292,7 @@ def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
             logger.info("[VOXTRAL] Déplacement vers GPU...")
             inputs = {k: v.to("cuda") for k, v in inputs.items()}
         
-        # Génération
+        # Génération avec Voxtral
         logger.info("[VOXTRAL] Génération en cours...")
         with torch.no_grad():
             generated_ids = model.generate(
@@ -258,11 +300,11 @@ def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
                 max_new_tokens=max_tokens,
                 do_sample=False,
                 temperature=0.0,
-                pad_token_id=processor.tokenizer.eos_token_id
+                pad_token_id=processor.tokenizer.eos_token_id if hasattr(processor, 'tokenizer') else 2
             )
         
         logger.info("[VOXTRAL] Décodage...")
-        # Décodage
+        # Décodage de la transcription
         transcription = processor.batch_decode(
             generated_ids,
             skip_special_tokens=True
