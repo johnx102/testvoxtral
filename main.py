@@ -5,7 +5,7 @@ import os
 import time
 import tempfile
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import requests
 import numpy as np
@@ -22,8 +22,11 @@ DIARIZATION_MODEL = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization
 # knobs
 ENABLE_DIARIZATION_DEFAULT = os.getenv("ENABLE_DIARIZATION_DEFAULT", "1") == "1"
 DIARIZATION_DEVICE = os.getenv("DIARIZATION_DEVICE", "cuda")  # "cuda" or "cpu"
-DIARIZATION_BATCH_SIZE = int(os.getenv("DIARIZATION_BATCH_SIZE", "32"))  # pyannote speed/VRAM tradeoff
+DIARIZATION_BATCH_SIZE = int(os.getenv("DIARIZATION_BATCH_SIZE", "32"))
 DIARIZATION_SKIP_FOR_SEC_OVER = float(os.getenv("DIARIZATION_SKIP_FOR_SEC_OVER", "0"))  # 0 = never skip
+
+# NOTE: 2500 tokens can be VERY slow; default to 1200
+DEFAULT_MAX_NEW_TOKENS = int(os.getenv("DEFAULT_MAX_NEW_TOKENS", "1200"))
 
 _voxtral_model = None
 _voxtral_processor = None
@@ -61,6 +64,8 @@ def load_voxtral_model():
     # speed knobs
     try:
         torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     except Exception:
         pass
 
@@ -82,7 +87,6 @@ def load_voxtral_model():
 
 
 def _ensure_torchaudio_compat():
-    # pyannote.audio may call torchaudio.set_audio_backend on import.
     try:
         import torchaudio
         if not hasattr(torchaudio, "set_audio_backend"):
@@ -95,7 +99,6 @@ def _ensure_torchaudio_compat():
 
 
 def load_diarizer(hf_token: Optional[str] = None):
-    """Load diarizer once. Move it to GPU explicitly (pyannote is often CPU by default)."""
     global _diarizer
     if _diarizer is not None:
         return _diarizer
@@ -112,7 +115,6 @@ def load_diarizer(hf_token: Optional[str] = None):
     except TypeError:
         diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL, token=hf_token)
 
-    # Move to device for SPEED (this is the big one)
     device = torch.device("cuda") if (DIARIZATION_DEVICE == "cuda" and torch.cuda.is_available()) else torch.device("cpu")
     try:
         diarizer.to(device)
@@ -120,7 +122,6 @@ def load_diarizer(hf_token: Optional[str] = None):
     except Exception as e:
         LOG.warning(f"[DIARIZER] Impossible de déplacer sur {device}: {repr(e)}")
 
-    # Some versions accept batch_size on call, some via attribute
     try:
         diarizer.instantiate({"segmentation": {"batch_size": DIARIZATION_BATCH_SIZE}})
         LOG.info(f"[DIARIZER] batch_size segmentation = {DIARIZATION_BATCH_SIZE}")
@@ -152,7 +153,6 @@ def load_audio_mono(path: str):
 
 
 def _ensure_wav_16k(path: str) -> str:
-    """Return a path to a 16kHz mono wav. If conversion is needed, returns a temp file path."""
     audio, sr = load_audio_mono(path)
     if sr == 16000:
         return path
@@ -164,14 +164,26 @@ def _ensure_wav_16k(path: str) -> str:
     return tmp16
 
 
-def transcribe_with_voxtral(audio_path: str, language: str = "fr", max_new_tokens: int = 1200) -> str:
-    """Voxtral transcription. Note: large max_new_tokens can massively increase latency."""
+def _to_device(batch: Any, device: str):
+    """Move BatchEncoding/BatchFeature dict-like tensors to device."""
+    try:
+        import torch
+        if isinstance(batch, dict):
+            return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
+        # transformers BatchEncoding supports .to()
+        if hasattr(batch, "to"):
+            return batch.to(device)
+    except Exception:
+        pass
+    return batch
+
+
+def transcribe_with_voxtral(audio_path: str, language: str = "fr", max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS) -> str:
     model, processor = load_voxtral_model()
 
     t0 = time.time()
     audio_path_for_model = _ensure_wav_16k(audio_path)
 
-    # duration log
     audio, sr = load_audio_mono(audio_path_for_model)
     duration = len(audio) / float(sr)
     LOG.info(f"[VOXTRAL] Audio prêt: {duration:.1f}s @ {sr}Hz")
@@ -189,16 +201,32 @@ def transcribe_with_voxtral(audio_path: str, language: str = "fr", max_new_token
     ]
 
     LOG.info("[VOXTRAL] apply_chat_template...")
-    input_ids = processor.apply_chat_template(conversation, return_tensors="pt")
+    # Depending on versions, this returns either:
+    # - a tensor (input_ids)
+    # - or a BatchEncoding / dict with "input_ids"
+    applied = processor.apply_chat_template(conversation, return_tensors="pt")
 
     import torch
-    if torch.cuda.is_available():
-        input_ids = input_ids.to("cuda")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    generate_kwargs: Dict[str, Any] = {}
+    if isinstance(applied, torch.Tensor):
+        generate_kwargs["input_ids"] = applied.to(device)
+    elif isinstance(applied, dict) or hasattr(applied, "keys"):
+        # BatchEncoding behaves like dict
+        if "input_ids" in applied:
+            generate_kwargs["input_ids"] = applied["input_ids"].to(device)
+        else:
+            # pass everything as **inputs (some versions return input_features, attention_mask, etc.)
+            applied = _to_device(dict(applied), device)
+            generate_kwargs.update(applied)
+    else:
+        raise RuntimeError(f"apply_chat_template returned unsupported type: {type(applied)}")
 
     LOG.info(f"[VOXTRAL] generate (max_new_tokens={max_new_tokens})...")
     with torch.inference_mode():
         generated = model.generate(
-            input_ids,
+            **generate_kwargs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             temperature=None,
@@ -220,7 +248,6 @@ def transcribe_with_voxtral(audio_path: str, language: str = "fr", max_new_token
 
 
 def summarize_text(text: str) -> str:
-    # placeholder (keep cheap). You can swap later for an LLM call.
     if not text:
         return ""
     if len(text) <= 500:
@@ -234,8 +261,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     audio_url = inp.get("audio_url")
     language = inp.get("language", "fr")
 
-    # Important: 2500 tokens can be VERY slow; default to 1200 unless user insists
-    max_new_tokens = int(inp.get("max_new_tokens", 1200))
+    max_new_tokens = int(inp.get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS))
     with_summary = bool(inp.get("with_summary", False))
     diarization_enabled = bool(inp.get("diarization", task == "transcribe_diarized")) and ENABLE_DIARIZATION_DEFAULT
 
@@ -263,7 +289,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     LOG.info("[HANDLER] Diarization: start")
                     t_d = time.time()
                     diarizer = load_diarizer(hf_token=hf_token)
-                    diarized = diarizer(audio_path)  # heavy step
+                    diarized = diarizer(audio_path)
                     diarization_info = {
                         "rttm": diarized.to_rttm(),
                         "elapsed_sec": round(time.time() - t_d, 2),
