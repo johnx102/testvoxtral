@@ -70,12 +70,13 @@ def load_voxtral_model():
 
 
 def _ensure_torchaudio_compat():
+    # pyannote.audio may call torchaudio.set_audio_backend on import.
     try:
         import torchaudio
         if not hasattr(torchaudio, "set_audio_backend"):
-            def _noop_set_audio_backend(*args, **kwargs):
+            def _noop(*args, **kwargs):
                 return None
-            torchaudio.set_audio_backend = _noop_set_audio_backend
+            torchaudio.set_audio_backend = _noop
             LOG.info("[DIARIZER] Monkeypatch: torchaudio.set_audio_backend ajouté (no-op)")
     except Exception as e:
         LOG.warning(f"[DIARIZER] torchaudio non importable: {repr(e)}")
@@ -145,29 +146,31 @@ def transcribe_with_voxtral(audio_path: str, language: str = "fr", max_new_token
     ]
 
     LOG.info("[VOXTRAL] Préparation des inputs (apply_chat_template)...")
-    inputs = processor.apply_chat_template(
+    # IMPORTANT: do NOT pass add_generation_prompt (unsupported by MistralCommonTokenizer in your stack)
+    input_ids = processor.apply_chat_template(
         conversation,
-        add_generation_prompt=True,
-        return_tensors="pt"
+        return_tensors="pt",
     )
 
     import torch
     if torch.cuda.is_available():
-        inputs = inputs.to("cuda")
+        input_ids = input_ids.to("cuda")
 
     LOG.info(f"[VOXTRAL] Génération (max_new_tokens={max_new_tokens})...")
     with torch.inference_mode():
         generated = model.generate(
-            inputs,
+            input_ids,
             max_new_tokens=max_new_tokens,
-            do_sample=False
+            do_sample=False,
         )
 
     text = processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
+    if prompt in text:
+        text = text.split(prompt, 1)[-1].strip()
     return text
 
 
-def summarize_text(text: str, language: str = "fr") -> str:
+def summarize_text(text: str) -> str:
     if not text:
         return ""
     if len(text) <= 400:
@@ -222,7 +225,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 result["diarization"] = str(diarized)
 
         if with_summary:
-            result["summary"] = summarize_text(transcript, language=language)
+            result["summary"] = summarize_text(transcript)
 
         return result
 
