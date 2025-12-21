@@ -213,6 +213,10 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                 from transformers.models.voxtral import VoxtralForConditionalGeneration
                 
                 with timeout(MODEL_DOWNLOAD_TIMEOUT):
+                    # Ajout de logs détaillés pour le suivi du téléchargement
+                    logger.info("[VOXTRAL] Début du téléchargement/chargement du modèle (45GB)...")
+                    start_time = time.time()
+                    
                     if hf_token:
                         voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
                             VOXTRAL_MODEL,
@@ -221,7 +225,8 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                             device_map="auto",
                             low_cpu_mem_usage=True,
                             resume_download=True,
-                            force_download=False
+                            force_download=False,
+                            local_files_only=False  # Permettre le téléchargement si nécessaire
                         )
                     else:
                         voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
@@ -230,8 +235,12 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                             device_map="auto",
                             low_cpu_mem_usage=True,
                             resume_download=True,
-                            force_download=False
+                            force_download=False,
+                            local_files_only=False  # Permettre le téléchargement si nécessaire
                         )
+                    
+                    elapsed_time = time.time() - start_time
+                    logger.info(f"[VOXTRAL] ✓ Modèle chargé en {elapsed_time:.1f}s")
                 
                 logger.info("[VOXTRAL] ✓ VoxtralForConditionalGeneration chargé")
                 
@@ -243,6 +252,9 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                 
                 # Deuxième tentative: utilisation d'AutoModel avec trust_remote_code et timeout
                 try:
+                    logger.info("[VOXTRAL] Tentative de fallback avec AutoModelForCausalLM...")
+                    start_time_fallback = time.time()
+                    
                     with timeout(MODEL_DOWNLOAD_TIMEOUT):
                         if hf_token:
                             voxtral_model = AutoModelForCausalLM.from_pretrained(
@@ -253,7 +265,8 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                                 trust_remote_code=True,
                                 low_cpu_mem_usage=True,
                                 resume_download=True,
-                                force_download=False
+                                force_download=False,
+                                local_files_only=False
                             )
                         else:
                             voxtral_model = AutoModelForCausalLM.from_pretrained(
@@ -263,8 +276,12 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                                 trust_remote_code=True,
                                 low_cpu_mem_usage=True,
                                 resume_download=True,
-                                force_download=False
+                                force_download=False,
+                                local_files_only=False
                             )
+                    
+                    elapsed_time_fallback = time.time() - start_time_fallback
+                    logger.info(f"[VOXTRAL] ✓ AutoModel chargé en {elapsed_time_fallback:.1f}s")
                     
                     logger.info("[VOXTRAL] ✓ AutoModelForCausalLM avec trust_remote_code chargé")
                     
