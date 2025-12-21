@@ -167,12 +167,9 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                 
                 logger.info("[VOXTRAL] Chargement des composants individuels...")
                 
-                if hf_token:
-                    tokenizer = AutoTokenizer.from_pretrained(VOXTRAL_MODEL, token=hf_token)
-                    feature_extractor = AutoFeatureExtractor.from_pretrained(VOXTRAL_MODEL, token=hf_token)
-                else:
-                    tokenizer = AutoTokenizer.from_pretrained(VOXTRAL_MODEL)
-                    feature_extractor = AutoFeatureExtractor.from_pretrained(VOXTRAL_MODEL)
+                # Chargement simplifié des composants (auth gérée globalement)
+                tokenizer = AutoTokenizer.from_pretrained(VOXTRAL_MODEL)
+                feature_extractor = AutoFeatureExtractor.from_pretrained(VOXTRAL_MODEL)
                 
                 # Création manuelle d'un objet processor
                 class VoxtralProcessorManual:
@@ -246,27 +243,13 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                     logger.info("[VOXTRAL] Début du téléchargement/chargement du modèle (45GB)...")
                     start_time = time.time()
                     
-                    if hf_token:
-                        voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
-                            VOXTRAL_MODEL,
-                            token=hf_token,
-                            torch_dtype=torch.bfloat16,
-                            device_map="auto",
-                            low_cpu_mem_usage=True,
-                            resume_download=True,
-                            force_download=False,
-                            local_files_only=False  # Permettre le téléchargement si nécessaire
-                        )
-                    else:
-                        voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
-                            VOXTRAL_MODEL,
-                            torch_dtype=torch.bfloat16,
-                            device_map="auto",
-                            low_cpu_mem_usage=True,
-                            resume_download=True,
-                            force_download=False,
-                            local_files_only=False  # Permettre le téléchargement si nécessaire
-                        )
+                    # Chargement simplifié sans paramètres d'authentification explicites
+                    voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
+                        VOXTRAL_MODEL,
+                        torch_dtype=torch.bfloat16,
+                        device_map="auto",
+                        low_cpu_mem_usage=True
+                    )
                     
                     elapsed_time = time.time() - start_time
                     logger.info(f"[VOXTRAL] ✓ Modèle chargé en {elapsed_time:.1f}s")
@@ -285,29 +268,14 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                     start_time_fallback = time.time()
                     
                     with timeout(MODEL_DOWNLOAD_TIMEOUT):
-                        if hf_token:
-                            voxtral_model = AutoModelForCausalLM.from_pretrained(
-                                VOXTRAL_MODEL,
-                                token=hf_token,
-                                torch_dtype=torch.bfloat16,
-                                device_map="auto",
-                                trust_remote_code=True,
-                                low_cpu_mem_usage=True,
-                                resume_download=True,
-                                force_download=False,
-                                local_files_only=False
-                            )
-                        else:
-                            voxtral_model = AutoModelForCausalLM.from_pretrained(
-                                VOXTRAL_MODEL,
-                                torch_dtype=torch.bfloat16,
-                                device_map="auto",
-                                trust_remote_code=True,
-                                low_cpu_mem_usage=True,
-                                resume_download=True,
-                                force_download=False,
-                                local_files_only=False
-                            )
+                        # Chargement simplifié sans paramètres d'authentification explicites
+                        voxtral_model = AutoModelForCausalLM.from_pretrained(
+                            VOXTRAL_MODEL,
+                            torch_dtype=torch.bfloat16,
+                            device_map="auto",
+                            trust_remote_code=True,
+                            low_cpu_mem_usage=True
+                        )
                     
                     elapsed_time_fallback = time.time() - start_time_fallback
                     logger.info(f"[VOXTRAL] ✓ AutoModel chargé en {elapsed_time_fallback:.1f}s")
@@ -343,30 +311,26 @@ def load_diarizer() -> Optional[Pipeline]:
         logger.info(f"[DIARIZER] Chargement: {DIARIZATION_MODEL}")
         hf_token = os.getenv("HF_TOKEN")
         
+        # Approche simplifiée sans paramètres d'authentification explicites
+        # HuggingFace détectera automatiquement le token depuis l'environnement
         try:
-            # Première tentative avec token (nouvelle API)
-            if hf_token:
-                diarizer = Pipeline.from_pretrained(
-                    DIARIZATION_MODEL,
-                    token=hf_token
-                )
-            else:
-                diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
-        except Exception as e1:
-            logger.warning(f"[DIARIZER] ⚠ token échoué: {e1}")
+            diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
+            logger.info("[DIARIZER] ✓ Chargé sans paramètres explicites")
+        except Exception as e:
+            logger.warning(f"[DIARIZER] ⚠ Échec chargement standard: {e}")
+            # Fallback: essayer avec use_auth_token si la version le supporte encore
             try:
-                # Deuxième tentative avec use_auth_token (ancienne API)
                 if hf_token:
                     diarizer = Pipeline.from_pretrained(
                         DIARIZATION_MODEL,
                         use_auth_token=hf_token
                     )
+                    logger.info("[DIARIZER] ✓ Chargé avec use_auth_token")
                 else:
-                    diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
+                    raise Exception("Aucun token disponible pour l'authentification")
             except Exception as e2:
-                logger.warning(f"[DIARIZER] ⚠ use_auth_token échoué: {e2}")
-                # Troisième tentative sans authentification
-                diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
+                logger.error(f"[DIARIZER] ✗ Toutes les méthodes d'auth ont échoué: {e2}")
+                return None
             
         diarizer.to(torch.device(DEVICE))
         logger.info("[DIARIZER] ✓ Diarizer chargé avec succès")
@@ -674,6 +638,18 @@ def initialize_models():
     """
     try:
         logger.info("[INIT] Pré-chargement des modèles...")
+        
+        # Configuration globale du token HuggingFace
+        hf_token = os.getenv("HF_TOKEN")
+        if hf_token:
+            # Configurer l'authentification HuggingFace globalement
+            from huggingface_hub import login
+            try:
+                login(token=hf_token, add_to_git_credential=False)
+                logger.info("[INIT] ✓ Authentification HuggingFace configurée")
+            except Exception as e:
+                logger.warning(f"[INIT] ⚠ Échec configuration auth HF: {e}")
+        
         log_gpu_memory()
         
         # Pré-chargement Voxtral
