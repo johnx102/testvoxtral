@@ -1,136 +1,66 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+RunPod Serverless - Voxtral + (optional) PyAnnote diarization
+- Loads Voxtral once at startup (cached by HF)
+- Accepts jobs with: {audio_url, language, max_new_tokens, task, with_summary}
+Tasks:
+- transcribe: transcription simple
+- transcribe_diarized: diarization (if available) + transcription (still global transcript for now)
+Notes:
+- VoxtralProcessor expects BOTH text and audio. If you only pass input_ids, the model won't condition on audio.
+- For generation, we decode only the generated continuation (exclude the prompt tokens).
+"""
+
 import os
+import io
 import time
+import json
 import tempfile
 import logging
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple
 
 import requests
-import numpy as np
-import soundfile as sf
-import librosa
+
+# RunPod
 import runpod
 
-LOG = logging.getLogger("serverless")
+# Audio I/O
+import soundfile as sf
+import numpy as np
+import torch
+
+LOG = logging.getLogger("voxtral_worker")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-VOXTRAL_REPO = os.getenv("VOXTRAL_REPO", "mistralai/Voxtral-Small-24B-2507")
-DIARIZATION_MODEL = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
+# --------- Global models (loaded once) ----------
+VOXTRAL_MODEL_ID = os.getenv("VOXTRAL_MODEL_ID", "mistralai/Voxtral-Small-24B-2507")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# knobs
-ENABLE_DIARIZATION_DEFAULT = os.getenv("ENABLE_DIARIZATION_DEFAULT", "1") == "1"
-DIARIZATION_DEVICE = os.getenv("DIARIZATION_DEVICE", "cuda")  # "cuda" or "cpu"
-DIARIZATION_BATCH_SIZE = int(os.getenv("DIARIZATION_BATCH_SIZE", "32"))
-DIARIZATION_SKIP_FOR_SEC_OVER = float(os.getenv("DIARIZATION_SKIP_FOR_SEC_OVER", "0"))  # 0 = never skip
+# Enable TF32 for speed (safe for transcription workloads)
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
-# NOTE: 2500 tokens can be VERY slow; default to 1200
-DEFAULT_MAX_NEW_TOKENS = int(os.getenv("DEFAULT_MAX_NEW_TOKENS", "1200"))
-
-_voxtral_model = None
-_voxtral_processor = None
-_diarizer = None
+processor = None
+model = None
+diarizer = None
 
 
-def _gpu_mem_log(tag: str = "GPU"):
-    try:
-        import torch
-        if torch.cuda.is_available():
-            free, total = torch.cuda.mem_get_info()
-            LOG.info(f"[{tag}] Free: {free/1024**3:.1f}GB / Total: {total/1024**3:.1f}GB")
-    except Exception:
-        pass
+def gpu_mem_log(prefix: str = "[GPU]") -> None:
+    if not torch.cuda.is_available():
+        return
+    free, total = torch.cuda.mem_get_info()
+    LOG.info(f"{prefix} Free: {free/1024**3:.1f}GB / Total: {total/1024**3:.1f}GB")
 
 
-def configure_hf_auth():
-    if os.getenv("HF_TOKEN"):
-        LOG.info("[INIT] ✓ HF_TOKEN présent (auth HuggingFace OK)")
+def ensure_hf_token_present() -> None:
+    # On RunPod, you usually inject HF_TOKEN in environment variables.
+    if not os.getenv("HF_TOKEN"):
+        LOG.warning("[INIT] ⚠ HF_TOKEN absent. Si le modèle est privé, le chargement échouera.")
     else:
-        LOG.warning("[INIT] ⚠ HF_TOKEN absent (modèles gated = échec possible)")
-
-
-def load_voxtral_model():
-    global _voxtral_model, _voxtral_processor
-    if _voxtral_model is not None and _voxtral_processor is not None:
-        return _voxtral_model, _voxtral_processor
-
-    LOG.info(f"[VOXTRAL] Chargement du modèle: {VOXTRAL_REPO}")
-    t0 = time.time()
-
-    from transformers import AutoProcessor, VoxtralForConditionalGeneration
-    import torch
-
-    # speed knobs
-    try:
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    except Exception:
-        pass
-
-    LOG.info("[VOXTRAL] Chargement du processor (AutoProcessor)...")
-    processor = AutoProcessor.from_pretrained(VOXTRAL_REPO)
-
-    LOG.info("[VOXTRAL] Chargement du modèle (VoxtralForConditionalGeneration)...")
-    model = VoxtralForConditionalGeneration.from_pretrained(
-        VOXTRAL_REPO,
-        device_map="cuda" if torch.cuda.is_available() else "cpu",
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
-    )
-    model.eval()
-
-    _voxtral_model, _voxtral_processor = model, processor
-    LOG.info(f"[VOXTRAL] ✓ Modèle chargé ({time.time()-t0:.1f}s)")
-    _gpu_mem_log("GPU")
-    return model, processor
-
-
-def _ensure_torchaudio_compat():
-    try:
-        import torchaudio
-        if not hasattr(torchaudio, "set_audio_backend"):
-            def _noop(*args, **kwargs):
-                return None
-            torchaudio.set_audio_backend = _noop
-            LOG.info("[DIARIZER] Monkeypatch: torchaudio.set_audio_backend ajouté (no-op)")
-    except Exception as e:
-        LOG.warning(f"[DIARIZER] torchaudio non importable: {repr(e)}")
-
-
-def load_diarizer(hf_token: Optional[str] = None):
-    global _diarizer
-    if _diarizer is not None:
-        return _diarizer
-
-    LOG.info(f"[DIARIZER] Chargement: {DIARIZATION_MODEL}")
-    _ensure_torchaudio_compat()
-
-    from pyannote.audio import Pipeline
-    import torch
-
-    t0 = time.time()
-    try:
-        diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL, use_auth_token=hf_token)
-    except TypeError:
-        diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL, token=hf_token)
-
-    device = torch.device("cuda") if (DIARIZATION_DEVICE == "cuda" and torch.cuda.is_available()) else torch.device("cpu")
-    try:
-        diarizer.to(device)
-        LOG.info(f"[DIARIZER] Pipeline déplacée sur {device}")
-    except Exception as e:
-        LOG.warning(f"[DIARIZER] Impossible de déplacer sur {device}: {repr(e)}")
-
-    try:
-        diarizer.instantiate({"segmentation": {"batch_size": DIARIZATION_BATCH_SIZE}})
-        LOG.info(f"[DIARIZER] batch_size segmentation = {DIARIZATION_BATCH_SIZE}")
-    except Exception:
-        pass
-
-    _diarizer = diarizer
-    LOG.info(f"[DIARIZER] ✓ Diarizer chargé ({time.time()-t0:.1f}s)")
-    return diarizer
+        LOG.info("[INIT] ✓ HF_TOKEN présent (auth HuggingFace OK)")
 
 
 def download_audio(audio_url: str, timeout: int = 120) -> str:
@@ -145,177 +75,208 @@ def download_audio(audio_url: str, timeout: int = 120) -> str:
     return path
 
 
-def load_audio_mono(path: str):
-    audio, sr = sf.read(path, dtype="float32", always_2d=False)
-    if audio.ndim > 1:
-        audio = np.mean(audio, axis=1)
-    return audio, sr
+def load_audio_mono_16k(path: str) -> Tuple[np.ndarray, int]:
+    """Return mono float32 waveform and sampling rate 16000."""
+    wav, sr = sf.read(path, always_2d=False)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    wav = wav.astype(np.float32)
+
+    if sr != 16000:
+        LOG.info(f"[AUDIO] Resampling {sr}Hz -> 16000Hz")
+        # fast CPU resample (librosa is heavier). Use scipy if available, else simple polyphase via torchaudio.
+        try:
+            import torchaudio
+            t = torch.from_numpy(wav).unsqueeze(0)
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
+            wav16 = resampler(t).squeeze(0).cpu().numpy().astype(np.float32)
+            return wav16, 16000
+        except Exception:
+            # fallback: linear interpolation
+            duration = wav.shape[0] / sr
+            t_old = np.linspace(0.0, duration, num=wav.shape[0], endpoint=False)
+            t_new = np.linspace(0.0, duration, num=int(duration * 16000), endpoint=False)
+            wav16 = np.interp(t_new, t_old, wav).astype(np.float32)
+            return wav16, 16000
+
+    return wav, sr
 
 
-def _ensure_wav_16k(path: str) -> str:
-    audio, sr = load_audio_mono(path)
-    if sr == 16000:
-        return path
-    LOG.info(f"[AUDIO] Resampling {sr}Hz -> 16000Hz")
-    audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-    fd, tmp16 = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    sf.write(tmp16, audio, 16000)
-    return tmp16
+def load_voxtral() -> None:
+    global processor, model
+    if processor is not None and model is not None:
+        return
 
+    from transformers import AutoProcessor, VoxtralForConditionalGeneration
 
-def _to_device(batch: Any, device: str):
-    """Move BatchEncoding/BatchFeature dict-like tensors to device."""
-    try:
-        import torch
-        if isinstance(batch, dict):
-            return {k: (v.to(device) if hasattr(v, "to") else v) for k, v in batch.items()}
-        # transformers BatchEncoding supports .to()
-        if hasattr(batch, "to"):
-            return batch.to(device)
-    except Exception:
-        pass
-    return batch
+    LOG.info(f"[VOXTRAL] Chargement du modèle: {VOXTRAL_MODEL_ID}")
+    LOG.info("[VOXTRAL] Chargement du processor (AutoProcessor)...")
+    processor = AutoProcessor.from_pretrained(VOXTRAL_MODEL_ID, trust_remote_code=True)
 
-
-def transcribe_with_voxtral(audio_path: str, language: str = "fr", max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS) -> str:
-    model, processor = load_voxtral_model()
-
+    LOG.info("[VOXTRAL] Chargement du modèle (VoxtralForConditionalGeneration)...")
     t0 = time.time()
-    audio_path_for_model = _ensure_wav_16k(audio_path)
 
-    audio, sr = load_audio_mono(audio_path_for_model)
-    duration = len(audio) / float(sr)
-    LOG.info(f"[VOXTRAL] Audio prêt: {duration:.1f}s @ {sr}Hz")
+    # Use device_map="auto" to spread on GPU (and maybe CPU) without OOM.
+    # torch_dtype bfloat16 is good on A100/H100; fallback float16.
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    model = VoxtralForConditionalGeneration.from_pretrained(
+        VOXTRAL_MODEL_ID,
+        torch_dtype=dtype,
+        device_map="auto" if torch.cuda.is_available() else None,
+        trust_remote_code=True,
+    )
+    model.eval()
+    LOG.info(f"[VOXTRAL] ✓ Modèle chargé ({time.time()-t0:.1f}s)")
+    gpu_mem_log()
 
-    prompt = (
-        f"Transcris fidèlement cet enregistrement audio en {language}. "
-        "Ne rajoute rien. Retourne uniquement le texte."
+
+def load_diarizer() -> None:
+    global diarizer
+    if diarizer is not None:
+        return
+    LOG.info("[DIARIZER] Chargement: pyannote/speaker-diarization-3.1")
+    from pyannote.audio import Pipeline
+
+    # Newer pyannote uses "use_auth_token"
+    hf_token = os.getenv("HF_TOKEN")
+    diarizer = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+    if torch.cuda.is_available():
+        diarizer.to(torch.device("cuda"))
+        LOG.info("[DIARIZER] Pipeline déplacée sur cuda")
+    LOG.info("[DIARIZER] ✓ Diarizer chargé")
+
+
+def perform_diarization(audio_path: str) -> Tuple[str, float]:
+    """Return RTTM string and elapsed seconds."""
+    if diarizer is None:
+        raise RuntimeError("Diarizer non chargé")
+    t0 = time.time()
+    diar = diarizer(audio_path)
+    rttm_buf = io.StringIO()
+    diar.write_rttm(rttm_buf)
+    return rttm_buf.getvalue(), time.time() - t0
+
+
+def transcribe_with_voxtral(audio_path: str, language: str = "fr", max_new_tokens: int = 1800) -> str:
+    """
+    Correct Voxtral usage:
+    - Build an instruction text (not chat-template dependent)
+    - Call processor(text=..., audio=..., sampling_rate=16000, return_tensors="pt")
+    - Generate
+    - Decode ONLY continuation tokens (exclude prompt tokens)
+    """
+    load_voxtral()
+
+    wav, sr = load_audio_mono_16k(audio_path)
+    LOG.info(f"[VOXTRAL] Audio prêt: {wav.shape[0]/sr:.1f}s @ {sr}Hz")
+
+    # Instruction: keep it simple and stable across tokenizer versions
+    if language.lower().startswith("fr"):
+        prompt = "Transcris fidèlement cet audio en français. Réponds uniquement avec la transcription."
+    else:
+        prompt = f"Transcribe this audio in {language}. Reply with the transcription only."
+
+    LOG.info("[VOXTRAL] Préparation des inputs (processor(text, audio))...")
+    inputs = processor(
+        text=prompt,
+        audio=wav,
+        sampling_rate=sr,
+        return_tensors="pt",
     )
 
-    conversation = [
-        {"role": "user", "content": [
-            {"type": "audio", "path": audio_path_for_model},
-            {"type": "text", "text": prompt},
-        ]}
-    ]
+    # Move tensors to GPU/device_map aware placement:
+    # If model is sharded via device_map, keeping inputs on CUDA is fine.
+    for k, v in list(inputs.items()):
+        if isinstance(v, torch.Tensor):
+            inputs[k] = v.to(DEVICE)
 
-    LOG.info("[VOXTRAL] apply_chat_template...")
-    # Depending on versions, this returns either:
-    # - a tensor (input_ids)
-    # - or a BatchEncoding / dict with "input_ids"
-    applied = processor.apply_chat_template(conversation, return_tensors="pt")
-
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    generate_kwargs: Dict[str, Any] = {}
-    if isinstance(applied, torch.Tensor):
-        generate_kwargs["input_ids"] = applied.to(device)
-    elif isinstance(applied, dict) or hasattr(applied, "keys"):
-        # BatchEncoding behaves like dict
-        if "input_ids" in applied:
-            generate_kwargs["input_ids"] = applied["input_ids"].to(device)
-        else:
-            # pass everything as **inputs (some versions return input_features, attention_mask, etc.)
-            applied = _to_device(dict(applied), device)
-            generate_kwargs.update(applied)
-    else:
-        raise RuntimeError(f"apply_chat_template returned unsupported type: {type(applied)}")
+    # Determine prompt length for slicing
+    prompt_len = inputs["input_ids"].shape[1] if "input_ids" in inputs else None
 
     LOG.info(f"[VOXTRAL] generate (max_new_tokens={max_new_tokens})...")
+    t0 = time.time()
     with torch.inference_mode():
         generated = model.generate(
-            **generate_kwargs,
-            max_new_tokens=max_new_tokens,
+            **inputs,
+            max_new_tokens=int(max_new_tokens),
             do_sample=False,
             temperature=None,
             top_p=None,
         )
 
-    text = processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
-    if prompt in text:
-        text = text.split(prompt, 1)[-1].strip()
+    # Slice generated tokens to remove prompt tokens (critical!)
+    if prompt_len is not None and generated.shape[1] > prompt_len:
+        gen_only = generated[:, prompt_len:]
+    else:
+        gen_only = generated
 
-    if audio_path_for_model != audio_path:
-        try:
-            os.remove(audio_path_for_model)
-        except Exception:
-            pass
+    text_out = processor.batch_decode(gen_only, skip_special_tokens=True)[0].strip()
+    elapsed = time.time() - t0
+    LOG.info(f"[VOXTRAL] ✓ Transcription terminée ({elapsed:.1f}s, {len(text_out)} chars)")
 
-    LOG.info(f"[VOXTRAL] ✓ Transcription terminée ({time.time()-t0:.1f}s, {len(text)} chars)")
-    return text
-
-
-def summarize_text(text: str) -> str:
-    if not text:
-        return ""
-    if len(text) <= 500:
-        return text
-    return text[:500].rstrip() + "…"
+    # Basic cleanup: remove weird empty lines
+    text_out = "\n".join([line.rstrip() for line in text_out.splitlines()]).strip()
+    return text_out
 
 
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    RunPod job format:
+      {"input": {"audio_url": "...", "language": "fr", "max_new_tokens": 2500, "task": "transcribe_diarized", "with_summary": true}}
+    """
+    t0 = time.time()
     inp = job.get("input", {}) or {}
-    task = inp.get("task", "transcribe")
+
     audio_url = inp.get("audio_url")
-    language = inp.get("language", "fr")
-
-    max_new_tokens = int(inp.get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS))
-    with_summary = bool(inp.get("with_summary", False))
-    diarization_enabled = bool(inp.get("diarization", task == "transcribe_diarized")) and ENABLE_DIARIZATION_DEFAULT
-
-    LOG.info(f"[HANDLER] Tâche: {task}, diarization={diarization_enabled}, langue: {language}, tokens: {max_new_tokens}")
-
     if not audio_url:
-        return {"error": "audio_url manquant"}
+        return {"error": "Missing audio_url"}
+
+    language = inp.get("language", "fr")
+    task = inp.get("task", "transcribe")
+    max_new_tokens = int(inp.get("max_new_tokens", 1800))
+    want_diar = (task == "transcribe_diarized") and bool(inp.get("diarization", True))
+    with_summary = bool(inp.get("with_summary", False))
+
+    LOG.info(f"[HANDLER] Tâche: {task}, diarization={want_diar}, langue: {language}, tokens: {max_new_tokens}")
 
     audio_path = None
-    t_job = time.time()
+    diar_rttm = None
+    diar_elapsed = None
     try:
         audio_path = download_audio(audio_url)
-        audio, sr = load_audio_mono(audio_path)
-        duration = len(audio) / float(sr)
-        LOG.info(f"[HANDLER] Durée audio: {duration:.1f}s")
+        wav, sr = sf.read(audio_path, always_2d=False)
+        duration_sec = (wav.shape[0] / sr) if hasattr(wav, "shape") else None
+        LOG.info(f"[HANDLER] Durée audio: {duration_sec:.1f}s" if duration_sec else "[HANDLER] Durée audio: ?")
 
-        hf_token = os.getenv("HF_TOKEN")
-
-        diarization_info = None
-        if diarization_enabled:
-            if DIARIZATION_SKIP_FOR_SEC_OVER and duration > DIARIZATION_SKIP_FOR_SEC_OVER:
-                LOG.warning(f"[HANDLER] Diarization skip: durée {duration:.1f}s > {DIARIZATION_SKIP_FOR_SEC_OVER}s")
-            else:
-                try:
-                    LOG.info("[HANDLER] Diarization: start")
-                    t_d = time.time()
-                    diarizer = load_diarizer(hf_token=hf_token)
-                    diarized = diarizer(audio_path)
-                    diarization_info = {
-                        "rttm": diarized.to_rttm(),
-                        "elapsed_sec": round(time.time() - t_d, 2),
-                    }
-                    LOG.info(f"[HANDLER] Diarization: done ({diarization_info['elapsed_sec']}s)")
-                except Exception as e:
-                    LOG.warning(f"[HANDLER] Diarization indisponible -> fallback transcription simple: {repr(e)}")
+        if want_diar:
+            try:
+                load_diarizer()
+                LOG.info("[HANDLER] Diarization: start")
+                diar_rttm, diar_elapsed = perform_diarization(audio_path)
+                LOG.info(f"[HANDLER] Diarization: done ({diar_elapsed:.2f}s)")
+            except Exception as e:
+                LOG.warning(f"[HANDLER] Diarization indisponible -> fallback transcription simple: {e}")
+                diar_rttm, diar_elapsed = None, None
 
         transcript = transcribe_with_voxtral(audio_path, language=language, max_new_tokens=max_new_tokens)
 
         result: Dict[str, Any] = {
             "task": task,
             "language": language,
-            "duration_sec": duration,
+            "duration_sec": float(duration_sec) if duration_sec else None,
+            "elapsed_sec": round(time.time() - t0, 2),
+            "diarization_rttm": diar_rttm,
+            "diarization_elapsed_sec": diar_elapsed,
             "transcript": transcript,
-            "elapsed_sec": round(time.time() - t_job, 2),
         }
 
-        if diarization_info:
-            result["diarization_rttm"] = diarization_info["rttm"]
-            result["diarization_elapsed_sec"] = diarization_info["elapsed_sec"]
-
         if with_summary:
-            result["summary"] = summarize_text(transcript)
+            # Simple summary: do it on CPU with a lightweight heuristic to avoid extra model calls.
+            # (You can later plug an LLM summarizer if desired.)
+            # Here: first 600 chars as "preview"
+            preview = transcript.replace("\n", " ").strip()
+            result["summary"] = preview[:600] + ("…" if len(preview) > 600 else "")
 
-        LOG.info(f"[HANDLER] ✓ Job terminé ({result['elapsed_sec']}s)")
         return result
 
     except Exception as e:
@@ -330,26 +291,26 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 pass
 
 
-def _preload():
+def preload() -> None:
     LOG.info("[INIT] Pré-chargement des modèles...")
-    configure_hf_auth()
-    _gpu_mem_log("GPU")
-
+    ensure_hf_token_present()
+    gpu_mem_log()
     try:
-        load_voxtral_model()
+        load_voxtral()
         LOG.info("[INIT] ✓ Voxtral pré-chargé")
-    except Exception as e:
-        LOG.warning(f"[INIT] ⚠ Échec pré-chargement Voxtral: {repr(e)}")
+    except Exception:
+        LOG.exception("[INIT] ⚠ Échec pré-chargement Voxtral")
 
-    try:
-        load_diarizer(hf_token=os.getenv("HF_TOKEN"))
-        LOG.info("[INIT] ✓ Diarizer pré-chargé")
-    except Exception as e:
-        LOG.warning(f"[INIT] ⚠ Échec pré-chargement Diarizer: {repr(e)}")
+    # Diarizer is optional; preload only if user wants it most of the time
+    if os.getenv("PRELOAD_DIARIZER", "1") == "1":
+        try:
+            load_diarizer()
+            LOG.info("[INIT] ✓ Diarizer pré-chargé")
+        except Exception as e:
+            LOG.warning(f"[INIT] ⚠ Échec pré-chargement Diarizer: {e}")
 
     LOG.info("[INIT] ✓ Initialisation terminée")
 
 
-if __name__ == "__main__":
-    _preload()
-    runpod.serverless.start({"handler": handler})
+preload()
+runpod.serverless.start({"handler": handler})
