@@ -1,41 +1,26 @@
-# ====================================================================
-# IMPORTANT: torch, torchaudio, torchvision sont installés dans le Dockerfile
-# Ne PAS les inclure ici pour éviter les conflits de version CUDA
-# ====================================================================
-
-# Transformers - version stable avec support Voxtral (>= 4.54.0)
-transformers==4.56.1
-
-# Tokenizer / processor Voxtral
-mistral-common[audio]==1.8.6
-
-# HuggingFace et ML core
-accelerate==0.34.2
+# Core
 huggingface_hub==0.26.2
 safetensors==0.4.5
+accelerate==0.34.2
 sentencepiece==0.2.0
-
-# Audio processing
-numpy>=1.26.0,<2.0.0
-scipy==1.12.0
+requests==2.32.0
+numpy==1.26.4
+scipy==1.10.0
 soundfile==0.12.1
-librosa==0.10.2
+librosa==0.10.2.post1
 pydub==0.25.1
 
-# PyAnnote pour diarization
-matplotlib==3.8.2
-pyannote.audio==3.3.2
-pyannote.core>=5.0.0
-pyannote.database>=5.1.0
-pyannote.pipeline>=3.0.1
-pytorch-lightning>=2.0.1
-pytorch-metric-learning>=2.3.0
-rich>=13.3.3
+# Transformers + Voxtral
+transformers==4.56.1
+mistral-common[audio]==1.8.6
 
-# Speechbrain (certaines pipelines pyannote l'utilisent)
-speechbrain==1.0.0
+# PyTorch CUDA (keep torchaudio <2.2 for pyannote.audio 3.1.x)
+# NOTE: for Docker we install from PyTorch cu121 index.
+# torch==2.1.2+cu121
+# torchaudio==2.1.2+cu121
 
-# API et utils
-requests==2.31.0
+# Diarization
+pyannote.audio==3.1.1
+
+# RunPod
 runpod==1.7.0
-psutil==5.9.8

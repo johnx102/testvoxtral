@@ -242,74 +242,65 @@ def load_diarizer() -> Optional[Any]:
         diarizer = None
         return None
 
-def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
-    """
-    Transcrit un fichier audio avec Voxtral
+def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500, language: str = "fr") -> str:
+    """Transcrit un fichier audio avec Voxtral.
+
+    Voxtral est un modèle *audio+texte -> texte* : il faut fournir un prompt texte,
+    même pour une simple transcription. On passe donc une instruction courte et on
+    injecte l'audio via `processor.apply_chat_template(...)`.
     """
     try:
         logger.info(f"[VOXTRAL] Début transcription: {audio_path}")
         model, processor = load_voxtral_model()
         if model is None or processor is None:
             raise Exception("Impossible de charger Voxtral")
-        
-        logger.info(f"[VOXTRAL] Transcription (max_tokens={max_tokens})")
-        
-        # Chargement de l'audio
-        logger.info("[VOXTRAL] Lecture du fichier audio...")
-        audio, sample_rate = sf.read(audio_path)
-        logger.info(f"[VOXTRAL] Audio: {len(audio)} samples @ {sample_rate}Hz")
-        
-        if len(audio.shape) > 1:
-            audio = audio.mean(axis=1)
-            logger.info("[VOXTRAL] Audio converti en mono")
-        
-        # Conversion au sample rate attendu (16kHz)
-        if sample_rate != 16000:
-            logger.info(f"[VOXTRAL] Resampling {sample_rate}Hz -> 16000Hz")
-            audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
-            sample_rate = 16000
-        
-        # Préparation des inputs avec le processor
-        logger.info("[VOXTRAL] Préparation des inputs...")
-        inputs = processor(
-            audio=audio,
-            sampling_rate=sample_rate,
-            return_tensors="pt"
-        )
-        logger.info(f"[VOXTRAL] Inputs préparés: {list(inputs.keys())}")
-        
-        # Déplacement vers GPU si disponible
+
+        # Prompt minimal (adapte la langue si fournie)
+        lang = (language or "fr").strip().lower()
+        if lang in ("fr", "fra", "french", "français", "francais"):
+            prompt = "Transcris fidèlement cet audio en français. N'ajoute rien."
+        elif lang in ("en", "eng", "english"):
+            prompt = "Transcribe this audio accurately in English. Do not add anything."
+        else:
+            prompt = f"Transcribe this audio accurately. Use language: {language}. Do not add anything."
+
+        # Voxtral attend une conversation (audio + instruction texte)
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "path": audio_path},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+
+        logger.info("[VOXTRAL] Préparation des inputs (apply_chat_template)...")
+        inputs = processor.apply_chat_template(conversation)
+
+        # Move to GPU + dtype
         if DEVICE == "cuda":
-            logger.info("[VOXTRAL] Déplacement vers GPU...")
-            inputs = {k: v.to("cuda") if hasattr(v, 'to') else v for k, v in inputs.items()}
-        
-        # Génération avec Voxtral
+            inputs = inputs.to("cuda", dtype=torch.bfloat16)
+        else:
+            inputs = inputs.to(DEVICE)
+
         logger.info("[VOXTRAL] Génération en cours...")
         with torch.no_grad():
-            generated_ids = model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                do_sample=False
-            )
-        
-        logger.info("[VOXTRAL] Décodage...")
-        transcription = processor.batch_decode(
-            generated_ids,
+            outputs = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False)
+
+        # On enlève le prompt d'entrée pour ne garder que la réponse générée
+        decoded = processor.batch_decode(
+            outputs[:, inputs.input_ids.shape[1]:],
             skip_special_tokens=True
-        )[0]
-        
-        logger.info(f"[VOXTRAL] ✓ Transcription terminée ({len(transcription)} caractères)")
-        if len(transcription) > 100:
-            logger.info(f"[VOXTRAL] Aperçu: {transcription[:100]}...")
-        return transcription.strip()
-        
+        )[0].strip()
+
+        logger.info(f"[VOXTRAL] ✓ Transcription générée ({len(decoded)} caractères)")
+        return decoded
+
     except Exception as e:
         logger.error(f"[VOXTRAL] ✗ Erreur transcription: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception(e)
         return ""
-
-
 def perform_diarization(audio_path: str) -> List[Dict]:
     """
     Effectue la diarisation sur un fichier audio
@@ -472,7 +463,7 @@ def process_audio_request(job_input: Dict[str, Any]) -> Dict[str, Any]:
                         )
                         if segment_path:
                             temp_files.append(segment_path)
-                            segment_text = transcribe_with_voxtral(segment_path, 500)
+                            segment_text = transcribe_with_voxtral(segment_path, 500, language)
                             
                             transcriptions.append({
                                 "speaker": segment["speaker"],
@@ -485,10 +476,10 @@ def process_audio_request(job_input: Dict[str, Any]) -> Dict[str, Any]:
                     full_transcription = " ".join(t["text"] for t in transcriptions if t["text"])
                 else:
                     logger.info("[HANDLER] Fallback: transcription simple")
-                    full_transcription = transcribe_with_voxtral(audio_path, max_tokens)
+                    full_transcription = transcribe_with_voxtral(audio_path, max_tokens, language)
                     result["transcriptions"] = [{"speaker": "UNKNOWN", "text": full_transcription}]
             else:
-                full_transcription = transcribe_with_voxtral(audio_path, max_tokens)
+                full_transcription = transcribe_with_voxtral(audio_path, max_tokens, language)
                 result["transcription"] = full_transcription
             
             # Ajout du résumé si demandé
