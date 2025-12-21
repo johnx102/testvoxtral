@@ -32,16 +32,16 @@ RUN pip install git+https://github.com/m-bain/whisperx.git
 
 # Dépendances supplémentaires
 RUN pip install \
-    runpod>=1.6.2 \
-    requests>=2.31.0 \
-    soundfile>=0.12.1 \
-    numpy>=1.24.0,<2.0.0
+    "runpod>=1.6.2" \
+    "requests>=2.31.0" \
+    "soundfile>=0.12.1" \
+    "numpy>=1.24.0,<2.0.0"
 
 # Pour le résumé - modèle léger
 RUN pip install \
-    transformers>=4.36.0 \
-    sentencepiece>=0.1.99 \
-    accelerate>=0.25.0
+    "transformers>=4.36.0" \
+    "sentencepiece>=0.1.99" \
+    "accelerate>=0.25.0"
 
 # Forcer numpy < 2.0
 RUN pip install "numpy>=1.24.0,<2.0.0" --force-reinstall
