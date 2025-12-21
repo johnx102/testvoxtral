@@ -55,13 +55,14 @@ RUN pip install --no-cache-dir \
     safetensors==0.4.5 \
     accelerate==0.34.2 \
     sentencepiece==0.2.0 \
-    tokenizers==0.20.3
 
 # TRANSFORMERS DEPUIS GITHUB - Version dev avec support Voxtral
-RUN pip install --no-cache-dir git+https://github.com/huggingface/transformers.git
+# Transformers (Voxtral support >= 4.54.0)
+RUN pip install --no-cache-dir "transformers==4.56.1"
 
 # Mistral tokenizer (requis pour Voxtral) - version stable
-RUN pip install --no-cache-dir mistral-common==1.5.1
+# Mistral tokenizer (requis pour Voxtral) - version récente
+RUN pip install --no-cache-dir --upgrade "mistral-common[audio]==1.8.6"
 
 # Matplotlib (requis par pyannote.audio)
 RUN pip install --no-cache-dir matplotlib==3.8.2
@@ -92,6 +93,7 @@ RUN pip install --no-cache-dir "numpy>=1.26.0,<2.0.0" --force-reinstall
 RUN python -c "import numpy; print(f'NumPy version: {numpy.__version__}')" && \
     python -c "import torch; print(f'PyTorch version: {torch.__version__}')" && \
     python -c "import transformers; print(f'Transformers version: {transformers.__version__}')" && \
+    python -c "import mistral_common; print(f'mistral-common version: {mistral_common.__version__}')" && \
     python -c "from transformers import VoxtralForConditionalGeneration; print('VoxtralForConditionalGeneration: OK')" && \
     python -c "import pyannote.audio; print(f'PyAnnote version: {pyannote.audio.__version__}')"
 
