@@ -33,13 +33,13 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # App et scripts
 COPY main.py /app/main.py
-COPY warm_cache.py /app/warm_cache.py
+COPY diagnostic.py /app/diagnostic.py
 
 # Pré-chargement du modèle Voxtral pendant la construction (optionnel)
 # Uncomment et set HF_TOKEN pour pré-charger le modèle dans l'image
 # ARG HF_TOKEN
 # RUN if [ -n "$HF_TOKEN" ]; then \
-#     HF_TOKEN=$HF_TOKEN python warm_cache.py; \
+#     HF_TOKEN=$HF_TOKEN python main.py warm_cache; \
 # fi
 
 # Variables d'environnement pour le service
