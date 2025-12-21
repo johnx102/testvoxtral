@@ -1,26 +1,16 @@
-# Core
+torch==2.3.1
+torchaudio==2.3.1
+transformers==4.56.1
+mistral-common[audio]==1.8.6
+pyannote.audio==3.1.1
+runpod==1.7.0
 huggingface_hub==0.26.2
 safetensors==0.4.5
 accelerate==0.34.2
 sentencepiece==0.2.0
-requests==2.32.0
-numpy==1.26.4
-scipy==1.10.0
 soundfile==0.12.1
 librosa==0.10.2.post1
+numpy==1.26.4
+scipy==1.10.0
 pydub==0.25.1
-
-# Transformers + Voxtral
-transformers==4.56.1
-mistral-common[audio]==1.8.6
-
-# PyTorch CUDA (keep torchaudio <2.2 for pyannote.audio 3.1.x)
-# NOTE: for Docker we install from PyTorch cu121 index.
-# torch==2.1.2+cu121
-# torchaudio==2.1.2+cu121
-
-# Diarization
-pyannote.audio==3.1.1
-
-# RunPod
-runpod==1.7.0
+requests==2.32.0

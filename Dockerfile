@@ -5,25 +5,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
-    ffmpeg \
-    git \
-    ca-certificates \
+    ffmpeg git ca-certificates \
     libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# --- IMPORTANT: install torch/torchaudio from PyTorch cu121 index ---
-# (This avoids random CPU wheels or mismatched deps)
+# --- PyTorch CUDA 12.1 stack (new enough for transformers>=4.4x) ---
 RUN python3 -m pip install --no-cache-dir \
-    --index-url https://download.pytorch.org/whl/cu121 \
-    torch==2.1.2 \
-    torchaudio==2.1.2
+  --index-url https://download.pytorch.org/whl/cu121 \
+  torch==2.3.1 \
+  torchaudio==2.3.1
 
 # Core deps
 RUN python3 -m pip install --no-cache-dir \
@@ -38,37 +33,30 @@ RUN python3 -m pip install --no-cache-dir \
     pydub==0.25.1 \
     requests==2.32.0
 
-# Transformers (Voxtral support)
-RUN python3 -m pip install --no-cache-dir "transformers==4.56.1"
-
-# Mistral tokenizer dependency
+# Transformers + Voxtral deps
+RUN python3 -m pip install --no-cache-dir transformers==4.56.1
 RUN python3 -m pip install --no-cache-dir --upgrade "mistral-common[audio]==1.8.6"
 
-# Pyannote diarization
-RUN python3 -m pip install --no-cache-dir "pyannote.audio==3.1.1"
-
-# Re-pin torchaudio (pyannote can pull different torch stack in some cases)
-RUN python3 -m pip install --no-cache-dir \
-    --index-url https://download.pytorch.org/whl/cu121 \
-    torch==2.1.2 \
-    torchaudio==2.1.2
+# Pyannote diarization (monkeypatched at runtime for torchaudio>=2.2)
+RUN python3 -m pip install --no-cache-dir pyannote.audio==3.1.1
 
 # RunPod worker
-RUN python3 -m pip install --no-cache-dir "runpod==1.7.0"
+RUN python3 -m pip install --no-cache-dir runpod==1.7.0
 
 COPY main.py /app/main.py
 COPY diagnostic.py /app/diagnostic.py
 
-# Version check WITHOUT failing build
+# Never fail build if optional imports behave differently
 RUN python3 - <<'PY' || true
 try:
-    import torch, torchaudio, transformers, mistral_common
+    import torch, torchaudio, transformers
+    import mistral_common
     print("torch:", torch.__version__, "cuda:", torch.version.cuda)
     print("torchaudio:", torchaudio.__version__)
     print("transformers:", transformers.__version__)
     print("mistral_common:", mistral_common.__version__)
 except Exception as e:
-    print("Version check skipped due to import error:", repr(e))
+    print("Version check skipped:", repr(e))
 PY
 
 CMD ["python3", "-u", "main.py"]
