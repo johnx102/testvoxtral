@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Voxtral Serverless Worker - Service de transcription avec diarisation
-Optimisé pour Runpod avec versions stables des transformers
-Version corrigée 2025-12-21
+Optimisé pour Runpod avec transformers dev (support Voxtral)
+Version corrigée 2025-12-21 v5
 """
 
 import os
@@ -22,18 +22,17 @@ import torch
 import soundfile as sf
 import librosa
 import numpy as np
-from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq, AutoModelForCausalLM
-from pyannote.audio import Pipeline
 import runpod
 
-# Configuration des warnings
+# Configuration des warnings AVANT les imports problématiques
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*torchcodec.*")
 warnings.filterwarnings("ignore", message=".*libtorchcodec.*")
 warnings.filterwarnings("ignore", message=".*TRANSFORMERS_CACHE.*")
+warnings.filterwarnings("ignore", message=".*torchaudio._backend.*")
 
-# Suppression des warnings torchcodec spécifiquement
+# Suppression des warnings torchcodec
 torchcodec_logger = logging.getLogger("pyannote.audio.core.io")
 torchcodec_logger.setLevel(logging.ERROR)
 
@@ -49,7 +48,7 @@ logger = logging.getLogger(__name__)
 VOXTRAL_MODEL = "mistralai/Voxtral-Small-24B-2507"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_DOWNLOAD_TIMEOUT = 3600  # 60 minutes pour le téléchargement (modèle 45GB)
+MODEL_DOWNLOAD_TIMEOUT = 3600  # 60 minutes pour le téléchargement
 MAX_DURATION = int(os.getenv("MAX_DURATION_S", "9000"))
 
 # Variables globales pour le cache des modèles
@@ -138,7 +137,7 @@ def cleanup_gpu():
 
 def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
     """
-    Charge le modèle Voxtral et son processor avec gestion d'erreurs robuste
+    Charge le modèle Voxtral et son processor
     """
     global voxtral_model, voxtral_processor
     
@@ -150,62 +149,17 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
     try:
         logger.info(f"[VOXTRAL] Chargement du modèle: {VOXTRAL_MODEL}")
         
+        # Import des classes nécessaires
+        from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+        
         # Chargement du processor
         logger.info("[VOXTRAL] Chargement du processor...")
-        
-        # Essai 1: AutoProcessor standard
-        try:
-            voxtral_processor = AutoProcessor.from_pretrained(
-                VOXTRAL_MODEL,
-                token=hf_token,
-                trust_remote_code=True
-            )
-            logger.info("[VOXTRAL] ✓ AutoProcessor chargé")
-        except Exception as e:
-            logger.warning(f"[VOXTRAL] ⚠ AutoProcessor échoué: {e}")
-            
-            # Essai 2: Chargement des composants individuels
-            try:
-                from transformers import AutoTokenizer, AutoFeatureExtractor
-                
-                logger.info("[VOXTRAL] Chargement des composants individuels...")
-                tokenizer = AutoTokenizer.from_pretrained(VOXTRAL_MODEL, token=hf_token, trust_remote_code=True)
-                feature_extractor = AutoFeatureExtractor.from_pretrained(VOXTRAL_MODEL, token=hf_token, trust_remote_code=True)
-                
-                # Création d'un processor manuel
-                class VoxtralProcessorManual:
-                    def __init__(self, tokenizer, feature_extractor):
-                        self.tokenizer = tokenizer
-                        self.feature_extractor = feature_extractor
-                    
-                    def __call__(self, audio=None, text=None, sampling_rate=16000, return_tensors="pt"):
-                        result = {}
-                        if audio is not None:
-                            audio_features = self.feature_extractor(
-                                audio, 
-                                sampling_rate=sampling_rate, 
-                                return_tensors=return_tensors
-                            )
-                            result.update(audio_features)
-                        if text is not None:
-                            text_features = self.tokenizer(
-                                text, 
-                                return_tensors=return_tensors,
-                                padding=True,
-                                truncation=True
-                            )
-                            result.update(text_features)
-                        return result
-                    
-                    def batch_decode(self, *args, **kwargs):
-                        return self.tokenizer.batch_decode(*args, **kwargs)
-                
-                voxtral_processor = VoxtralProcessorManual(tokenizer, feature_extractor)
-                logger.info("[VOXTRAL] ✓ Processor manuel créé")
-                
-            except Exception as e2:
-                logger.error(f"[VOXTRAL] ✗ Erreur processor manuel: {e2}")
-                return None, None
+        voxtral_processor = AutoProcessor.from_pretrained(
+            VOXTRAL_MODEL,
+            token=hf_token,
+            trust_remote_code=True
+        )
+        logger.info("[VOXTRAL] ✓ Processor chargé")
         
         # Chargement du modèle
         logger.info("[VOXTRAL] Chargement du modèle...")
@@ -213,73 +167,32 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
         
         start_time = time.time()
         
-        try:
-            # Essai 1: VoxtralForConditionalGeneration direct
-            try:
-                from transformers.models.voxtral import VoxtralForConditionalGeneration
-                
-                with timeout(MODEL_DOWNLOAD_TIMEOUT):
-                    voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
-                        VOXTRAL_MODEL,
-                        token=hf_token,
-                        torch_dtype=torch.bfloat16,
-                        device_map="auto",
-                        low_cpu_mem_usage=True,
-                        trust_remote_code=True
-                    )
-                logger.info("[VOXTRAL] ✓ VoxtralForConditionalGeneration chargé")
-                
-            except (ImportError, AttributeError) as e:
-                logger.warning(f"[VOXTRAL] VoxtralForConditionalGeneration non disponible: {e}")
-                
-                # Essai 2: AutoModelForSpeechSeq2Seq
-                try:
-                    with timeout(MODEL_DOWNLOAD_TIMEOUT):
-                        voxtral_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                            VOXTRAL_MODEL,
-                            token=hf_token,
-                            torch_dtype=torch.bfloat16,
-                            device_map="auto",
-                            low_cpu_mem_usage=True,
-                            trust_remote_code=True
-                        )
-                    logger.info("[VOXTRAL] ✓ AutoModelForSpeechSeq2Seq chargé")
-                    
-                except Exception as e2:
-                    logger.warning(f"[VOXTRAL] AutoModelForSpeechSeq2Seq échoué: {e2}")
-                    
-                    # Essai 3: AutoModelForCausalLM (fallback)
-                    with timeout(MODEL_DOWNLOAD_TIMEOUT):
-                        voxtral_model = AutoModelForCausalLM.from_pretrained(
-                            VOXTRAL_MODEL,
-                            token=hf_token,
-                            torch_dtype=torch.bfloat16,
-                            device_map="auto",
-                            low_cpu_mem_usage=True,
-                            trust_remote_code=True
-                        )
-                    logger.info("[VOXTRAL] ✓ AutoModelForCausalLM chargé")
-        
-        except TimeoutError as e:
-            logger.error(f"[VOXTRAL] ✗ Timeout lors du chargement: {e}")
-            return None, None
+        with timeout(MODEL_DOWNLOAD_TIMEOUT):
+            voxtral_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                VOXTRAL_MODEL,
+                token=hf_token,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                low_cpu_mem_usage=True,
+                trust_remote_code=True
+            )
         
         elapsed_time = time.time() - start_time
-        logger.info(f"[VOXTRAL] Modèle chargé en {elapsed_time:.1f}s")
+        logger.info(f"[VOXTRAL] ✓ Modèle chargé en {elapsed_time:.1f}s")
         
         log_gpu_memory()
         return voxtral_model, voxtral_processor
             
     except Exception as e:
-        logger.error(f"[VOXTRAL] ✗ Erreur générale: {e}")
+        logger.error(f"[VOXTRAL] ✗ Erreur: {e}")
         import traceback
         traceback.print_exc()
         return None, None
 
 
-def load_diarizer() -> Optional[Pipeline]:
+def load_diarizer():
     """
-    Charge le pipeline de diarisation PyAnnote avec API à jour
+    Charge le pipeline de diarisation PyAnnote
     """
     global diarizer
     
@@ -287,31 +200,22 @@ def load_diarizer() -> Optional[Pipeline]:
         return diarizer
     
     try:
+        # Import ici pour éviter les erreurs au démarrage
+        from pyannote.audio import Pipeline
+        
         logger.info(f"[DIARIZER] Chargement: {DIARIZATION_MODEL}")
         hf_token = os.getenv("HF_TOKEN")
         
-        # Méthode moderne avec paramètre 'token' (pas 'use_auth_token')
-        try:
-            if hf_token:
-                diarizer = Pipeline.from_pretrained(
-                    DIARIZATION_MODEL,
-                    token=hf_token  # Paramètre moderne
-                )
-            else:
-                diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
-            logger.info("[DIARIZER] ✓ Pipeline chargé")
-            
-        except TypeError as e:
-            # Fallback pour anciennes versions de pyannote
-            if "token" in str(e):
-                logger.warning("[DIARIZER] ⚠ Fallback vers use_auth_token (ancienne API)")
-                diarizer = Pipeline.from_pretrained(
-                    DIARIZATION_MODEL,
-                    use_auth_token=hf_token
-                )
-            else:
-                raise
-            
+        if not hf_token:
+            logger.error("[DIARIZER] ✗ HF_TOKEN non défini")
+            return None
+        
+        # PyAnnote 3.1.1 utilise use_auth_token (pas token)
+        diarizer = Pipeline.from_pretrained(
+            DIARIZATION_MODEL,
+            use_auth_token=hf_token
+        )
+        
         diarizer.to(torch.device(DEVICE))
         logger.info("[DIARIZER] ✓ Diarizer chargé avec succès")
         return diarizer
@@ -344,7 +248,7 @@ def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
             audio = audio.mean(axis=1)
             logger.info("[VOXTRAL] Audio converti en mono")
         
-        # Conversion au sample rate attendu (16kHz généralement)
+        # Conversion au sample rate attendu (16kHz)
         if sample_rate != 16000:
             logger.info(f"[VOXTRAL] Resampling {sample_rate}Hz -> 16000Hz")
             audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
@@ -367,19 +271,10 @@ def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
         # Génération avec Voxtral
         logger.info("[VOXTRAL] Génération en cours...")
         with torch.no_grad():
-            # Déterminer le pad_token_id
-            pad_token_id = 2  # Default
-            if hasattr(processor, 'tokenizer') and hasattr(processor.tokenizer, 'eos_token_id'):
-                pad_token_id = processor.tokenizer.eos_token_id
-            elif hasattr(processor, 'eos_token_id'):
-                pad_token_id = processor.eos_token_id
-            
             generated_ids = model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
-                do_sample=False,
-                temperature=None,  # Pas de temperature en mode greedy
-                pad_token_id=pad_token_id
+                do_sample=False
             )
         
         logger.info("[VOXTRAL] Décodage...")
@@ -523,8 +418,8 @@ def process_audio_request(job_input: Dict[str, Any]) -> Dict[str, Any]:
         task = job_input.get("task", "transcribe")
         audio_url = job_input.get("audio_url", "")
         language = job_input.get("language", "fr")
-        max_tokens = job_input.get("max_tokens", 2500)
-        include_summary = job_input.get("summary", False)
+        max_tokens = job_input.get("max_tokens", job_input.get("max_new_tokens", 2500))
+        include_summary = job_input.get("summary", job_input.get("with_summary", False))
         include_sentiment = job_input.get("sentiment", False)
         
         logger.info(f"[HANDLER] Tâche: {task}, langue: {language}, tokens: {max_tokens}")

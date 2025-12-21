@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
     TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
-    APP_VERSION=2025-12-21-v4
+    APP_VERSION=2025-12-21-v5
 
 # System deps - INCLUT LLVM pour numba
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -57,11 +57,15 @@ RUN pip install --no-cache-dir \
     sentencepiece==0.2.0 \
     tokenizers==0.20.3
 
-# Transformers avec support Voxtral
-RUN pip install --no-cache-dir transformers==4.47.1
+# TRANSFORMERS DEPUIS GITHUB - Version dev avec support Voxtral
+# Voxtral a été ajouté récemment et n'est pas encore dans une release stable
+RUN pip install --no-cache-dir git+https://github.com/huggingface/transformers.git
 
 # Mistral tokenizer (requis pour Voxtral)
 RUN pip install --no-cache-dir mistral-common==1.8.6
+
+# Matplotlib (requis par pyannote.audio)
+RUN pip install --no-cache-dir matplotlib==3.8.2
 
 # PyAnnote (installation séparée car complexe)
 RUN pip install --no-cache-dir \
@@ -75,20 +79,19 @@ RUN pip install --no-cache-dir \
     psutil==5.9.8
 
 # CRITICAL: Forcer numpy < 2.0 après toutes les installations
-# pyannote.audio utilise np.NaN qui n'existe plus dans numpy 2.0
 RUN pip install --no-cache-dir "numpy>=1.26.0,<2.0.0" --force-reinstall
 
 # Vérification des versions critiques
 RUN python -c "import numpy; print(f'NumPy version: {numpy.__version__}')" && \
     python -c "import torch; print(f'PyTorch version: {torch.__version__}')" && \
-    python -c "import transformers; print(f'Transformers version: {transformers.__version__}')"
+    python -c "import transformers; print(f'Transformers version: {transformers.__version__}')" && \
+    python -c "import matplotlib; print(f'Matplotlib version: {matplotlib.__version__}')"
 
 # App et scripts
 COPY main.py /app/main.py
 COPY diagnostic.py /app/diagnostic.py
 
 # Variables d'environnement pour le service
-# Note: HF_TOKEN doit être passé au runtime via -e ou RunPod secrets
 ENV MAX_DURATION_S="9000" \
     LOG_LEVEL="INFO" \
     PYTHONPATH="/app" \
