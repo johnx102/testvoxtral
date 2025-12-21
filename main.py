@@ -2,7 +2,7 @@
 """
 Voxtral Serverless Worker - Service de transcription avec diarisation
 Optimisé pour Runpod avec transformers dev (support Voxtral)
-Version corrigée 2025-12-21 v5
+Version corrigée 2025-12-21 v6
 """
 
 import os
@@ -138,6 +138,7 @@ def cleanup_gpu():
 def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
     """
     Charge le modèle Voxtral et son processor
+    Chargement MANUEL des composants pour éviter les problèmes de kwargs
     """
     global voxtral_model, voxtral_processor
     
@@ -149,23 +150,124 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
     try:
         logger.info(f"[VOXTRAL] Chargement du modèle: {VOXTRAL_MODEL}")
         
-        # Import des classes nécessaires
-        from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+        # ============================================
+        # CHARGEMENT MANUEL DES COMPOSANTS DU PROCESSOR
+        # AutoProcessor passe des kwargs non supportés par MistralCommon
+        # ============================================
+        logger.info("[VOXTRAL] Chargement manuel des composants du processor...")
         
-        # Chargement du processor
-        logger.info("[VOXTRAL] Chargement du processor...")
-        voxtral_processor = AutoProcessor.from_pretrained(
+        from transformers import AutoFeatureExtractor, AutoConfig
+        from huggingface_hub import hf_hub_download
+        
+        # 1. Charger le feature extractor (pour l'audio)
+        logger.info("[VOXTRAL] Chargement du feature extractor...")
+        feature_extractor = AutoFeatureExtractor.from_pretrained(
             VOXTRAL_MODEL,
             token=hf_token,
             trust_remote_code=True
         )
-        logger.info("[VOXTRAL] ✓ Processor chargé")
+        logger.info("[VOXTRAL] ✓ Feature extractor chargé")
         
-        # Chargement du modèle
+        # 2. Charger le tokenizer MistralCommon directement
+        logger.info("[VOXTRAL] Chargement du tokenizer MistralCommon...")
+        try:
+            # Télécharger le fichier tekken.json nécessaire pour MistralCommon
+            from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+            
+            # Télécharger le tokenizer
+            tokenizer_path = hf_hub_download(
+                repo_id=VOXTRAL_MODEL,
+                filename="tekken.json",
+                token=hf_token
+            )
+            
+            mistral_tokenizer = MistralTokenizer.from_file(tokenizer_path)
+            logger.info("[VOXTRAL] ✓ MistralTokenizer chargé depuis tekken.json")
+            
+        except Exception as e:
+            logger.warning(f"[VOXTRAL] ⚠ MistralTokenizer direct échoué: {e}")
+            # Fallback: essayer avec un tokenizer standard
+            from transformers import AutoTokenizer
+            mistral_tokenizer = AutoTokenizer.from_pretrained(
+                VOXTRAL_MODEL,
+                token=hf_token,
+                trust_remote_code=True,
+                use_fast=False
+            )
+            logger.info("[VOXTRAL] ✓ Tokenizer chargé via AutoTokenizer fallback")
+        
+        # 3. Créer un processor wrapper
+        class VoxtralProcessorWrapper:
+            """Wrapper pour combiner feature_extractor et tokenizer"""
+            def __init__(self, feature_extractor, tokenizer):
+                self.feature_extractor = feature_extractor
+                self.tokenizer = tokenizer
+                self._is_mistral_tokenizer = hasattr(tokenizer, 'encode')
+            
+            def __call__(self, audio=None, text=None, sampling_rate=16000, return_tensors="pt", **kwargs):
+                result = {}
+                
+                if audio is not None:
+                    # Traitement audio via feature_extractor
+                    audio_inputs = self.feature_extractor(
+                        audio,
+                        sampling_rate=sampling_rate,
+                        return_tensors=return_tensors,
+                        **kwargs
+                    )
+                    result.update(audio_inputs)
+                
+                if text is not None:
+                    # Traitement texte via tokenizer
+                    if self._is_mistral_tokenizer:
+                        # MistralTokenizer natif
+                        tokens = self.tokenizer.encode(text)
+                        result["input_ids"] = torch.tensor([tokens])
+                    else:
+                        # HuggingFace tokenizer
+                        text_inputs = self.tokenizer(
+                            text,
+                            return_tensors=return_tensors,
+                            padding=True,
+                            truncation=True
+                        )
+                        result.update(text_inputs)
+                
+                return result
+            
+            def batch_decode(self, token_ids, skip_special_tokens=True, **kwargs):
+                if self._is_mistral_tokenizer:
+                    # MistralTokenizer natif
+                    results = []
+                    for ids in token_ids:
+                        if hasattr(ids, 'tolist'):
+                            ids = ids.tolist()
+                        text = self.tokenizer.decode(ids)
+                        results.append(text)
+                    return results
+                else:
+                    # HuggingFace tokenizer
+                    return self.tokenizer.batch_decode(
+                        token_ids,
+                        skip_special_tokens=skip_special_tokens,
+                        **kwargs
+                    )
+            
+            def decode(self, token_ids, skip_special_tokens=True, **kwargs):
+                return self.batch_decode([token_ids], skip_special_tokens=skip_special_tokens, **kwargs)[0]
+        
+        voxtral_processor = VoxtralProcessorWrapper(feature_extractor, mistral_tokenizer)
+        logger.info("[VOXTRAL] ✓ Processor wrapper créé")
+        
+        # ============================================
+        # CHARGEMENT DU MODÈLE
+        # ============================================
         logger.info("[VOXTRAL] Chargement du modèle...")
         logger.info(f"[VOXTRAL] Timeout configuré: {MODEL_DOWNLOAD_TIMEOUT}s")
         
         start_time = time.time()
+        
+        from transformers import AutoModelForSpeechSeq2Seq
         
         with timeout(MODEL_DOWNLOAD_TIMEOUT):
             voxtral_model = AutoModelForSpeechSeq2Seq.from_pretrained(
@@ -193,6 +295,7 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
 def load_diarizer():
     """
     Charge le pipeline de diarisation PyAnnote
+    PyAnnote 3.3+ utilise 'token' au lieu de 'use_auth_token'
     """
     global diarizer
     
@@ -210,10 +313,10 @@ def load_diarizer():
             logger.error("[DIARIZER] ✗ HF_TOKEN non défini")
             return None
         
-        # PyAnnote 3.1.1 utilise use_auth_token (pas token)
+        # PyAnnote 3.3+ utilise 'token' (pas 'use_auth_token')
         diarizer = Pipeline.from_pretrained(
             DIARIZATION_MODEL,
-            use_auth_token=hf_token
+            token=hf_token
         )
         
         diarizer.to(torch.device(DEVICE))
