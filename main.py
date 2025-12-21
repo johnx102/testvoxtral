@@ -62,18 +62,6 @@ def timeout(duration):
     
     try:
         yield
-@contextmanager
-def timeout(duration):
-    """Context manager pour timeout sur le téléchargement de modèles"""
-    def timeout_handler(signum, frame):
-        raise TimeoutError(f"Opération timeout après {duration} secondes")
-    
-    # Configurer le signal d'alarme
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(duration)
-    
-    try:
-        yield
     finally:
         # Nettoyer
         signal.alarm(0)
