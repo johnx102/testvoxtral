@@ -1,316 +1,491 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-RunPod Serverless - Voxtral + (optional) PyAnnote diarization
-- Loads Voxtral once at startup (cached by HF)
-- Accepts jobs with: {audio_url, language, max_new_tokens, task, with_summary}
-Tasks:
-- transcribe: transcription simple
-- transcribe_diarized: diarization (if available) + transcription (still global transcript for now)
-Notes:
-- VoxtralProcessor expects BOTH text and audio. If you only pass input_ids, the model won't condition on audio.
-- For generation, we decode only the generated continuation (exclude the prompt tokens).
+Voxtral Serverless Worker - Transcription + Diarisation + Résumé + Sentiment
+Utilise vLLM pour servir Voxtral + Pyannote pour diarisation
+Version finale 2025-12-21
 """
 
 import os
-import io
-import time
 import json
-import tempfile
+import time
 import logging
-from typing import Any, Dict, Optional, Tuple
-
+import gc
+import warnings
+import base64
+from typing import Optional, Dict, Any, List
+import tempfile
 import requests
+from pathlib import Path
 
-# RunPod
-import runpod
-
-# Audio I/O
-import soundfile as sf
-import numpy as np
 import torch
+import soundfile as sf
+import librosa
+import numpy as np
+import runpod
+from openai import OpenAI
 
-LOG = logging.getLogger("voxtral_worker")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Configuration des warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*torchaudio._backend.*")
 
-# --------- Global models (loaded once) ----------
-VOXTRAL_MODEL_ID = os.getenv("VOXTRAL_MODEL_ID", "mistralai/Voxtral-Small-24B-2507")
+# Suppression des warnings pyannote
+logging.getLogger("pyannote.audio.core.io").setLevel(logging.ERROR)
+
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
+VLLM_PORT = os.getenv("VLLM_PORT", "8000")
+VLLM_BASE_URL = f"http://localhost:{VLLM_PORT}/v1"
+DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MAX_DURATION = int(os.getenv("MAX_DURATION_S", "9000"))
+MAX_RETRIES_VLLM = 60  # 5 minutes pour que vLLM démarre
 
-# Enable TF32 for speed (safe for transcription workloads)
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-processor = None
-model = None
+# Cache global
 diarizer = None
+openai_client = None
 
 
-def gpu_mem_log(prefix: str = "[GPU]") -> None:
-    if not torch.cuda.is_available():
-        return
-    free, total = torch.cuda.mem_get_info()
-    LOG.info(f"{prefix} Free: {free/1024**3:.1f}GB / Total: {total/1024**3:.1f}GB")
-
-
-def ensure_hf_token_present() -> None:
-    # On RunPod, you usually inject HF_TOKEN in environment variables.
-    if not os.getenv("HF_TOKEN"):
-        LOG.warning("[INIT] ⚠ HF_TOKEN absent. Si le modèle est privé, le chargement échouera.")
-    else:
-        LOG.info("[INIT] ✓ HF_TOKEN présent (auth HuggingFace OK)")
-
-
-def download_audio(audio_url: str, timeout: int = 120) -> str:
-    LOG.info(f"[DOWNLOAD] Téléchargement: {audio_url}")
-    r = requests.get(audio_url, timeout=timeout)
-    r.raise_for_status()
-    fd, path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    with open(path, "wb") as f:
-        f.write(r.content)
-    LOG.info(f"[DOWNLOAD] ✓ Audio téléchargé: {path}")
-    return path
-
-
-def load_audio_mono_16k(path: str) -> Tuple[np.ndarray, int]:
-    """Return mono float32 waveform and sampling rate 16000."""
-    wav, sr = sf.read(path, always_2d=False)
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)
-    wav = wav.astype(np.float32)
-
-    if sr != 16000:
-        LOG.info(f"[AUDIO] Resampling {sr}Hz -> 16000Hz")
-        # fast CPU resample (librosa is heavier). Use scipy if available, else simple polyphase via torchaudio.
+def wait_for_vllm():
+    """Vérifie que vLLM est prêt (devrait déjà l'être via start.sh)"""
+    global openai_client
+    
+    logger.info(f"[VLLM] Connexion au serveur vLLM sur {VLLM_BASE_URL}...")
+    
+    for i in range(30):  # 30 secondes max
         try:
-            import torchaudio
-            t = torch.from_numpy(wav).unsqueeze(0)
-            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
-            wav16 = resampler(t).squeeze(0).cpu().numpy().astype(np.float32)
-            return wav16, 16000
-        except Exception:
-            # fallback: linear interpolation
-            duration = wav.shape[0] / sr
-            t_old = np.linspace(0.0, duration, num=wav.shape[0], endpoint=False)
-            t_new = np.linspace(0.0, duration, num=int(duration * 16000), endpoint=False)
-            wav16 = np.interp(t_new, t_old, wav).astype(np.float32)
-            return wav16, 16000
-
-    return wav, sr
-
-
-def load_voxtral() -> None:
-    global processor, model
-    if processor is not None and model is not None:
-        return
-
-    from transformers import AutoProcessor, VoxtralForConditionalGeneration
-
-    LOG.info(f"[VOXTRAL] Chargement du modèle: {VOXTRAL_MODEL_ID}")
-    LOG.info("[VOXTRAL] Chargement du processor (AutoProcessor)...")
-    processor = AutoProcessor.from_pretrained(VOXTRAL_MODEL_ID, trust_remote_code=True)
-
-    LOG.info("[VOXTRAL] Chargement du modèle (VoxtralForConditionalGeneration)...")
-    t0 = time.time()
-
-    # Use device_map="auto" to spread on GPU (and maybe CPU) without OOM.
-    # torch_dtype bfloat16 is good on A100/H100; fallback float16.
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    model = VoxtralForConditionalGeneration.from_pretrained(
-        VOXTRAL_MODEL_ID,
-        torch_dtype=dtype,
-        device_map="auto" if torch.cuda.is_available() else None,
-        trust_remote_code=True,
-    )
-    model.eval()
-    LOG.info(f"[VOXTRAL] ✓ Modèle chargé ({time.time()-t0:.1f}s)")
-    gpu_mem_log()
+            response = requests.get(f"{VLLM_BASE_URL}/models", timeout=5)
+            if response.status_code == 200:
+                models = response.json()
+                logger.info(f"[VLLM] ✓ Serveur prêt. Modèles: {[m['id'] for m in models.get('data', [])]}")
+                
+                # Créer le client OpenAI
+                openai_client = OpenAI(
+                    api_key="EMPTY",  # vLLM n'a pas besoin de clé
+                    base_url=VLLM_BASE_URL
+                )
+                return True
+        except Exception as e:
+            logger.debug(f"[VLLM] Attente... {e}")
+        time.sleep(1)
+    
+    logger.error("[VLLM] ✗ vLLM n'est pas accessible")
+    return False
 
 
-def load_diarizer() -> None:
+def load_diarizer():
+    """Charge le pipeline de diarisation PyAnnote"""
     global diarizer
+    
     if diarizer is not None:
-        return
-    LOG.info("[DIARIZER] Chargement: pyannote/speaker-diarization-3.1")
-    from pyannote.audio import Pipeline
-
-    # Newer pyannote uses "use_auth_token"
-    hf_token = os.getenv("HF_TOKEN")
-    diarizer = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
-    if torch.cuda.is_available():
-        diarizer.to(torch.device("cuda"))
-        LOG.info("[DIARIZER] Pipeline déplacée sur cuda")
-    LOG.info("[DIARIZER] ✓ Diarizer chargé")
-
-
-def perform_diarization(audio_path: str) -> Tuple[str, float]:
-    """Return RTTM string and elapsed seconds."""
-    if diarizer is None:
-        raise RuntimeError("Diarizer non chargé")
-    t0 = time.time()
-    diar = diarizer(audio_path)
-    rttm_buf = io.StringIO()
-    diar.write_rttm(rttm_buf)
-    return rttm_buf.getvalue(), time.time() - t0
-
-
-def transcribe_with_voxtral(audio_path: str, language: str = "fr", max_new_tokens: int = 1800) -> str:
-    """
-    Correct Voxtral usage:
-    - Build an instruction text (not chat-template dependent)
-    - Call processor(text=..., audio=..., sampling_rate=16000, return_tensors="pt")
-    - Generate
-    - Decode ONLY continuation tokens (exclude prompt tokens)
-    """
-    load_voxtral()
-
-    wav, sr = load_audio_mono_16k(audio_path)
-    LOG.info(f"[VOXTRAL] Audio prêt: {wav.shape[0]/sr:.1f}s @ {sr}Hz")
-
-    # Instruction: keep it simple and stable across tokenizer versions
-    if language.lower().startswith("fr"):
-        prompt = "Transcris fidèlement cet audio en français. Réponds uniquement avec la transcription."
-    else:
-        prompt = f"Transcribe this audio in {language}. Reply with the transcription only."
-
-    LOG.info("[VOXTRAL] Préparation des inputs (processor(text, audio))...")
-    inputs = processor(
-        text=prompt,
-        audio=wav,
-        sampling_rate=sr,
-        return_tensors="pt",
-    )
-
-    # Move tensors to GPU/device_map aware placement:
-    # If model is sharded via device_map, keeping inputs on CUDA is fine.
-    for k, v in list(inputs.items()):
-        if isinstance(v, torch.Tensor):
-            inputs[k] = v.to(DEVICE)
-
-    # Determine prompt length for slicing
-    prompt_len = inputs["input_ids"].shape[1] if "input_ids" in inputs else None
-
-    LOG.info(f"[VOXTRAL] generate (max_new_tokens={max_new_tokens})...")
-    t0 = time.time()
-    with torch.inference_mode():
-        generated = model.generate(
-            **inputs,
-            max_new_tokens=int(max_new_tokens),
-            do_sample=False,
-            temperature=None,
-            top_p=None,
-        )
-
-    # Slice generated tokens to remove prompt tokens (critical!)
-    if prompt_len is not None and generated.shape[1] > prompt_len:
-        gen_only = generated[:, prompt_len:]
-    else:
-        gen_only = generated
-
-    text_out = processor.batch_decode(gen_only, skip_special_tokens=True)[0].strip()
-    elapsed = time.time() - t0
-    LOG.info(f"[VOXTRAL] ✓ Transcription terminée ({elapsed:.1f}s, {len(text_out)} chars)")
-
-    # Basic cleanup: remove weird empty lines
-    text_out = "\n".join([line.rstrip() for line in text_out.splitlines()]).strip()
-    return text_out
-
-
-def handler(job: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    RunPod job format:
-      {"input": {"audio_url": "...", "language": "fr", "max_new_tokens": 2500, "task": "transcribe_diarized", "with_summary": true}}
-    """
-    t0 = time.time()
-    inp = job.get("input", {}) or {}
-
-    audio_url = inp.get("audio_url")
-    if not audio_url:
-        return {"error": "Missing audio_url"}
-
-    language = inp.get("language", "fr")
-    task = inp.get("task", "transcribe")
-    max_new_tokens = int(inp.get("max_new_tokens", 1800))
-    want_diar = (task == "transcribe_diarized") and bool(inp.get("diarization", True))
-    with_summary = bool(inp.get("with_summary", False))
-
-    LOG.info(f"[HANDLER] Tâche: {task}, diarization={want_diar}, langue: {language}, tokens: {max_new_tokens}")
-
-    audio_path = None
-    diar_rttm = None
-    diar_elapsed = None
+        return diarizer
+    
     try:
+        from pyannote.audio import Pipeline
+        
+        logger.info(f"[DIARIZER] Chargement: {DIARIZATION_MODEL}")
+        hf_token = os.getenv("HF_TOKEN")
+        
+        if not hf_token:
+            logger.error("[DIARIZER] ✗ HF_TOKEN non défini")
+            return None
+        
+        # Essayer les deux APIs
+        try:
+            diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL, token=hf_token)
+        except TypeError:
+            diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL, use_auth_token=hf_token)
+        
+        diarizer.to(torch.device(DEVICE))
+        logger.info("[DIARIZER] ✓ Diarizer chargé")
+        return diarizer
+        
+    except Exception as e:
+        logger.error(f"[DIARIZER] ✗ Erreur: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def audio_to_base64(audio_path: str) -> str:
+    """Convertit un fichier audio en base64"""
+    with open(audio_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def transcribe_audio(audio_path: str, language: str = "fr") -> str:
+    """Transcrit un audio avec Voxtral via vLLM"""
+    global openai_client
+    
+    if openai_client is None:
+        raise Exception("vLLM client non initialisé")
+    
+    try:
+        logger.info(f"[VOXTRAL] Transcription: {audio_path}")
+        
+        # Lire l'audio et le convertir en base64
+        audio_base64 = audio_to_base64(audio_path)
+        
+        # Utiliser l'API de transcription vLLM
+        # Note: vLLM expose une API compatible OpenAI
+        from mistral_common.protocol.transcription.request import TranscriptionRequest
+        from mistral_common.protocol.instruct.messages import RawAudio
+        from mistral_common.audio import Audio
+        
+        # Charger l'audio avec mistral_common
+        audio = Audio.from_file(audio_path, strict=False)
+        raw_audio = RawAudio.from_audio(audio)
+        
+        # Créer la requête de transcription
+        models = openai_client.models.list()
+        model_id = models.data[0].id
+        
+        req = TranscriptionRequest(
+            model=model_id,
+            audio=raw_audio,
+            language=language,
+            temperature=0.0
+        ).to_openai(exclude=("top_p", "seed"))
+        
+        response = openai_client.audio.transcriptions.create(**req)
+        
+        transcription = response.text if hasattr(response, 'text') else str(response)
+        logger.info(f"[VOXTRAL] ✓ Transcription: {len(transcription)} caractères")
+        
+        return transcription.strip()
+        
+    except Exception as e:
+        logger.error(f"[VOXTRAL] ✗ Erreur transcription: {e}")
+        import traceback
+        traceback.print_exc()
+        return ""
+
+
+def generate_summary(text: str, language: str = "fr") -> str:
+    """Génère un résumé avec Voxtral"""
+    global openai_client
+    
+    if openai_client is None or not text:
+        return ""
+    
+    try:
+        logger.info("[VOXTRAL] Génération du résumé...")
+        
+        models = openai_client.models.list()
+        model_id = models.data[0].id
+        
+        prompt = f"""Résume cette conversation téléphonique en français de manière concise et structurée.
+Identifie les points clés, les décisions prises et les actions à suivre.
+
+Transcription:
+{text}
+
+Résumé:"""
+        
+        response = openai_client.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=500
+        )
+        
+        summary = response.choices[0].message.content
+        logger.info(f"[VOXTRAL] ✓ Résumé généré: {len(summary)} caractères")
+        return summary.strip()
+        
+    except Exception as e:
+        logger.error(f"[VOXTRAL] ✗ Erreur résumé: {e}")
+        return ""
+
+
+def analyze_sentiment(text: str, language: str = "fr") -> Dict[str, Any]:
+    """Analyse le sentiment avec Voxtral"""
+    global openai_client
+    
+    if openai_client is None or not text:
+        return {"sentiment": "neutre", "score": 0.5}
+    
+    try:
+        logger.info("[VOXTRAL] Analyse du sentiment...")
+        
+        models = openai_client.models.list()
+        model_id = models.data[0].id
+        
+        prompt = f"""Analyse le sentiment de cette conversation téléphonique.
+Réponds UNIQUEMENT avec un JSON valide contenant:
+- "sentiment": "positif", "négatif" ou "neutre"
+- "score": un nombre entre 0 et 1 (0=très négatif, 1=très positif)
+- "emotions": liste des émotions détectées
+- "satisfaction_client": "satisfait", "insatisfait" ou "neutre"
+
+Transcription:
+{text}
+
+JSON:"""
+        
+        response = openai_client.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=200
+        )
+        
+        result_text = response.choices[0].message.content.strip()
+        
+        # Parser le JSON
+        try:
+            # Nettoyer le texte
+            if "```json" in result_text:
+                result_text = result_text.split("```json")[1].split("```")[0]
+            elif "```" in result_text:
+                result_text = result_text.split("```")[1].split("```")[0]
+            
+            result = json.loads(result_text)
+            logger.info(f"[VOXTRAL] ✓ Sentiment: {result.get('sentiment', 'neutre')}")
+            return result
+        except json.JSONDecodeError:
+            # Fallback si pas de JSON valide
+            if "positif" in result_text.lower():
+                return {"sentiment": "positif", "score": 0.7}
+            elif "négatif" in result_text.lower():
+                return {"sentiment": "négatif", "score": 0.3}
+            else:
+                return {"sentiment": "neutre", "score": 0.5}
+        
+    except Exception as e:
+        logger.error(f"[VOXTRAL] ✗ Erreur sentiment: {e}")
+        return {"sentiment": "neutre", "score": 0.5}
+
+
+def perform_diarization(audio_path: str) -> List[Dict]:
+    """Effectue la diarisation sur un fichier audio"""
+    try:
+        diarizer_pipeline = load_diarizer()
+        if diarizer_pipeline is None:
+            return []
+        
+        logger.info("[DIARIZER] Analyse de la diarisation...")
+        diarization = diarizer_pipeline(audio_path)
+        
+        segments = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            segments.append({
+                "start": round(turn.start, 2),
+                "end": round(turn.end, 2),
+                "speaker": speaker,
+                "duration": round(turn.end - turn.start, 2)
+            })
+        
+        logger.info(f"[DIARIZER] ✓ {len(segments)} segments détectés")
+        return segments
+        
+    except Exception as e:
+        logger.error(f"[DIARIZER] ✗ Erreur: {e}")
+        return []
+
+
+def extract_audio_segment(audio_path: str, start_time: float, end_time: float) -> str:
+    """Extrait un segment audio"""
+    try:
+        audio, sample_rate = sf.read(audio_path)
+        
+        start_idx = int(start_time * sample_rate)
+        end_idx = int(end_time * sample_rate)
+        segment = audio[start_idx:end_idx]
+        
+        temp_path = f"/tmp/segment_{int(start_time*1000)}_{int(end_time*1000)}.wav"
+        sf.write(temp_path, segment, sample_rate)
+        
+        return temp_path
+    except Exception as e:
+        logger.error(f"[EXTRACT] Erreur: {e}")
+        return ""
+
+
+def download_audio(url: str) -> str:
+    """Télécharge un fichier audio depuis une URL"""
+    try:
+        logger.info(f"[DOWNLOAD] Téléchargement: {url}")
+        response = requests.get(url, timeout=120)
+        response.raise_for_status()
+        
+        # Déterminer l'extension
+        ext = ".wav"
+        if ".mp3" in url.lower():
+            ext = ".mp3"
+        elif ".ogg" in url.lower():
+            ext = ".ogg"
+        
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as temp_file:
+            temp_file.write(response.content)
+            temp_path = temp_file.name
+        
+        # Convertir en WAV si nécessaire
+        if ext != ".wav":
+            wav_path = temp_path.replace(ext, ".wav")
+            audio, sr = librosa.load(temp_path, sr=16000)
+            sf.write(wav_path, audio, sr)
+            os.unlink(temp_path)
+            temp_path = wav_path
+        
+        logger.info(f"[DOWNLOAD] ✓ Audio téléchargé: {temp_path}")
+        return temp_path
+        
+    except Exception as e:
+        logger.error(f"[DOWNLOAD] ✗ Erreur: {e}")
+        return ""
+
+
+def cleanup_gpu():
+    """Nettoie la mémoire GPU"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
+def process_audio_request(job_input: Dict[str, Any]) -> Dict[str, Any]:
+    """Traite une demande complète"""
+    temp_files = []
+    
+    try:
+        # Paramètres
+        task = job_input.get("task", "transcribe")
+        audio_url = job_input.get("audio_url", "")
+        language = job_input.get("language", "fr")
+        include_summary = job_input.get("summary", job_input.get("with_summary", False))
+        include_sentiment = job_input.get("sentiment", False)
+        include_diarization = task == "transcribe_diarized"
+        
+        logger.info(f"[HANDLER] Tâche: {task}, Langue: {language}")
+        logger.info(f"[HANDLER] Options: summary={include_summary}, sentiment={include_sentiment}, diarization={include_diarization}")
+        
+        if not audio_url:
+            return {"error": "URL audio manquante"}
+        
+        # Téléchargement
         audio_path = download_audio(audio_url)
-        wav, sr = sf.read(audio_path, always_2d=False)
-        duration_sec = (wav.shape[0] / sr) if hasattr(wav, "shape") else None
-        LOG.info(f"[HANDLER] Durée audio: {duration_sec:.1f}s" if duration_sec else "[HANDLER] Durée audio: ?")
-
-        if want_diar:
-            try:
-                load_diarizer()
-                LOG.info("[HANDLER] Diarization: start")
-                diar_rttm, diar_elapsed = perform_diarization(audio_path)
-                LOG.info(f"[HANDLER] Diarization: done ({diar_elapsed:.2f}s)")
-            except Exception as e:
-                LOG.warning(f"[HANDLER] Diarization indisponible -> fallback transcription simple: {e}")
-                diar_rttm, diar_elapsed = None, None
-
-        transcript = transcribe_with_voxtral(audio_path, language=language, max_new_tokens=max_new_tokens)
-
-        result: Dict[str, Any] = {
+        if not audio_path:
+            return {"error": "Échec du téléchargement audio"}
+        temp_files.append(audio_path)
+        
+        # Vérification durée
+        audio, sr = sf.read(audio_path)
+        duration = len(audio) / sr
+        logger.info(f"[HANDLER] Durée audio: {duration:.1f}s")
+        
+        if duration > MAX_DURATION:
+            return {"error": f"Audio trop long (max {MAX_DURATION}s)"}
+        
+        result = {
             "task": task,
             "language": language,
-            "duration_sec": float(duration_sec) if duration_sec else None,
-            "elapsed_sec": round(time.time() - t0, 2),
-            "diarization_rttm": diar_rttm,
-            "diarization_elapsed_sec": diar_elapsed,
-            "transcript": transcript,
+            "duration": round(duration, 2)
         }
-
-        if with_summary:
-            # Simple summary: do it on CPU with a lightweight heuristic to avoid extra model calls.
-            # (You can later plug an LLM summarizer if desired.)
-            # Here: first 600 chars as "preview"
-            preview = transcript.replace("\n", " ").strip()
-            result["summary"] = preview[:600] + ("…" if len(preview) > 600 else "")
-
+        
+        # Diarisation si demandée
+        if include_diarization:
+            logger.info("[HANDLER] Mode diarisation activé")
+            segments = perform_diarization(audio_path)
+            
+            if segments:
+                transcriptions = []
+                for segment in segments:
+                    segment_path = extract_audio_segment(
+                        audio_path, segment["start"], segment["end"]
+                    )
+                    if segment_path:
+                        temp_files.append(segment_path)
+                        segment_text = transcribe_audio(segment_path, language)
+                        
+                        transcriptions.append({
+                            "speaker": segment["speaker"],
+                            "start": segment["start"],
+                            "end": segment["end"],
+                            "text": segment_text
+                        })
+                
+                result["transcriptions"] = transcriptions
+                full_text = " ".join(t["text"] for t in transcriptions if t["text"])
+            else:
+                logger.info("[HANDLER] Diarisation échouée, fallback transcription simple")
+                full_text = transcribe_audio(audio_path, language)
+                result["transcriptions"] = [{"speaker": "UNKNOWN", "text": full_text}]
+        else:
+            # Transcription simple
+            full_text = transcribe_audio(audio_path, language)
+            result["transcription"] = full_text
+        
+        # Résumé
+        if include_summary and full_text:
+            result["summary"] = generate_summary(full_text, language)
+        
+        # Sentiment
+        if include_sentiment and full_text:
+            result["sentiment"] = analyze_sentiment(full_text, language)
+        
+        logger.info("[HANDLER] ✓ Traitement terminé")
         return result
-
+        
     except Exception as e:
-        LOG.exception("[HANDLER] Erreur traitement")
+        logger.error(f"[HANDLER] ✗ Erreur: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
+        
+    finally:
+        # Nettoyage
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except:
+                pass
+        cleanup_gpu()
+
+
+def handler(job):
+    """Handler principal pour RunPod serverless"""
+    try:
+        logger.info(f"[HANDLER] Nouveau job: {job.get('id', 'unknown')}")
+        job_input = job.get("input", {})
+        
+        if not job_input:
+            return {"error": "Pas d'input fourni"}
+        
+        result = process_audio_request(job_input)
+        logger.info(f"[HANDLER] ✓ Job terminé: {len(str(result))} caractères")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[HANDLER] ✗ Erreur: {e}")
+        import traceback
+        traceback.print_exc()
         return {"error": str(e)}
 
-    finally:
-        if audio_path and os.path.exists(audio_path):
-            try:
-                os.remove(audio_path)
-            except Exception:
-                pass
+
+def main():
+    """Point d'entrée principal"""
+    logger.info("=== Voxtral Serverless Worker ===")
+    
+    # Attendre que vLLM soit prêt
+    if not wait_for_vllm():
+        logger.error("vLLM n'a pas démarré. Arrêt du worker.")
+        return
+    
+    # Pré-charger le diarizer
+    load_diarizer()
+    
+    # Démarrer le worker RunPod
+    logger.info("[INIT] ✓ Démarrage du worker RunPod")
+    runpod.serverless.start({"handler": handler})
 
 
-def preload() -> None:
-    LOG.info("[INIT] Pré-chargement des modèles...")
-    ensure_hf_token_present()
-    gpu_mem_log()
-    try:
-        load_voxtral()
-        LOG.info("[INIT] ✓ Voxtral pré-chargé")
-    except Exception:
-        LOG.exception("[INIT] ⚠ Échec pré-chargement Voxtral")
-
-    # Diarizer is optional; preload only if user wants it most of the time
-    if os.getenv("PRELOAD_DIARIZER", "1") == "1":
-        try:
-            load_diarizer()
-            LOG.info("[INIT] ✓ Diarizer pré-chargé")
-        except Exception as e:
-            LOG.warning(f"[INIT] ⚠ Échec pré-chargement Diarizer: {e}")
-
-    LOG.info("[INIT] ✓ Initialisation terminée")
-
-
-preload()
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    main()
