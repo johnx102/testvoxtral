@@ -31,13 +31,26 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu11
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# App
+# App et scripts
 COPY main.py /app/main.py
+COPY warm_cache.py /app/warm_cache.py
+
+# Pré-chargement du modèle Voxtral pendant la construction (optionnel)
+# Uncomment et set HF_TOKEN pour pré-charger le modèle dans l'image
+# ARG HF_TOKEN
+# RUN if [ -n "$HF_TOKEN" ]; then \
+#     HF_TOKEN=$HF_TOKEN python warm_cache.py; \
+# fi
 
 # Variables d'environnement pour le service
 ENV HF_TOKEN="" \
     MAX_DURATION_S="9000" \
     LOG_LEVEL="INFO" \
-    PYTHONPATH="/app"
+    PYTHONPATH="/app" \
+    HF_HUB_CACHE="/app/.cache/huggingface" \
+    TRANSFORMERS_CACHE="/app/.cache/transformers"
+
+# Créer les dossiers de cache
+RUN mkdir -p /app/.cache/huggingface /app/.cache/transformers
 
 ENTRYPOINT ["python", "-u", "main.py"]
