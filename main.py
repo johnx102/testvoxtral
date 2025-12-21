@@ -10,6 +10,8 @@ import time
 import logging
 import gc
 import warnings
+import signal
+from contextlib import contextmanager
 from typing import Optional, Dict, Any, List, Tuple
 import tempfile
 import requests
@@ -46,6 +48,41 @@ logger = logging.getLogger(__name__)
 VOXTRAL_MODEL = "mistralai/Voxtral-Small-24B-2507"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_DOWNLOAD_TIMEOUT = 3600  # 60 minutes pour le téléchargement (modèle 45GB)
+
+@contextmanager
+def timeout(duration):
+    """Context manager pour timeout sur le téléchargement de modèles"""
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Opération timeout après {duration} secondes")
+    
+    # Configurer le signal d'alarme
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(duration)
+    
+    try:
+        yield
+    finally:
+        # Nettoyer
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+@contextmanager
+def timeout(duration):
+    """Context manager pour timeout sur le téléchargement de modèles"""
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Opération timeout après {duration} secondes")
+    
+    # Configurer le signal d'alarme
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(duration)
+    
+    try:
+        yield
+    finally:
+        # Nettoyer
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 MAX_DURATION = int(os.getenv("MAX_DURATION_S", "9000"))
 
 # Variables globales pour le cache des modèles
@@ -148,50 +185,92 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
         # Chargement du modèle avec approche simplifiée
         logger.info("[VOXTRAL] Chargement du modèle...")
         try:
-            # Chargement du vrai modèle Voxtral avec approche directe
-            logger.info("[VOXTRAL] Chargement du modèle Voxtral...")
+            # Vérification de la disponibilité du modèle dans le cache
+            from huggingface_hub import scan_cache_dir, try_to_load_from_cache
+            
+            # Essayer de charger depuis le cache d'abord
+            cache_info = None
+            try:
+                cache_info = scan_cache_dir()
+                cached_repo = None
+                for repo in cache_info.repos:
+                    if VOXTRAL_MODEL.split('/')[-1] in repo.repo_id:
+                        cached_repo = repo
+                        break
+                
+                if cached_repo:
+                    logger.info(f"[VOXTRAL] Modèle trouvé dans le cache: {cached_repo.size_on_disk_str}")
+                else:
+                    logger.info("[VOXTRAL] Aucun cache trouvé, téléchargement nécessaire")
+            except Exception as cache_err:
+                logger.warning(f"[VOXTRAL] ⚠ Impossible de vérifier le cache: {cache_err}")
+            
+            # Chargement du vrai modèle Voxtral avec approche directe et timeout
+            logger.info(f"[VOXTRAL] Chargement du modèle Voxtral (timeout: {MODEL_DOWNLOAD_TIMEOUT}s)...")
             
             try:
                 # Première tentative: import direct de VoxtralForConditionalGeneration
                 from transformers.models.voxtral import VoxtralForConditionalGeneration
                 
-                if hf_token:
-                    voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
-                        VOXTRAL_MODEL,
-                        token=hf_token,
-                        torch_dtype=torch.bfloat16,
-                        device_map="auto"
-                    )
-                else:
-                    voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
-                        VOXTRAL_MODEL,
-                        torch_dtype=torch.bfloat16,
-                        device_map="auto"
-                    )
+                with timeout(MODEL_DOWNLOAD_TIMEOUT):
+                    if hf_token:
+                        voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
+                            VOXTRAL_MODEL,
+                            token=hf_token,
+                            torch_dtype=torch.bfloat16,
+                            device_map="auto",
+                            low_cpu_mem_usage=True,
+                            resume_download=True,
+                            force_download=False
+                        )
+                    else:
+                        voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
+                            VOXTRAL_MODEL,
+                            torch_dtype=torch.bfloat16,
+                            device_map="auto",
+                            low_cpu_mem_usage=True,
+                            resume_download=True,
+                            force_download=False
+                        )
                 
                 logger.info("[VOXTRAL] ✓ VoxtralForConditionalGeneration chargé")
                 
-            except ImportError:
-                logger.warning("[VOXTRAL] ⚠ VoxtralForConditionalGeneration non disponible, tentative AutoModel...")
-                
-                # Deuxième tentative: utilisation d'AutoModel avec trust_remote_code
-                if hf_token:
-                    voxtral_model = AutoModelForCausalLM.from_pretrained(
-                        VOXTRAL_MODEL,
-                        token=hf_token,
-                        torch_dtype=torch.bfloat16,
-                        device_map="auto",
-                        trust_remote_code=True
-                    )
+            except (ImportError, TimeoutError) as e:
+                if isinstance(e, TimeoutError):
+                    logger.error(f"[VOXTRAL] ✗ Timeout lors du chargement VoxtralForConditionalGeneration: {e}")
                 else:
-                    voxtral_model = AutoModelForCausalLM.from_pretrained(
-                        VOXTRAL_MODEL,
-                        torch_dtype=torch.bfloat16,
-                        device_map="auto",
-                        trust_remote_code=True
-                    )
+                    logger.warning("[VOXTRAL] ⚠ VoxtralForConditionalGeneration non disponible, tentative AutoModel...")
                 
-                logger.info("[VOXTRAL] ✓ AutoModelForCausalLM avec trust_remote_code chargé")
+                # Deuxième tentative: utilisation d'AutoModel avec trust_remote_code et timeout
+                try:
+                    with timeout(MODEL_DOWNLOAD_TIMEOUT):
+                        if hf_token:
+                            voxtral_model = AutoModelForCausalLM.from_pretrained(
+                                VOXTRAL_MODEL,
+                                token=hf_token,
+                                torch_dtype=torch.bfloat16,
+                                device_map="auto",
+                                trust_remote_code=True,
+                                low_cpu_mem_usage=True,
+                                resume_download=True,
+                                force_download=False
+                            )
+                        else:
+                            voxtral_model = AutoModelForCausalLM.from_pretrained(
+                                VOXTRAL_MODEL,
+                                torch_dtype=torch.bfloat16,
+                                device_map="auto",
+                                trust_remote_code=True,
+                                low_cpu_mem_usage=True,
+                                resume_download=True,
+                                force_download=False
+                            )
+                    
+                    logger.info("[VOXTRAL] ✓ AutoModelForCausalLM avec trust_remote_code chargé")
+                    
+                except TimeoutError as timeout_err:
+                    logger.error(f"[VOXTRAL] ✗ Timeout lors du chargement AutoModel: {timeout_err}")
+                    raise
             
             log_gpu_memory()
             return voxtral_model, voxtral_processor
