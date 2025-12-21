@@ -2,7 +2,7 @@
 
 Worker RunPod Serverless basé sur [WhisperX](https://github.com/m-bain/whisperX) avec fonctionnalités additionnelles.
 
-## Fonctionnalités
+## Fonctionnalitésj
 
 - ✅ **Transcription** - Whisper large-v3 (meilleure qualité)
 - ✅ **Alignement** - Timestamps précis au niveau des mots
