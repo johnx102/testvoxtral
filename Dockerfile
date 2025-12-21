@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -7,40 +7,36 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
     TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
-    PYTORCH_JIT=0 \
-    APP_VERSION=2025-12-20-stable
+    APP_VERSION=2025-12-21-fixed
 
 # System deps avec FFmpeg et outils de compilation
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv \
+    python3.11 python3.11-venv python3-pip \
     ffmpeg libavformat-dev libavcodec-dev libavutil-dev libavdevice-dev \
     libsndfile1 git ca-certificates curl \
     pkg-config build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-RUN ln -sf /usr/bin/python3 /usr/bin/python && \
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
     python -m pip install --upgrade pip setuptools wheel
 
 WORKDIR /app
 
-# Torch versions stables compatibles
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu118 \
-    torch==2.4.0 torchaudio==2.4.0 torchvision==0.19.0
+# PyTorch pour CUDA 12.1 (cohérent avec l'image de base)
+RUN pip install --no-cache-dir \
+    torch==2.4.0+cu121 \
+    torchaudio==2.4.0+cu121 \
+    torchvision==0.19.0+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
 
-# Requirements
+# Requirements (sans torch car déjà installé)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # App et scripts
 COPY main.py /app/main.py
 COPY diagnostic.py /app/diagnostic.py
-
-# Pré-chargement du modèle Voxtral pendant la construction (optionnel)
-# Uncomment et set HF_TOKEN pour pré-charger le modèle dans l'image
-# ARG HF_TOKEN
-# RUN if [ -n "$HF_TOKEN" ]; then \
-#     HF_TOKEN=$HF_TOKEN python main.py warm_cache; \
-# fi
 
 # Variables d'environnement pour le service
 ENV HF_TOKEN="" \

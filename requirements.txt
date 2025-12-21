@@ -1,22 +1,26 @@
-# Version de développement transformers avec support complet Voxtral
-git+https://github.com/huggingface/transformers.git
-torch==2.4.0
-torchvision==0.19.0
-torchaudio==2.4.0
+# ====================================================================
+# IMPORTANT: torch, torchaudio, torchvision sont installés dans le Dockerfile
+# Ne PAS les inclure ici pour éviter les conflits de version CUDA
+# ====================================================================
 
-# HuggingFace et ML core (versions compatibles avec transformers 4.48+)
+# Transformers - version stable avec support Voxtral
+# Le support Voxtral est inclus depuis transformers 4.47+
+transformers>=4.47.0
+
+# HuggingFace et ML core
 accelerate>=0.33.0
 huggingface_hub>=0.26.0
 scipy>=1.10.1
 sentencepiece>=0.2.0
+safetensors>=0.4.0
 
-# Mistral/Voxtral tokenizer dependency (OBLIGATOIRE pour Voxtral) - Dernière version
+# Mistral/Voxtral tokenizer dependency (OBLIGATOIRE pour Voxtral)
 mistral-common>=1.8.6
 
 # Audio processing
 soundfile>=0.12.1
 librosa>=0.10.1
-numpy>=1.24.3
+numpy>=1.24.3,<2.0.0
 pydub>=0.25.1
 
 # PyAnnote pour diarization
@@ -26,3 +30,4 @@ speechbrain>=0.5.16
 # API et utils
 requests>=2.31.0
 runpod>=1.6.2
+psutil>=5.9.0

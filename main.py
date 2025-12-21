@@ -2,6 +2,7 @@
 """
 Voxtral Serverless Worker - Service de transcription avec diarisation
 Optimisé pour Runpod avec versions stables des transformers
+Version corrigée 2025-12-21
 """
 
 import os
@@ -21,7 +22,7 @@ import torch
 import soundfile as sf
 import librosa
 import numpy as np
-from transformers import AutoProcessor, AutoModelForCausalLM
+from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq, AutoModelForCausalLM
 from pyannote.audio import Pipeline
 import runpod
 
@@ -32,7 +33,6 @@ warnings.filterwarnings("ignore", message=".*torchcodec.*")
 warnings.filterwarnings("ignore", message=".*libtorchcodec.*")
 
 # Suppression des warnings torchcodec spécifiquement
-import logging
 torchcodec_logger = logging.getLogger("pyannote.audio.core.io")
 torchcodec_logger.setLevel(logging.ERROR)
 
@@ -49,6 +49,13 @@ VOXTRAL_MODEL = "mistralai/Voxtral-Small-24B-2507"
 DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_DOWNLOAD_TIMEOUT = 3600  # 60 minutes pour le téléchargement (modèle 45GB)
+MAX_DURATION = int(os.getenv("MAX_DURATION_S", "9000"))
+
+# Variables globales pour le cache des modèles
+voxtral_model = None
+voxtral_processor = None
+diarizer = None
+
 
 @contextmanager
 def timeout(duration):
@@ -56,16 +63,15 @@ def timeout(duration):
     def timeout_handler(signum, frame):
         raise TimeoutError(f"Opération timeout après {duration} secondes")
     
-    # Configurer le signal d'alarme
     old_handler = signal.signal(signal.SIGALRM, timeout_handler)
     signal.alarm(duration)
     
     try:
         yield
     finally:
-        # Nettoyer
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
+
 
 def warm_model_cache():
     """Pré-télécharge le modèle Voxtral pour accélérer le démarrage"""
@@ -73,7 +79,6 @@ def warm_model_cache():
     
     logger.info("=== Voxtral Cache Warming ===")
     
-    # Vérifier le cache existant
     try:
         cache_info = scan_cache_dir()
         cached_repos = [repo.repo_id for repo in cache_info.repos]
@@ -89,7 +94,6 @@ def warm_model_cache():
     except Exception as e:
         logger.warning(f"Impossible de vérifier le cache: {e}")
     
-    # Télécharger le modèle
     try:
         hf_token = os.getenv("HF_TOKEN")
         start_time = time.time()
@@ -112,12 +116,7 @@ def warm_model_cache():
     except Exception as e:
         logger.error(f"❌ Erreur lors du téléchargement: {e}")
         return False
-MAX_DURATION = int(os.getenv("MAX_DURATION_S", "9000"))
 
-# Variables globales pour le cache des modèles
-voxtral_model = None
-voxtral_processor = None
-diarizer = None
 
 def log_gpu_memory():
     """Affiche l'utilisation mémoire GPU"""
@@ -128,11 +127,13 @@ def log_gpu_memory():
         free = total - allocated
         logger.info(f"[GPU] Total: {total:.1f}GB | Allocated: {allocated:.1f}GB | Cached: {cached:.1f}GB | Free: {free:.1f}GB")
 
+
 def cleanup_gpu():
     """Nettoie la mémoire GPU"""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
+
 
 def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
     """
@@ -143,35 +144,34 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
     if voxtral_model is not None and voxtral_processor is not None:
         return voxtral_model, voxtral_processor
     
+    hf_token = os.getenv("HF_TOKEN")
+    
     try:
         logger.info(f"[VOXTRAL] Chargement du modèle: {VOXTRAL_MODEL}")
         
-        # Chargement du processor avec gestion HF token
-        hf_token = os.getenv("HF_TOKEN")
-        # Chargement du processor Voxtral - approche simplifiée sans arguments problématiques
+        # Chargement du processor
         logger.info("[VOXTRAL] Chargement du processor...")
         
+        # Essai 1: AutoProcessor standard
         try:
-            # Approche directe sans passer par AutoProcessor qui ajoute des kwargs problématiques
-            from transformers.models.voxtral import VoxtralProcessor
-            
-            # Chargement sans les kwargs qui posent problème
-            voxtral_processor = VoxtralProcessor.from_pretrained(VOXTRAL_MODEL)
-            logger.info("[VOXTRAL] ✓ VoxtralProcessor chargé directement")
-            
+            voxtral_processor = AutoProcessor.from_pretrained(
+                VOXTRAL_MODEL,
+                token=hf_token,
+                trust_remote_code=True
+            )
+            logger.info("[VOXTRAL] ✓ AutoProcessor chargé")
         except Exception as e:
-            logger.warning(f"[VOXTRAL] ⚠ VoxtralProcessor direct échoué: {e}")
+            logger.warning(f"[VOXTRAL] ⚠ AutoProcessor échoué: {e}")
+            
+            # Essai 2: Chargement des composants individuels
             try:
-                # Fallback: chargement manuel des composants
                 from transformers import AutoTokenizer, AutoFeatureExtractor
                 
                 logger.info("[VOXTRAL] Chargement des composants individuels...")
+                tokenizer = AutoTokenizer.from_pretrained(VOXTRAL_MODEL, token=hf_token, trust_remote_code=True)
+                feature_extractor = AutoFeatureExtractor.from_pretrained(VOXTRAL_MODEL, token=hf_token, trust_remote_code=True)
                 
-                # Chargement simplifié des composants (auth gérée globalement)
-                tokenizer = AutoTokenizer.from_pretrained(VOXTRAL_MODEL)
-                feature_extractor = AutoFeatureExtractor.from_pretrained(VOXTRAL_MODEL)
-                
-                # Création manuelle d'un objet processor
+                # Création d'un processor manuel
                 class VoxtralProcessorManual:
                     def __init__(self, tokenizer, feature_extractor):
                         self.tokenizer = tokenizer
@@ -180,7 +180,6 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                     def __call__(self, audio=None, text=None, sampling_rate=16000, return_tensors="pt"):
                         result = {}
                         if audio is not None:
-                            # Process audio through feature extractor
                             audio_features = self.feature_extractor(
                                 audio, 
                                 sampling_rate=sampling_rate, 
@@ -188,7 +187,6 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                             )
                             result.update(audio_features)
                         if text is not None:
-                            # Process text through tokenizer
                             text_features = self.tokenizer(
                                 text, 
                                 return_tensors=return_tensors,
@@ -208,99 +206,79 @@ def load_voxtral_model() -> Tuple[Optional[Any], Optional[Any]]:
                 logger.error(f"[VOXTRAL] ✗ Erreur processor manuel: {e2}")
                 return None, None
         
-        # Chargement du modèle avec approche simplifiée
+        # Chargement du modèle
         logger.info("[VOXTRAL] Chargement du modèle...")
+        logger.info(f"[VOXTRAL] Timeout configuré: {MODEL_DOWNLOAD_TIMEOUT}s")
+        
+        start_time = time.time()
+        
         try:
-            # Vérification de la disponibilité du modèle dans le cache
-            from huggingface_hub import scan_cache_dir, try_to_load_from_cache
-            
-            # Essayer de charger depuis le cache d'abord
-            cache_info = None
+            # Essai 1: VoxtralForConditionalGeneration direct
             try:
-                cache_info = scan_cache_dir()
-                cached_repo = None
-                for repo in cache_info.repos:
-                    if VOXTRAL_MODEL.split('/')[-1] in repo.repo_id:
-                        cached_repo = repo
-                        break
-                
-                if cached_repo:
-                    logger.info(f"[VOXTRAL] Modèle trouvé dans le cache: {cached_repo.size_on_disk_str}")
-                else:
-                    logger.info("[VOXTRAL] Aucun cache trouvé, téléchargement nécessaire")
-            except Exception as cache_err:
-                logger.warning(f"[VOXTRAL] ⚠ Impossible de vérifier le cache: {cache_err}")
-            
-            # Chargement du vrai modèle Voxtral avec approche directe et timeout
-            logger.info(f"[VOXTRAL] Chargement du modèle Voxtral (timeout: {MODEL_DOWNLOAD_TIMEOUT}s)...")
-            
-            try:
-                # Première tentative: import direct de VoxtralForConditionalGeneration
                 from transformers.models.voxtral import VoxtralForConditionalGeneration
                 
                 with timeout(MODEL_DOWNLOAD_TIMEOUT):
-                    # Ajout de logs détaillés pour le suivi du téléchargement
-                    logger.info("[VOXTRAL] Début du téléchargement/chargement du modèle (45GB)...")
-                    start_time = time.time()
-                    
-                    # Chargement simplifié sans paramètres d'authentification explicites
                     voxtral_model = VoxtralForConditionalGeneration.from_pretrained(
                         VOXTRAL_MODEL,
+                        token=hf_token,
                         torch_dtype=torch.bfloat16,
                         device_map="auto",
-                        low_cpu_mem_usage=True
+                        low_cpu_mem_usage=True,
+                        trust_remote_code=True
                     )
-                    
-                    elapsed_time = time.time() - start_time
-                    logger.info(f"[VOXTRAL] ✓ Modèle chargé en {elapsed_time:.1f}s")
-                
                 logger.info("[VOXTRAL] ✓ VoxtralForConditionalGeneration chargé")
                 
-            except (ImportError, TimeoutError) as e:
-                if isinstance(e, TimeoutError):
-                    logger.error(f"[VOXTRAL] ✗ Timeout lors du chargement VoxtralForConditionalGeneration: {e}")
-                else:
-                    logger.warning("[VOXTRAL] ⚠ VoxtralForConditionalGeneration non disponible, tentative AutoModel...")
+            except (ImportError, AttributeError) as e:
+                logger.warning(f"[VOXTRAL] VoxtralForConditionalGeneration non disponible: {e}")
                 
-                # Deuxième tentative: utilisation d'AutoModel avec trust_remote_code et timeout
+                # Essai 2: AutoModelForSpeechSeq2Seq
                 try:
-                    logger.info("[VOXTRAL] Tentative de fallback avec AutoModelForCausalLM...")
-                    start_time_fallback = time.time()
-                    
                     with timeout(MODEL_DOWNLOAD_TIMEOUT):
-                        # Chargement simplifié sans paramètres d'authentification explicites
-                        voxtral_model = AutoModelForCausalLM.from_pretrained(
+                        voxtral_model = AutoModelForSpeechSeq2Seq.from_pretrained(
                             VOXTRAL_MODEL,
+                            token=hf_token,
                             torch_dtype=torch.bfloat16,
                             device_map="auto",
-                            trust_remote_code=True,
-                            low_cpu_mem_usage=True
+                            low_cpu_mem_usage=True,
+                            trust_remote_code=True
                         )
+                    logger.info("[VOXTRAL] ✓ AutoModelForSpeechSeq2Seq chargé")
                     
-                    elapsed_time_fallback = time.time() - start_time_fallback
-                    logger.info(f"[VOXTRAL] ✓ AutoModel chargé en {elapsed_time_fallback:.1f}s")
+                except Exception as e2:
+                    logger.warning(f"[VOXTRAL] AutoModelForSpeechSeq2Seq échoué: {e2}")
                     
-                    logger.info("[VOXTRAL] ✓ AutoModelForCausalLM avec trust_remote_code chargé")
-                    
-                except TimeoutError as timeout_err:
-                    logger.error(f"[VOXTRAL] ✗ Timeout lors du chargement AutoModel: {timeout_err}")
-                    raise
-            
-            log_gpu_memory()
-            return voxtral_model, voxtral_processor
-            
-        except Exception as e:
-            logger.error(f"[VOXTRAL] ✗ Erreur modèle: {e}")
-            voxtral_processor = None
+                    # Essai 3: AutoModelForCausalLM (fallback)
+                    with timeout(MODEL_DOWNLOAD_TIMEOUT):
+                        voxtral_model = AutoModelForCausalLM.from_pretrained(
+                            VOXTRAL_MODEL,
+                            token=hf_token,
+                            torch_dtype=torch.bfloat16,
+                            device_map="auto",
+                            low_cpu_mem_usage=True,
+                            trust_remote_code=True
+                        )
+                    logger.info("[VOXTRAL] ✓ AutoModelForCausalLM chargé")
+        
+        except TimeoutError as e:
+            logger.error(f"[VOXTRAL] ✗ Timeout lors du chargement: {e}")
             return None, None
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"[VOXTRAL] Modèle chargé en {elapsed_time:.1f}s")
+        
+        log_gpu_memory()
+        return voxtral_model, voxtral_processor
             
     except Exception as e:
         logger.error(f"[VOXTRAL] ✗ Erreur générale: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None
+
 
 def load_diarizer() -> Optional[Pipeline]:
     """
-    Charge le pipeline de diarisation PyAnnote avec gestion des versions d'API
+    Charge le pipeline de diarisation PyAnnote avec API à jour
     """
     global diarizer
     
@@ -311,26 +289,27 @@ def load_diarizer() -> Optional[Pipeline]:
         logger.info(f"[DIARIZER] Chargement: {DIARIZATION_MODEL}")
         hf_token = os.getenv("HF_TOKEN")
         
-        # Approche simplifiée sans paramètres d'authentification explicites
-        # HuggingFace détectera automatiquement le token depuis l'environnement
+        # Méthode moderne avec paramètre 'token' (pas 'use_auth_token')
         try:
-            diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
-            logger.info("[DIARIZER] ✓ Chargé sans paramètres explicites")
-        except Exception as e:
-            logger.warning(f"[DIARIZER] ⚠ Échec chargement standard: {e}")
-            # Fallback: essayer avec use_auth_token si la version le supporte encore
-            try:
-                if hf_token:
-                    diarizer = Pipeline.from_pretrained(
-                        DIARIZATION_MODEL,
-                        use_auth_token=hf_token
-                    )
-                    logger.info("[DIARIZER] ✓ Chargé avec use_auth_token")
-                else:
-                    raise Exception("Aucun token disponible pour l'authentification")
-            except Exception as e2:
-                logger.error(f"[DIARIZER] ✗ Toutes les méthodes d'auth ont échoué: {e2}")
-                return None
+            if hf_token:
+                diarizer = Pipeline.from_pretrained(
+                    DIARIZATION_MODEL,
+                    token=hf_token  # Paramètre moderne
+                )
+            else:
+                diarizer = Pipeline.from_pretrained(DIARIZATION_MODEL)
+            logger.info("[DIARIZER] ✓ Pipeline chargé")
+            
+        except TypeError as e:
+            # Fallback pour anciennes versions de pyannote
+            if "token" in str(e):
+                logger.warning("[DIARIZER] ⚠ Fallback vers use_auth_token (ancienne API)")
+                diarizer = Pipeline.from_pretrained(
+                    DIARIZATION_MODEL,
+                    use_auth_token=hf_token
+                )
+            else:
+                raise
             
         diarizer.to(torch.device(DEVICE))
         logger.info("[DIARIZER] ✓ Diarizer chargé avec succès")
@@ -338,7 +317,10 @@ def load_diarizer() -> Optional[Pipeline]:
         
     except Exception as e:
         logger.error(f"[DIARIZER] ✗ Erreur: {e}")
+        import traceback
+        traceback.print_exc()
         return None
+
 
 def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
     """
@@ -379,28 +361,35 @@ def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
         # Déplacement vers GPU si disponible
         if DEVICE == "cuda":
             logger.info("[VOXTRAL] Déplacement vers GPU...")
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+            inputs = {k: v.to("cuda") if hasattr(v, 'to') else v for k, v in inputs.items()}
         
         # Génération avec Voxtral
         logger.info("[VOXTRAL] Génération en cours...")
         with torch.no_grad():
+            # Déterminer le pad_token_id
+            pad_token_id = 2  # Default
+            if hasattr(processor, 'tokenizer') and hasattr(processor.tokenizer, 'eos_token_id'):
+                pad_token_id = processor.tokenizer.eos_token_id
+            elif hasattr(processor, 'eos_token_id'):
+                pad_token_id = processor.eos_token_id
+            
             generated_ids = model.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
                 do_sample=False,
-                temperature=0.0,
-                pad_token_id=processor.tokenizer.eos_token_id if hasattr(processor, 'tokenizer') else 2
+                temperature=None,  # Pas de temperature en mode greedy
+                pad_token_id=pad_token_id
             )
         
         logger.info("[VOXTRAL] Décodage...")
-        # Décodage de la transcription
         transcription = processor.batch_decode(
             generated_ids,
             skip_special_tokens=True
         )[0]
         
         logger.info(f"[VOXTRAL] ✓ Transcription terminée ({len(transcription)} caractères)")
-        logger.info(f"[VOXTRAL] Aperçu: {transcription[:100]}...")
+        if len(transcription) > 100:
+            logger.info(f"[VOXTRAL] Aperçu: {transcription[:100]}...")
         return transcription.strip()
         
     except Exception as e:
@@ -408,6 +397,7 @@ def transcribe_with_voxtral(audio_path: str, max_tokens: int = 2500) -> str:
         import traceback
         traceback.print_exc()
         return ""
+
 
 def perform_diarization(audio_path: str) -> List[Dict]:
     """
@@ -435,25 +425,24 @@ def perform_diarization(audio_path: str) -> List[Dict]:
         
     except Exception as e:
         logger.error(f"[DIARIZER] ✗ Erreur: {e}")
+        import traceback
+        traceback.print_exc()
         return []
+
 
 def extract_audio_segment(audio_path: str, start_time: float, end_time: float) -> str:
     """
     Extrait un segment audio entre start_time et end_time
     """
     try:
-        # Lecture de l'audio complet
         audio, sample_rate = sf.read(audio_path)
         
-        # Calcul des indices de début et fin
         start_idx = int(start_time * sample_rate)
         end_idx = int(end_time * sample_rate)
         
-        # Extraction du segment
         segment = audio[start_idx:end_idx]
         
-        # Sauvegarde temporaire
-        temp_path = f"/tmp/segment_{int(start_time)}_{int(end_time)}.wav"
+        temp_path = f"/tmp/segment_{int(start_time*1000)}_{int(end_time*1000)}.wav"
         sf.write(temp_path, segment, sample_rate)
         
         return temp_path
@@ -462,16 +451,16 @@ def extract_audio_segment(audio_path: str, start_time: float, end_time: float) -
         logger.error(f"[EXTRACT] Erreur extraction segment: {e}")
         return ""
 
+
 def analyze_sentiment(text: str) -> str:
     """
-    Analyse basique du sentiment (peut être étendue avec un modèle dédié)
+    Analyse basique du sentiment
     """
     if not text:
         return "neutre"
     
-    # Mots-clés positifs et négatifs (français)
-    positive_words = ["merci", "bien", "parfait", "excellent", "content", "satisfait", "ok"]
-    negative_words = ["problème", "erreur", "mal", "mauvais", "pas bien", "insatisfait", "déçu"]
+    positive_words = ["merci", "bien", "parfait", "excellent", "content", "satisfait", "ok", "super", "génial"]
+    negative_words = ["problème", "erreur", "mal", "mauvais", "pas bien", "insatisfait", "déçu", "terrible"]
     
     text_lower = text.lower()
     positive_count = sum(1 for word in positive_words if word in text_lower)
@@ -484,6 +473,7 @@ def analyze_sentiment(text: str) -> str:
     else:
         return "neutre"
 
+
 def create_summary(transcription: str) -> str:
     """
     Crée un résumé basique de la transcription
@@ -491,16 +481,15 @@ def create_summary(transcription: str) -> str:
     if not transcription:
         return "Aucune transcription disponible"
     
-    # Résumé simple par troncature intelligente
     sentences = transcription.split('.')
     if len(sentences) <= 3:
         return transcription
     
-    # Prendre les premières et dernières phrases
     summary_sentences = sentences[:2] + sentences[-1:]
     summary = '. '.join(s.strip() for s in summary_sentences if s.strip())
     
     return f"Résumé: {summary}"
+
 
 def download_audio(url: str) -> str:
     """
@@ -508,10 +497,9 @@ def download_audio(url: str) -> str:
     """
     try:
         logger.info(f"[DOWNLOAD] Téléchargement: {url}")
-        response = requests.get(url, timeout=60)
+        response = requests.get(url, timeout=120)
         response.raise_for_status()
         
-        # Création d'un fichier temporaire
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
             temp_file.write(response.content)
             temp_path = temp_file.name
@@ -523,6 +511,7 @@ def download_audio(url: str) -> str:
         logger.error(f"[DOWNLOAD] ✗ Erreur: {e}")
         return ""
 
+
 def process_audio_request(job_input: Dict[str, Any]) -> Dict[str, Any]:
     """
     Traite une demande de transcription audio
@@ -530,7 +519,6 @@ def process_audio_request(job_input: Dict[str, Any]) -> Dict[str, Any]:
     temp_files = []
     
     try:
-        # Extraction des paramètres
         task = job_input.get("task", "transcribe")
         audio_url = job_input.get("audio_url", "")
         language = job_input.get("language", "fr")
@@ -562,21 +550,17 @@ def process_audio_request(job_input: Dict[str, Any]) -> Dict[str, Any]:
         # Traitement selon la tâche demandée
         if task in ["transcribe", "transcribe_diarized"]:
             if task == "transcribe_diarized":
-                # Diarisation + transcription par segment
                 logger.info("[HANDLER] Mode diarisation activé")
                 segments = perform_diarization(audio_path)
                 
                 if segments:
                     transcriptions = []
                     for segment in segments:
-                        # Extraction du segment audio
                         segment_path = extract_audio_segment(
                             audio_path, segment["start"], segment["end"]
                         )
                         if segment_path:
                             temp_files.append(segment_path)
-                            
-                            # Transcription du segment
                             segment_text = transcribe_with_voxtral(segment_path, 500)
                             
                             transcriptions.append({
@@ -587,16 +571,12 @@ def process_audio_request(job_input: Dict[str, Any]) -> Dict[str, Any]:
                             })
                     
                     result["transcriptions"] = transcriptions
-                    
-                    # Transcription complète concatenée
                     full_transcription = " ".join(t["text"] for t in transcriptions if t["text"])
                 else:
-                    # Fallback: transcription sans diarisation
                     logger.info("[HANDLER] Fallback: transcription simple")
                     full_transcription = transcribe_with_voxtral(audio_path, max_tokens)
                     result["transcriptions"] = [{"speaker": "UNKNOWN", "text": full_transcription}]
             else:
-                # Transcription simple
                 full_transcription = transcribe_with_voxtral(audio_path, max_tokens)
                 result["transcription"] = full_transcription
             
@@ -619,10 +599,11 @@ def process_audio_request(job_input: Dict[str, Any]) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"[HANDLER] ✗ Erreur: {e}")
+        import traceback
+        traceback.print_exc()
         return {"error": str(e)}
         
     finally:
-        # Nettoyage des fichiers temporaires
         for temp_file in temp_files:
             try:
                 if os.path.exists(temp_file):
@@ -632,23 +613,24 @@ def process_audio_request(job_input: Dict[str, Any]) -> Dict[str, Any]:
         
         cleanup_gpu()
 
+
 def initialize_models():
     """
-    Initialise les modèles au démarrage (optionnel)
+    Initialise les modèles au démarrage
     """
     try:
         logger.info("[INIT] Pré-chargement des modèles...")
         
-        # Configuration globale du token HuggingFace
         hf_token = os.getenv("HF_TOKEN")
         if hf_token:
-            # Configurer l'authentification HuggingFace globalement
             from huggingface_hub import login
             try:
                 login(token=hf_token, add_to_git_credential=False)
                 logger.info("[INIT] ✓ Authentification HuggingFace configurée")
             except Exception as e:
                 logger.warning(f"[INIT] ⚠ Échec configuration auth HF: {e}")
+        else:
+            logger.warning("[INIT] ⚠ HF_TOKEN non défini - accès limité aux modèles")
         
         log_gpu_memory()
         
@@ -671,8 +653,10 @@ def initialize_models():
         
     except Exception as e:
         logger.error(f"[INIT] ✗ Erreur initialisation: {e}")
+        import traceback
+        traceback.print_exc()
 
-# Point d'entrée principal pour RunPod
+
 def handler(job):
     """
     Handler principal pour RunPod serverless
@@ -695,6 +679,7 @@ def handler(job):
         traceback.print_exc()
         return {"error": f"Erreur handler: {str(e)}"}
 
+
 if __name__ == "__main__":
     import sys
     
@@ -705,7 +690,6 @@ if __name__ == "__main__":
     
     # Test local ou démarrage RunPod
     if os.getenv("RUNPOD_DEBUG"):
-        # Mode debug local
         test_input = {
             "task": "transcribe_diarized",
             "audio_url": "https://example.com/test.wav",
