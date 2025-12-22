@@ -1,56 +1,48 @@
-FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-RUN rm -f /etc/apt/sources.list.d/*.list
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
+    PYTORCH_JIT=0 \
+    APP_VERSION=2025-12-22-voxtral-pinned
 
-SHELL ["/bin/bash", "-c"]
-ENV DEBIAN_FRONTEND=noninteractive
-ENV SHELL=/bin/bash
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    ffmpeg libsndfile1 git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /
+WORKDIR /app
 
-# Update and upgrade the system packages
-RUN apt-get update -y && \
-    apt-get upgrade -y && \
-    apt-get install --yes --no-install-recommends sudo ca-certificates git wget curl bash libgl1 libx11-6 software-properties-common ffmpeg build-essential -y &&\
-    apt-get autoremove -y && \
-    apt-get clean -y && \
-    rm -rf /var/lib/apt/lists/*
+# Torch (CUDA 12.1 wheels)
+RUN python3 -m pip install --upgrade pip setuptools wheel \
+ && python3 -m pip install --index-url https://download.pytorch.org/whl/cu121 \
+    torch torchvision torchaudio
 
-# Install Python 3.10
-RUN apt-get update -y && \
-    apt-get install python3.10 python3.10-dev python3.10-venv python3-pip -y --no-install-recommends && \
-    ln -s /usr/bin/python3.10 /usr/bin/python && \
-    rm -f /usr/bin/python3 && \
-    ln -s /usr/bin/python3.10 /usr/bin/python3 && \
-    apt-get autoremove -y && \
-    apt-get clean -y && \
-    rm -rf /var/lib/apt/lists/*
+# Python deps
+COPY requirements.txt /app/requirements.txt
+RUN python3 -m pip install -r /app/requirements.txt
 
+# App
+COPY main.py /app/main.py
 
-# 2.  cache directories
-RUN mkdir -p /cache/models /root/.cache/torch
+# Defaults (override in RunPod env if needed)
+ENV MODEL_ID="mistralai/Voxtral-Small-24B-2507" \
+    MAX_NEW_TOKENS="512" \
+    TEMPERATURE="0.0" \
+    TOP_P="0.95" \
+    HF_TOKEN="" \
+    MAX_DURATION_S="1200" \
+    DIAR_MODEL="pyannote/speaker-diarization-3.1" \
+    WITH_SUMMARY_DEFAULT="1" \
+    ENABLE_SENTIMENT="1" \
+    SENTIMENT_MODEL="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli" \
+    SENTIMENT_TYPE="zero-shot" \
+    SENTIMENT_DEVICE="-1" \
+    LOG_LEVEL="INFO"
 
-# 3.  clone whisperx *before* pip needs it
-#RUN git clone --depth 1 https://github.com/m-bain/whisperx.git /tmp/whisperx && \
-#    cd /tmp/whisperx && \
-#    git reset --hard 58f00339af7dcc9705ef40d97a1f40764b7cf555
-
-# 4.  requirements file (local copy that uses the clone)
-COPY builder/requirements.txt /builder/requirements.txt
-
-# 5.  python dependencies
-RUN python3 -m pip install --upgrade pip \
- && python3 -m pip install hf_transfer \ 
- && python3 -m pip install --no-cache-dir -r /builder/requirements.txt
-
-# 6.  local VAD model
-COPY models/whisperx-vad-segmentation.bin /root/.cache/torch/whisperx-vad-segmentation.bin
-
-# 7.  builder scripts + model downloader
-COPY builder /builder
-RUN chmod +x /builder/download_models.sh
-RUN --mount=type=secret,id=hf_token /builder/download_models.sh
-# 8.  application code
-COPY src .
-
-CMD ["python3", "-u", "/rp_handler.py"]
+ENTRYPOINT ["python3", "-u", "/app/main.py"]
