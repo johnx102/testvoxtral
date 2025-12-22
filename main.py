@@ -10,13 +10,15 @@ from transformers import (
     pipeline as hf_pipeline
 )
 
-# Voxtral class (transformers @ main / nightly)
+# Voxtral - Use AutoModelForSpeechSeq2Seq as fallback
 try:
     from transformers import VoxtralForConditionalGeneration  # type: ignore
     _HAS_VOXTRAL_CLASS = True
-except Exception:
-    VoxtralForConditionalGeneration = None  # type: ignore
-    _HAS_VOXTRAL_CLASS = False
+except Exception as e:
+    print(f"[WARN] VoxtralForConditionalGeneration not found: {e}. Using AutoModel fallback.")
+    from transformers import AutoModel  # type: ignore
+    VoxtralForConditionalGeneration = AutoModel  # type: ignore
+    _HAS_VOXTRAL_CLASS = True  # Force True to use AutoModel
 
 from pydub import AudioSegment
 from pyannote.audio import Pipeline
