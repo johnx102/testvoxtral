@@ -1,21 +1,17 @@
-# Stable, reproducible deps for Voxtral on RunPod Serverless
-# Voxtral supported natively starting transformers>=4.54.0
 transformers==4.56.2
-
-accelerate==0.35.0
+accelerate==0.34.2
 huggingface_hub==0.26.5
 
-numpy==1.26.4
 scipy==1.11.4
 soundfile==0.12.1
 librosa==0.10.2.post1
+numpy==1.26.4
 pydub==0.25.1
 requests==2.32.3
 
 pyannote.audio==3.3.2
 sentencepiece==0.2.0
 
-# Voxtral tokenizer backend (pin exact to avoid breaking changes)
-mistral_common[audio]==1.8.7
+mistral-common[audio]==1.8.7
 
 runpod==1.6.2

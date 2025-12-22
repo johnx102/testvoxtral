@@ -8,9 +8,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_DISABLE_TELEMETRY=1 \
     TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
     PYTORCH_JIT=0 \
-    APP_VERSION=2025-12-22-voxtral-pinned
+    APP_VERSION=2025-12-22-voxtral-fix02
 
-# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
     ffmpeg libsndfile1 git ca-certificates \
@@ -18,19 +17,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Torch (CUDA 12.1 wheels)
 RUN python3 -m pip install --upgrade pip setuptools wheel \
  && python3 -m pip install --index-url https://download.pytorch.org/whl/cu121 \
     torch torchvision torchaudio
 
-# Python deps
 COPY requirements.txt /app/requirements.txt
 RUN python3 -m pip install -r /app/requirements.txt
 
-# App
 COPY main.py /app/main.py
+COPY README.md /app/README.md
 
-# Defaults (override in RunPod env if needed)
 ENV MODEL_ID="mistralai/Voxtral-Small-24B-2507" \
     MAX_NEW_TOKENS="512" \
     TEMPERATURE="0.0" \
@@ -40,8 +36,6 @@ ENV MODEL_ID="mistralai/Voxtral-Small-24B-2507" \
     DIAR_MODEL="pyannote/speaker-diarization-3.1" \
     WITH_SUMMARY_DEFAULT="1" \
     ENABLE_SENTIMENT="1" \
-    SENTIMENT_MODEL="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli" \
-    SENTIMENT_TYPE="zero-shot" \
     SENTIMENT_DEVICE="-1" \
     LOG_LEVEL="INFO"
 
