@@ -13,6 +13,8 @@ numpy==1.26.4
 soundfile==0.12.1
 pydub==0.25.1
 requests==2.32.3
+torch
+torchaudio
 
 # Diarization (pyannote)
 pyannote.audio==3.1.1
@@ -21,7 +23,9 @@ torchmetrics==1.4.0
 omegaconf==2.3.0
 hydra-core==1.3.2
 einops==0.8.0
+
+# If you keep scikit-learn, bump scipy to avoid conflicts
 scikit-learn==1.4.2
-scipy==1.10.1
+scipy>=1.11.0,<1.13
 
 runpod==1.6.2
