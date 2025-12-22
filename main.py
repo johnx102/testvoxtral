@@ -19,15 +19,10 @@ except Exception:
     _HAS_VOXTRAL_CLASS = False
 
 from pydub import AudioSegment
-
-# Optional diarization dependency
 try:
-    from pyannote.audio import Pipeline  # type: ignore
-    _HAS_PYANNOTE = True
+    from pyannote.audio import Pipeline
 except Exception:
-    Pipeline = None  # type: ignore
-    _HAS_PYANNOTE = False
-
+    Pipeline = None
 import runpod
 
 # ---------------------------
@@ -139,7 +134,7 @@ def load_voxtral():
         if HF_TOKEN:
             proc_kwargs["token"] = HF_TOKEN
         log("[INIT] Loading processor...")
-        _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
+        _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs, trust_remote_code=True)
         log("[INIT] Processor loaded successfully")
     except Exception as e:
         log(f"[ERROR] Failed to load processor: {e}")
@@ -160,7 +155,7 @@ def load_voxtral():
     try:
         log("[INIT] Loading model... (this may take several minutes)")
         if _HAS_VOXTRAL_CLASS:
-            _model = VoxtralForConditionalGeneration.from_pretrained(MODEL_ID, **mdl_kwargs)
+            _model = VoxtralForConditionalGeneration.from_pretrained(MODEL_ID, **mdl_kwargs, trust_remote_code=True)
         else:
             raise RuntimeError("Transformers sans VoxtralForConditionalGeneration. Utiliser transformers@main/nightly.")
         log("[INIT] Model loaded successfully")
@@ -298,8 +293,6 @@ def clean_transcription_result(text: str, duration_s: float) -> str:
 # ---------------------------
 def load_diarizer():
     global _diarizer
-    if not _HAS_PYANNOTE:
-        raise RuntimeError("pyannote.audio is not installed in this image. Rebuild with pyannote support or disable diarization.")
     if _diarizer is not None:
         return _diarizer
     log(f"[INIT] Loading diarization: {DIAR_MODEL}")

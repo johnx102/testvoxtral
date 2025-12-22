@@ -1,15 +1,16 @@
 transformers==4.56.2
 accelerate==0.34.2
-huggingface_hub==0.24.6
-scipy==1.11.4
-soundfile==0.12.1
-librosa==0.10.2.post1
-numpy==1.26.4
-pydub==0.25.1
-requests==2.32.3
-sentencepiece==0.2.0
-mistral-common[audio]==1.8.6
-runpod==1.6.2
+huggingface_hub>=0.23.4
 
-# Optional (diarization) - build a separate image if needed:
-# pyannote.audio==3.1.1
+numpy==1.26.4
+scipy>=1.10.0
+soundfile>=0.12.1
+librosa>=0.10.2.post1
+pydub>=0.25.1
+requests>=2.32.0
+sentencepiece>=0.2.0
+
+# Voxtral tokenizer backend (required). Audio extra pulls soxr/soundfile helpers.
+mistral_common[audio]==1.8.8
+
+runpod==1.6.2
