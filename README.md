@@ -1,31 +1,9 @@
-# Voxtral Mini 3B — Transcription + Résumé + Diarization + Humeur (Health3)
+# Voxtral RunPod Serverless (Pinned, conflict-free)
 
-**Fixes clés :**
-- Sentiment **sur CPU** par défaut (`SENTIMENT_DEVICE=-1`) + `PYTORCH_JIT=0` → évite l'erreur NVRTC/TorchScript `fabs(...)`.
-- Diarizer `.to(...)` **robuste** : essaie CUDA (torch.device), sinon garde sur CPU sans crasher.
-- `APP_VERSION=2025-08-23-02` renvoyé dans `/health` pour vérifier que la bonne image tourne.
+This build removes `accelerate` and other optional deps to avoid pip resolution conflicts on RunPod.
+Diarization (pyannote) is optional and disabled unless you add it yourself.
 
-## Health
-```bash
-curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
-  -H "Authorization: Bearer $RUNPOD_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{ "input": { "task": "health" } }'
-```
-Vérifie que `info.app_version` = **2025-08-23-02** et `sentiment_device` = **cpu**.
+## Build
+Use the included Dockerfile and requirements.txt.
 
-## Transcription diarized
-```bash
-curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
-  -H "Authorization: Bearer $RUNPOD_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "input": {
-      "task": "transcribe_diarized",
-      "audio_url": "https://example.com/mon_audio.wav",
-      "language": "fr",
-      "with_summary": true,
-      "max_new_tokens": 512
-    }
-  }'
-```
+If pip fails during build, the Dockerfile prints the tail of `/tmp/pip_install.log` in the build logs.

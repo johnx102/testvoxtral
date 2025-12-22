@@ -2,7 +2,6 @@ FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
@@ -10,8 +9,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTORCH_JIT=0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv python3-dev \
-    ffmpeg libsndfile1 git ca-certificates \
+    python3 python3-pip python3-venv \
+    ffmpeg libsndfile1 \
+    git ca-certificates \
     build-essential pkg-config \
  && rm -rf /var/lib/apt/lists/*
 
@@ -24,21 +24,15 @@ RUN python3 -m pip install --upgrade pip setuptools wheel \
 
 COPY requirements.txt /app/requirements.txt
 
-# Install deps with verbose logging; if it fails, print the tail so RunPod logs show the real error.
+# Install deps; if it fails, print the tail of pip log so RunPod UI shows the real error
 RUN set -eux; \
-    python3 -m pip install -v --progress-bar off -r /app/requirements.txt 2>&1 | tee /tmp/pip_install.log || (echo '----- pip install FAILED (tail) -----'; tail -n 200 /tmp/pip_install.log || true; exit 1); \
-    python3 -m pip check; \
-    true
+    python3 -m pip install -v -r /app/requirements.txt 2>&1 | tee /tmp/pip_install.log; \
+    python3 -m pip check
 
 COPY main.py /app/main.py
 
 ENV MODEL_ID="mistralai/Voxtral-Small-24B-2507" \
-    MAX_NEW_TOKENS="512" \
-    TEMPERATURE="0.0" \
-    TOP_P="0.95" \
     HF_TOKEN="" \
-    MAX_DURATION_S="1200" \
-    WITH_SUMMARY_DEFAULT="1" \
     LOG_LEVEL="INFO"
 
 ENTRYPOINT ["python3", "-u", "/app/main.py"]
