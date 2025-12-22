@@ -316,6 +316,10 @@ def run(job):
     job_id     = job["id"]
     job_input  = job["input"]
 
+    # ------------- Compatibilité audio_url -> audio_file ------------
+    if "audio_url" in job_input and "audio_file" not in job_input:
+        job_input["audio_file"] = job_input.pop("audio_url")
+
     # ------------- validate basic schema ----------------------------
     validated = validate(job_input, INPUT_VALIDATIONS)
     if "errors" in validated:
