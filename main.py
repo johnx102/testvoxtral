@@ -127,7 +127,7 @@ def load_voxtral():
     log(f"[INIT] Loading Voxtral: {MODEL_ID}")
 
     try:
-        proc_kwargs = {}
+        proc_kwargs = {"trust_remote_code": True}
         if HF_TOKEN:
             proc_kwargs["token"] = HF_TOKEN
         log("[INIT] Loading processor...")
@@ -145,6 +145,7 @@ def load_voxtral():
         "dtype": dtype,
         "device_map": "auto",
         "low_cpu_mem_usage": True,
+        "trust_remote_code": True,
     }
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
@@ -295,7 +296,7 @@ def load_diarizer():
     log(f"[INIT] Loading diarization: {DIAR_MODEL}")
     kwargs = {}
     if HF_TOKEN:
-        kwargs["token"] = HF_TOKEN
+        kwargs["use_auth_token"] = HF_TOKEN
     _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
     try:
         if torch.cuda.is_available():
