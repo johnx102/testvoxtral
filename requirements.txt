@@ -1,14 +1,13 @@
-# Core
 transformers==4.56.2
-mistral_common[audio]==1.8.8
+accelerate==1.10.1
+huggingface_hub>=0.23.4
 
-# App deps
-runpod==1.6.2
-requests>=2.32.0
-pydub>=0.25.1
+mistral_common[audio]==1.8.6
+
+numpy>=1.26.4
 soundfile>=0.12.1
-
-# Often needed by tokenizers/models (avoid source builds)
-numpy==1.26.4
+pydub>=0.25.1
+requests>=2.32.0
 sentencepiece>=0.2.0
-safetensors>=0.4.3
+
+runpod==1.6.2
