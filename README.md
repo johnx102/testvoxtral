@@ -1,4 +1,4 @@
-# Voxtral Mini 3B — Transcription + Résumé + Diarization + Humeur (Health3)
+c# Voxtral Mini 3B — Transcription + Résumé + Diarization + Humeur (Health3)
 
 **Fixes clés :**
 - Sentiment **sur CPU** par défaut (`SENTIMENT_DEVICE=-1`) + `PYTORCH_JIT=0` → évite l'erreur NVRTC/TorchScript `fabs(...)`.
