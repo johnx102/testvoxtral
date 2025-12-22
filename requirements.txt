@@ -1,5 +1,5 @@
 # Transformers - VERSION STABLE avec support Voxtral (ajouté en 4.54.0)
-transformers==4.57.3
+transformers>=4.54.0
 accelerate==0.34.2
 huggingface_hub>=0.34.0,<1.0
 scipy>=1.10.0
@@ -13,7 +13,7 @@ requests>=2.32.0
 pyannote.audio==3.3.2
 sentencepiece>=0.2.0
 
-# Voxtral tokenizer dependency
-mistral_common==1.5.0
+# Voxtral dependencies - CRITICAL: mistral-common avec audio support
+mistral_common[audio]>=1.8.1
 
 runpod==1.6.2
