@@ -5,6 +5,8 @@ import os, time, base64, tempfile, uuid, requests, json, traceback, re
 from typing import Optional, List, Dict, Any, Tuple
 
 import torch
+import numpy as np
+import torchaudio
 from transformers import (
     AutoProcessor, AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline,
     pipeline as hf_pipeline
@@ -19,10 +21,7 @@ except Exception:
     _HAS_VOXTRAL_CLASS = False
 
 from pydub import AudioSegment
-try:
-    from pyannote.audio import Pipeline
-except Exception:
-    Pipeline = None
+from pyannote.audio import Pipeline
 import runpod
 
 # ---------------------------
@@ -100,6 +99,35 @@ def _b64_to_tmp(b64: str) -> str:
         f.write(raw)
     return path
 
+
+def _load_audio_dict(path: str, target_sr: int = 16000) -> Dict[str, Any]:
+    """Load audio without librosa and return dict {'array': <list[float]>, 'sampling_rate': int}.
+    Uses torchaudio when possible, falls back to soundfile.
+    """
+    try:
+        wav, sr = torchaudio.load(path)  # (channels, time)
+    except Exception:
+        import soundfile as sf
+        data, sr = sf.read(path, always_2d=True)  # (time, channels)
+        wav = torch.from_numpy(data.T)
+    # mono
+    if wav.dim() == 2 and wav.size(0) > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    # resample
+    if sr != target_sr:
+        try:
+            wav = torchaudio.functional.resample(wav, sr, target_sr)
+        except Exception:
+            # simple fallback resample (slow but safe)
+            import torch.nn.functional as F
+            x = wav.unsqueeze(0)  # (1,1,T)
+            new_len = int(wav.size(-1) * target_sr / sr)
+            wav = F.interpolate(x, size=new_len, mode="linear", align_corners=False).squeeze(0)
+        sr = target_sr
+    arr = wav.squeeze(0).float().cpu().numpy()
+    return {"array": arr.tolist(), "sampling_rate": sr}
+
+
 def check_gpu_memory():
     """Vérifier la mémoire GPU disponible"""
     if torch.cuda.is_available():
@@ -134,7 +162,7 @@ def load_voxtral():
         if HF_TOKEN:
             proc_kwargs["token"] = HF_TOKEN
         log("[INIT] Loading processor...")
-        _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs, trust_remote_code=True)
+        _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
         log("[INIT] Processor loaded successfully")
     except Exception as e:
         log(f"[ERROR] Failed to load processor: {e}")
@@ -155,7 +183,7 @@ def load_voxtral():
     try:
         log("[INIT] Loading model... (this may take several minutes)")
         if _HAS_VOXTRAL_CLASS:
-            _model = VoxtralForConditionalGeneration.from_pretrained(MODEL_ID, **mdl_kwargs, trust_remote_code=True)
+            _model = VoxtralForConditionalGeneration.from_pretrained(MODEL_ID, **mdl_kwargs)
         else:
             raise RuntimeError("Transformers sans VoxtralForConditionalGeneration. Utiliser transformers@main/nightly.")
         log("[INIT] Model loaded successfully")
@@ -244,7 +272,7 @@ def _build_conv_transcribe_ultra_strict(local_path: str, language: Optional[str]
     return [{
         "role": "user",
         "content": [
-            {"type": "audio", "path": local_path},
+            {"type": "audio", "audio": _load_audio_dict(local_path)},
             {"type": "text", "text": "lang:fr [TRANSCRIBE] Écris exactement ce qui est dit, mot pour mot, en français uniquement."}
         ],
     }]
@@ -885,7 +913,7 @@ def detect_single_voice_content(wav_path: str, language: Optional[str]) -> Dict[
     conversation = [{
         "role": "user",
         "content": [
-            {"type": "audio", "path": wav_path},
+            {"type": "audio", "audio": _load_audio_dict(wav_path)},
             {"type": "text", "text": instruction}
         ]
     }]
@@ -1023,7 +1051,7 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     conv_speaker_id = [{
         "role": "user",
         "content": [
-            {"type": "audio", "path": wav_path},
+            {"type": "audio", "audio": _load_audio_dict(wav_path)},
             {"type": "text", "text": instruction}
         ]
     }]
@@ -2061,7 +2089,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 conv = [{
                     "role": "user",
                     "content": [
-                        {"type": "audio", "path": local_path},
+                        {"type": "audio", "audio": _load_audio_dict(local_path)},
                         {"type": "text", "text": instruction}
                     ]
                 }]
