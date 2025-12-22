@@ -1,7 +1,7 @@
 # Transformers - version stable avec support Voxtral
 transformers==4.48.0
-accelerate==0.35.0
-huggingface_hub==0.26.5
+accelerate>=0.33.0
+huggingface_hub>=0.23.4
 scipy>=1.10.0
 soundfile>=0.12.1
 librosa>=0.10.2.post1
