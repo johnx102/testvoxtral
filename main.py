@@ -1279,10 +1279,17 @@ def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_t
     except Exception as e:
         log(f"[PYANNOTE_AUTO] Could not check duration: {e}")
 
-    # DIARIZATION AUTOMATIQUE (SANS PARAMÈTRES)
+    # DIARIZATION AVEC NOMBRE DE SPEAKERS FORCÉ
     log("[PYANNOTE_AUTO] Running automatic diarization...")
     dia = load_diarizer()
-    diarization = dia(wav_path)  # Laisse PyAnnote décider complètement
+
+    # FORCER num_speakers pour éviter la détection de la musique d'attente
+    diarization_kwargs = {}
+    if EXACT_TWO or MAX_SPEAKERS == 2:
+        diarization_kwargs["num_speakers"] = 2
+        log(f"[PYANNOTE_AUTO] Forcing exactly 2 speakers (EXACT_TWO={EXACT_TWO}, MAX_SPEAKERS={MAX_SPEAKERS})")
+
+    diarization = dia(wav_path, **diarization_kwargs)
     
     # Collecter tous les segments
     raw_segments = []
