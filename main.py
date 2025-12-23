@@ -130,11 +130,7 @@ def load_voxtral():
     log(f"[INIT] Loading Voxtral: {MODEL_ID}")
 
     try:
-        proc_kwargs = {
-            "trust_remote_code": True,
-            "local_files_only": False,  # Allow download if not cached
-            "resume_download": True,    # Resume interrupted downloads
-        }
+        proc_kwargs = {"trust_remote_code": True}
         if HF_TOKEN:
             proc_kwargs["token"] = HF_TOKEN
         log("[INIT] Loading processor...")
@@ -153,8 +149,6 @@ def load_voxtral():
         "device_map": "auto",
         "low_cpu_mem_usage": True,
         "trust_remote_code": True,
-        "local_files_only": False,  # Allow download if not cached
-        "resume_download": True,    # Resume interrupted downloads
     }
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
