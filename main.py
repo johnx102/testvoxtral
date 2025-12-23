@@ -1336,8 +1336,8 @@ def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_t
                 
                 seg["speaker"] = best_speaker
     
-    # Appliquer le mode hybride avec les segments PyAnnote auto
-    return apply_hybrid_workflow_with_segments(wav_path, raw_segments, language, max_new_tokens, with_summary)
+    # Appliquer le mode hybride avec les segments PyAnnote auto (SANS ultra_merge)
+    return apply_hybrid_workflow_with_segments(wav_path, raw_segments, language, max_new_tokens, with_summary, skip_ultra_merge=True)
 
 def ultra_aggressive_merge(segments: List[Dict[str, Any]], max_gap: float = 3.0) -> List[Dict[str, Any]]:
     """
@@ -1383,18 +1383,22 @@ def ultra_aggressive_merge(segments: List[Dict[str, Any]], max_gap: float = 3.0)
     
     log(f"[ULTRA_MERGE] Result: {len(segments)} → {len(merged)} segments")
     return merged
-def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool):
+def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool, skip_ultra_merge: bool = False):
     """Applique le workflow hybride avec des segments de diarization fournis"""
     # Transcription globale
     conv_global = _build_conv_transcribe_ultra_strict(wav_path, language or "fr")
     out_global = run_voxtral_with_timeout(conv_global, max_new_tokens=max_new_tokens, timeout=60)
     full_text = (out_global.get("text") or "").strip()
-    
+
     if not full_text:
         return {"error": "Empty global transcription"}
-    
-    # Optimisation des segments
-    optimized_segments = optimize_diarization_segments(diar_segments)
+
+    # Optimisation des segments (skip pour PYANNOTE_AUTO si demandé)
+    if skip_ultra_merge:
+        log("[HYBRID] Skipping ultra_merge for better PyAnnote accuracy")
+        optimized_segments = diar_segments  # Garder les segments PyAnnote bruts
+    else:
+        optimized_segments = optimize_diarization_segments(diar_segments)
     
     # Attribution du texte (réutilise la logique existante)
     sentences = smart_sentence_split(full_text)
