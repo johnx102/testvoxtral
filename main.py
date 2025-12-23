@@ -373,13 +373,24 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
         "pas content du tout", "vraiment pas content", "pas contente du tout",
         "très mécontent", "très déçu", "complètement déçu",
         "annulé à cause", "annuler parce que", "se foutre la honte",
-        "inadmissible", "inacceptable", "catastrophe", "scandaleux"
+        "inadmissible", "inacceptable", "catastrophe", "scandaleux",
+        # Colère explicite
+        "en colère", "énervé", "furieux", "exaspéré",
+        "ras-le-bol", "j'en ai marre", "c'est honteux",
+        "n'importe quoi", "vous vous moquez", "c'est une blague",
+        "c'est du foutage", "limite", "sérieux là",
+        "c'est abusé", "vous abusez", "c'est grave"
     ]
-    
+
     # MOTS MOYENNEMENT NÉGATIFS (besoin d'accumulation)
     mild_negative = [
-        "pas content", "pas satisfait", "déçu", "problème", 
-        "difficile", "compliqué", "pas possible"
+        "pas content", "pas satisfait", "déçu", "problème",
+        "difficile", "compliqué", "pas possible",
+        # Frustration/Impatience
+        "encore", "toujours pas", "ça fait longtemps",
+        "combien de fois", "à chaque fois", "ça suffit",
+        "patienter", "retard", "toujours le même",
+        "ça traîne", "trop long", "pas normal"
     ]
     
     # INDICATEURS POSITIFS (seuil plus bas)
@@ -415,8 +426,8 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
             "scores": {"negative": 0.90, "neutral": 0.08, "positive": 0.02}
         }
     
-    # 2. Beaucoup de positifs = positif (SEUIL ABAISSÉ)
-    if positive_count >= 2 and mild_neg_count == 0:
+    # 2. Beaucoup de positifs = positif (SEUIL PLUS CONSERVATEUR)
+    if positive_count >= 3 and mild_neg_count == 0:
         log(f"[SENTIMENT] Clear positive: {positive_count} indicators")
         return {
             "label_en": "positive",
@@ -480,8 +491,8 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
         log(f"[SENTIMENT] Voxtral: '{response}' (pos:{positive_count} neg:{mild_neg_count})")
         
         if "insatisfaisant" in response:
-            # Override si trop de positifs
-            if positive_count >= 2:
+            # Override si BEAUCOUP de positifs (seuil augmenté)
+            if positive_count >= 4:
                 return {
                     "label_en": "neutral",
                     "label_fr": "neutre",
@@ -546,11 +557,26 @@ def validate_sentiment_coherence(text: str, sentiment: Dict[str, Any]) -> Dict[s
     strong_negative_phrases = [
         "pas content", "pas contente",
         "annulé", "annuler à cause",
-        "se foutre la honte", 
+        "se foutre la honte",
         "pas satisfait", "pas satisfaite",
         "je veux parler", "parler avec le responsable",
         "ce n'est pas normal",
-        "c'est inadmissible"
+        "c'est inadmissible",
+        # Mécontentement explicite
+        "ça ne va pas du tout", "c'est la dernière fois",
+        "je change de", "je vais voir ailleurs",
+        "un concurrent", "chez un concurrent",
+        "je vais me plaindre", "porter plainte",
+        "service client nul", "nul", "zéro",
+        "catastrophique", "lamentable",
+        # Menaces/Escalade
+        "avocat", "mon avocat",
+        "résilier", "résiliation",
+        "remboursement immédiat", "je veux un remboursement",
+        # Expressions de colère
+        "j'en ai assez", "j'en peux plus",
+        "c'est toujours pareil", "à chaque fois c'est pareil",
+        "vous êtes nuls", "incompétent"
     ]
     
     text_lower = text.lower()
@@ -582,6 +608,72 @@ def classify_sentiment(text: str) -> Dict[str, Any]:
     sentiment = validate_sentiment_coherence(text, sentiment)
     
     return sentiment
+
+def analyze_sentiment_by_speaker(segments: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Analyse le sentiment pour chaque speaker séparément.
+    FOCUS: Le client est généralement le premier speaker ou celui qui parle le moins.
+    """
+    if not ENABLE_SENTIMENT or not segments:
+        return {}
+
+    # Grouper les paroles par speaker
+    speaker_texts = {}
+    speaker_durations = {}
+
+    for seg in segments:
+        speaker = seg.get("speaker")
+        text = seg.get("text", "").strip()
+        if not speaker or not text:
+            continue
+
+        if speaker not in speaker_texts:
+            speaker_texts[speaker] = []
+            speaker_durations[speaker] = 0.0
+
+        speaker_texts[speaker].append(text)
+        speaker_durations[speaker] += (seg.get("end", 0) - seg.get("start", 0))
+
+    # Analyser le sentiment pour chaque speaker
+    speaker_sentiments = {}
+    for speaker, texts in speaker_texts.items():
+        combined_text = " ".join(texts)
+        sentiment = classify_sentiment(combined_text)
+        speaker_sentiments[speaker] = sentiment
+        log(f"[SENTIMENT_BY_SPEAKER] {speaker}: {sentiment.get('label_fr')} (confidence: {sentiment.get('confidence', 0):.2f})")
+
+    return speaker_sentiments
+
+
+def get_client_sentiment(speaker_sentiments: Dict[str, Dict[str, Any]], segments: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Identifie le sentiment du CLIENT (pas de l'agent).
+    Heuristique: Le client est généralement le premier speaker ou celui qui parle le moins.
+    """
+    if not speaker_sentiments:
+        return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
+
+    # Compter le temps de parole par speaker
+    speaker_durations = {}
+    for seg in segments:
+        speaker = seg.get("speaker")
+        if speaker:
+            duration = seg.get("end", 0) - seg.get("start", 0)
+            speaker_durations[speaker] = speaker_durations.get(speaker, 0.0) + duration
+
+    # Le client parle généralement MOINS que l'agent
+    if speaker_durations:
+        client_speaker = min(speaker_durations.items(), key=lambda x: x[1])[0]
+        log(f"[CLIENT_DETECTION] Client identifié: {client_speaker} (temps de parole: {speaker_durations[client_speaker]:.1f}s)")
+        return speaker_sentiments.get(client_speaker, {"label_en": None, "label_fr": None, "confidence": None, "scores": None})
+
+    # Fallback: premier speaker
+    first_speaker = segments[0].get("speaker") if segments else None
+    if first_speaker and first_speaker in speaker_sentiments:
+        return speaker_sentiments[first_speaker]
+
+    return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
+
 
 def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, Any]:
     total = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
@@ -1052,6 +1144,7 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
 
     # POST-TRAITEMENT STANDARD
     segments = _enforce_max_two_speakers(segments)
+    segments = detect_and_fix_speaker_inversion(segments)  # AVANT _map_roles
     _map_roles(segments)
     
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
@@ -1062,28 +1155,35 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
         log("[VOXTRAL_ID] Generating summary...")
         result["summary"] = select_best_summary_approach(full_transcript)
     
-    # Sentiment global rapide
+    # Sentiment par speaker (analyse améliorée)
     if ENABLE_SENTIMENT:
-        log("[VOXTRAL_ID] Computing sentiment analysis...")
-        global_mood = classify_sentiment(full_transcript) if full_transcript else None
-        
-        if global_mood and global_mood.get("scores"):
-            # Attribution du sentiment global à tous les segments
+        log("[VOXTRAL_ID] Computing sentiment analysis by speaker...")
+
+        # Analyse le sentiment pour chaque speaker séparément
+        speaker_sentiments = analyze_sentiment_by_speaker(segments)
+
+        if speaker_sentiments:
+            # Attribuer le sentiment spécifique à chaque segment
             for seg in segments:
-                if seg.get("text"):
-                    seg["mood"] = global_mood
-            
-            # Mood overall et par speaker
-            weighted_moods = [(global_mood, float(seg["end"]) - float(seg["start"])) for seg in segments if seg.get("text")]
-            result["mood_overall"] = aggregate_mood(weighted_moods)
-            
-            per_role = {}
+                speaker = seg.get("speaker")
+                if speaker and speaker in speaker_sentiments:
+                    seg["mood"] = speaker_sentiments[speaker]
+
+            # Mood overall (moyenne pondérée de tous les speakers)
+            weighted_moods = []
             for seg in segments:
-                d = float(seg["end"]) - float(seg["start"])
-                r = seg["speaker"]
-                if seg.get("text"):
-                    per_role.setdefault(r, []).append((global_mood, d))
-            result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
+                if seg.get("text") and seg.get("mood"):
+                    duration = float(seg["end"]) - float(seg["start"])
+                    weighted_moods.append((seg["mood"], duration))
+            result["mood_overall"] = aggregate_mood(weighted_moods) if weighted_moods else None
+
+            # Mood par speaker (déjà calculé)
+            result["mood_by_speaker"] = speaker_sentiments
+
+            # NOUVEAU: Sentiment du client identifié
+            client_mood = get_client_sentiment(speaker_sentiments, segments)
+            result["mood_client"] = client_mood
+            log(f"[VOXTRAL_ID] Client sentiment: {client_mood.get('label_fr')} (confidence: {client_mood.get('confidence', 0):.2f})")
 
     log("[VOXTRAL_ID] Voxtral speaker identification completed successfully")
     return result
@@ -1320,6 +1420,7 @@ def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict]
     
     # Post-traitement standard
     segments = _enforce_max_two_speakers(segments)
+    segments = detect_and_fix_speaker_inversion(segments)  # AVANT _map_roles
     _map_roles(segments)
     
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
@@ -1329,22 +1430,33 @@ def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict]
         result["summary"] = select_best_summary_approach(full_transcript)
     
     if ENABLE_SENTIMENT:
-        global_mood = classify_sentiment(full_transcript) if full_transcript else None
-        if global_mood:
+        log("[PYANNOTE] Computing sentiment analysis by speaker...")
+
+        # Analyse le sentiment pour chaque speaker séparément
+        speaker_sentiments = analyze_sentiment_by_speaker(segments)
+
+        if speaker_sentiments:
+            # Attribuer le sentiment spécifique à chaque segment
             for seg in segments:
-                if seg.get("text"):
-                    seg["mood"] = global_mood
-            
-            weighted_moods = [(global_mood, float(seg["end"]) - float(seg["start"])) for seg in segments if seg.get("text")]
-            result["mood_overall"] = aggregate_mood(weighted_moods)
-            
-            per_role = {}
+                speaker = seg.get("speaker")
+                if speaker and speaker in speaker_sentiments:
+                    seg["mood"] = speaker_sentiments[speaker]
+
+            # Mood overall (moyenne pondérée de tous les speakers)
+            weighted_moods = []
             for seg in segments:
-                d = float(seg["end"]) - float(seg["start"])
-                r = seg["speaker"]
-                if seg.get("text"):
-                    per_role.setdefault(r, []).append((global_mood, d))
-            result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
+                if seg.get("text") and seg.get("mood"):
+                    duration = float(seg["end"]) - float(seg["start"])
+                    weighted_moods.append((seg["mood"], duration))
+            result["mood_overall"] = aggregate_mood(weighted_moods) if weighted_moods else None
+
+            # Mood par speaker (déjà calculé)
+            result["mood_by_speaker"] = speaker_sentiments
+
+            # NOUVEAU: Sentiment du client identifié
+            client_mood = get_client_sentiment(speaker_sentiments, segments)
+            result["mood_client"] = client_mood
+            log(f"[PYANNOTE] Client sentiment: {client_mood.get('label_fr')} (confidence: {client_mood.get('confidence', 0):.2f})")
     
     return result
 
@@ -1600,32 +1712,116 @@ def post_correct_speaker_attribution(text: str, speaker: str, has_previous_speak
     
     return text.strip()
 
+def detect_and_fix_speaker_inversion(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Correction MINIMALE et CONSERVATRICE des erreurs de diarisation.
+
+    PHILOSOPHIE:
+    - La reconnaissance vocale PyAnnote est LA VÉRITÉ DE BASE
+    - On corrige UNIQUEMENT les segments suspects isolés
+    - PAS de swap global - seulement correction de segments individuels
+
+    Cas corrigés:
+    1. Segments courts (<2s) isolés entre 2 segments du même autre speaker
+    2. Segments avec forte incohérence sémantique évidente
+    """
+    if not segments or len(segments) < 3:
+        return segments
+
+    log("[SPEAKER_FIX] Checking for isolated segment errors...")
+
+    corrections_made = 0
+
+    # Phrases TRÈS caractéristiques qui indiquent FORTEMENT un rôle
+    agent_strong_phrases = [
+        "cabinet", "secrétariat", "je prends note", "je vous mets en ligne",
+        "c'est noté", "je vérifie dans l'agenda", "vous êtes madame", "votre nom"
+    ]
+
+    client_strong_phrases = [
+        "ma femme", "mon mari", "mon fils", "ma fille", "mes enfants",
+        "rendez-vous pour moi", "j'appelle pour prendre"
+    ]
+
+    for i in range(1, len(segments) - 1):
+        current = segments[i]
+        prev = segments[i - 1]
+        next_seg = segments[i + 1]
+
+        current_speaker = current.get("speaker")
+        prev_speaker = prev.get("speaker")
+        next_speaker = next_seg.get("speaker")
+        text = (current.get("text", "") or "").lower()
+
+        # CAS 1: Segment court isolé entre 2 segments du même autre speaker
+        duration = current.get("end", 0) - current.get("start", 0)
+        is_isolated = (prev_speaker == next_speaker and prev_speaker != current_speaker)
+        is_very_short = duration < 1.5  # Très court = probablement erreur
+        has_few_words = len(text.split()) < 4
+
+        if is_isolated and (is_very_short or has_few_words):
+            # Vérifier conflit sémantique FORT
+            has_strong_semantic_conflict = False
+
+            current_says_agent_phrase = any(phrase in text for phrase in agent_strong_phrases)
+            current_says_client_phrase = any(phrase in text for phrase in client_strong_phrases)
+
+            if current_says_agent_phrase or current_says_client_phrase:
+                # Vérifier si le speaker environnant dit le contraire
+                prev_text = (prev.get("text", "") or "").lower()
+                next_text = (next_seg.get("text", "") or "").lower()
+                surrounding_text = prev_text + " " + next_text
+
+                prev_says_agent = any(phrase in surrounding_text for phrase in agent_strong_phrases)
+                prev_says_client = any(phrase in surrounding_text for phrase in client_strong_phrases)
+
+                # Conflit = current dit "ma femme" mais prev/next dit "cabinet"
+                if (current_says_client_phrase and prev_says_agent) or \
+                   (current_says_agent_phrase and prev_says_client):
+                    has_strong_semantic_conflict = True
+
+            # Correction si segment très court isolé OU conflit sémantique fort
+            if is_very_short or has_strong_semantic_conflict:
+                log(f"[SPEAKER_FIX] Correcting isolated segment [{i}]: '{text[:40]}' ({duration:.1f}s)")
+                log(f"[SPEAKER_FIX]   Reason: {'semantic_conflict' if has_strong_semantic_conflict else 'very_short_isolated'}")
+                log(f"[SPEAKER_FIX]   Changing {current_speaker} → {prev_speaker}")
+                current["speaker"] = prev_speaker
+                corrections_made += 1
+
+    if corrections_made > 0:
+        log(f"[SPEAKER_FIX] ✅ Corrected {corrections_made} isolated segment(s)")
+    else:
+        log("[SPEAKER_FIX] ✅ No suspicious segments, keeping PyAnnote attribution")
+
+    return segments
+
+
 def improve_diarization_quality(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Améliore la qualité de la diarization en post-traitement.
     """
     if not segments:
         return segments
-    
+
     improved_segments = []
-    
+
     for i, seg in enumerate(segments):
         text = seg.get("text", "")
         speaker = seg["speaker"]
-        
+
         # Si le segment est très court et répète le speaker précédent/suivant,
         # il pourrait s'agir d'une erreur de segmentation
         if len(text.split()) < 3:
             # Regarder le contexte
             prev_speaker = segments[i-1]["speaker"] if i > 0 else None
             next_speaker = segments[i+1]["speaker"] if i < len(segments)-1 else None
-            
+
             # Si entouré du même speaker, c'est probablement une erreur de segmentation
             if prev_speaker == next_speaker and prev_speaker != speaker:
                 log(f"[QUALITY] Potential segmentation error: short '{text}' between {prev_speaker} segments")
-        
+
         improved_segments.append(seg)
-    
+
     return improved_segments
 def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
     """
@@ -1759,6 +1955,7 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     segments = intelligent_dialogue_correction(full_text, segments)
     segments = improve_diarization_quality(segments)
     segments = _enforce_max_two_speakers(segments)
+    segments = detect_and_fix_speaker_inversion(segments)  # AVANT _map_roles
     _map_roles(segments)
     
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
@@ -1770,31 +1967,36 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
         log("[HYBRID] Generating summary...")
         result["summary"] = select_best_summary_approach(full_transcript)
     
-    # Sentiment global (optimisé pour la vitesse en mode hybride)
+    # Sentiment par speaker (analyse améliorée)
     if ENABLE_SENTIMENT:
-        log("[HYBRID] Computing sentiment analysis...")
-        # Calcul du sentiment global sur le texte complet (plus rapide qu'individual)
-        global_mood = classify_sentiment(full_text) if full_text else None
-        
-        # Attribution du même sentiment à tous les segments (approximation rapide)
-        for seg in segments:
-            if seg.get("text"):
-                seg["mood"] = global_mood
-        
-        # Mood overall basé sur la durée des segments
-        if global_mood and global_mood.get("scores"):
-            weighted_moods = [(global_mood, float(seg["end"]) - float(seg["start"])) for seg in segments if seg.get("text")]
-            result["mood_overall"] = aggregate_mood(weighted_moods)
-            
-            # Mood par speaker (approximation basée sur le global mood)  
-            per_role = {}
+        log("[HYBRID] Computing sentiment analysis by speaker...")
+
+        # Analyse le sentiment pour chaque speaker séparément
+        speaker_sentiments = analyze_sentiment_by_speaker(segments)
+
+        if speaker_sentiments:
+            # Attribuer le sentiment spécifique à chaque segment
             for seg in segments:
-                d = float(seg["end"]) - float(seg["start"])
-                r = seg["speaker"]
-                if seg.get("text"):
-                    per_role.setdefault(r, []).append((global_mood, d))
-            result["mood_by_speaker"] = {r: aggregate_mood(lst) for r, lst in per_role.items()}
-        
+                speaker = seg.get("speaker")
+                if speaker and speaker in speaker_sentiments:
+                    seg["mood"] = speaker_sentiments[speaker]
+
+            # Mood overall (moyenne pondérée de tous les speakers)
+            weighted_moods = []
+            for seg in segments:
+                if seg.get("text") and seg.get("mood"):
+                    duration = float(seg["end"]) - float(seg["start"])
+                    weighted_moods.append((seg["mood"], duration))
+            result["mood_overall"] = aggregate_mood(weighted_moods) if weighted_moods else None
+
+            # Mood par speaker (déjà calculé)
+            result["mood_by_speaker"] = speaker_sentiments
+
+            # NOUVEAU: Sentiment du client identifié
+            client_mood = get_client_sentiment(speaker_sentiments, segments)
+            result["mood_client"] = client_mood
+            log(f"[HYBRID] Client sentiment: {client_mood.get('label_fr')} (confidence: {client_mood.get('confidence', 0):.2f})")
+
         log("[HYBRID] Sentiment analysis completed")
     else:
         log("[HYBRID] Sentiment analysis skipped")
@@ -1870,6 +2072,7 @@ def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max
     
     # Post-traitement
     segments = _enforce_max_two_speakers(segments)
+    segments = detect_and_fix_speaker_inversion(segments)  # AVANT _map_roles
     _map_roles(segments)
     
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
