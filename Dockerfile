@@ -10,9 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTORCH_JIT=0 \
     APP_VERSION=2025-08-23-02 \
     HF_HOME=/workspace/.cache/huggingface \
-    TORCH_HOME=/workspace/.cache/torch \
-    TRANSFORMERS_CACHE=/workspace/.cache/huggingface/transformers \
-    HF_DATASETS_CACHE=/workspace/.cache/huggingface/datasets
+    TORCH_HOME=/workspace/.cache/torch
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
