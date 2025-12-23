@@ -8,7 +8,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_DISABLE_TELEMETRY=1 \
     TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
     PYTORCH_JIT=0 \
-    APP_VERSION=2025-08-23-02
+    APP_VERSION=2025-08-23-02 \
+    HF_HOME=/workspace/.cache/huggingface \
+    TORCH_HOME=/workspace/.cache/torch \
+    TRANSFORMERS_CACHE=/workspace/.cache/huggingface/transformers \
+    HF_DATASETS_CACHE=/workspace/.cache/huggingface/datasets
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -29,8 +33,12 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu12
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# App
+# Create cache directories (RunPod will mount /workspace)
+RUN mkdir -p /workspace/.cache/huggingface /workspace/.cache/torch
+
+# Copy app files
 COPY main.py /app/main.py
+COPY warmup.py /app/warmup.py
 
 ENV MODEL_ID="mistralai/Voxtral-Small-24B-2507" \
     MAX_NEW_TOKENS="512" \
@@ -45,5 +53,15 @@ ENV MODEL_ID="mistralai/Voxtral-Small-24B-2507" \
     ENABLE_SENTIMENT="1" \
     SENTIMENT_DEVICE="-1" \
     LOG_LEVEL="INFO"
+
+# Pre-download models at build time
+# RunPod injects HF_TOKEN as ENV var during build, so we use it if available
+RUN echo "[BUILD] Checking for HF_TOKEN to pre-cache models..." && \
+    if [ -n "$HF_TOKEN" ]; then \
+        echo "[BUILD] HF_TOKEN found - Pre-caching models..." && \
+        python /app/warmup.py || echo "[BUILD] Warmup failed (non-critical)"; \
+    else \
+        echo "[BUILD] No HF_TOKEN found - Models will download on first use"; \
+    fi
 
 ENTRYPOINT ["python", "-u", "main.py"]
