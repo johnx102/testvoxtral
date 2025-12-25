@@ -1183,7 +1183,17 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
             # NOUVEAU: Sentiment du client identifié
             client_mood = get_client_sentiment(speaker_sentiments, segments)
             result["mood_client"] = client_mood
-            log(f"[VOXTRAL_ID] Client sentiment: {client_mood.get('label_fr')} (confidence: {client_mood.get('confidence', 0):.2f})")
+
+            # Protection maximale contre None
+            confidence_raw = client_mood.get('confidence')
+            if confidence_raw is None:
+                confidence = 0.0
+                log(f"[VOXTRAL_ID] WARNING: Client sentiment confidence is None, using 0.0")
+            else:
+                confidence = float(confidence_raw)
+
+            label_fr = client_mood.get('label_fr') or 'inconnu'
+            log(f"[VOXTRAL_ID] Client sentiment: {label_fr} (confidence: {confidence:.2f})")
 
     log("[VOXTRAL_ID] Voxtral speaker identification completed successfully")
     return result
@@ -1467,7 +1477,19 @@ def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict]
             # NOUVEAU: Sentiment du client identifié
             client_mood = get_client_sentiment(speaker_sentiments, segments)
             result["mood_client"] = client_mood
-            log(f"[PYANNOTE] Client sentiment: {client_mood.get('label_fr')} (confidence: {client_mood.get('confidence', 0):.2f})")
+            log(f"[PYANNOTE] DEBUG: client_mood = {client_mood}")
+            log(f"[PYANNOTE] DEBUG: speaker_sentiments keys = {list(speaker_sentiments.keys())}")
+
+            # Protection maximale contre None
+            confidence_raw = client_mood.get('confidence')
+            if confidence_raw is None:
+                confidence = 0.0
+                log(f"[PYANNOTE] WARNING: Client sentiment confidence is None, using 0.0")
+            else:
+                confidence = float(confidence_raw)
+
+            label_fr = client_mood.get('label_fr') or 'inconnu'
+            log(f"[PYANNOTE] Client sentiment: {label_fr} (confidence: {confidence:.2f})")
     
     return result
 
@@ -2006,7 +2028,17 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
             # NOUVEAU: Sentiment du client identifié
             client_mood = get_client_sentiment(speaker_sentiments, segments)
             result["mood_client"] = client_mood
-            log(f"[HYBRID] Client sentiment: {client_mood.get('label_fr')} (confidence: {client_mood.get('confidence', 0):.2f})")
+
+            # Protection maximale contre None
+            confidence_raw = client_mood.get('confidence')
+            if confidence_raw is None:
+                confidence = 0.0
+                log(f"[HYBRID] WARNING: Client sentiment confidence is None, using 0.0")
+            else:
+                confidence = float(confidence_raw)
+
+            label_fr = client_mood.get('label_fr') or 'inconnu'
+            log(f"[HYBRID] Client sentiment: {label_fr} (confidence: {confidence:.2f})")
 
         log("[HYBRID] Sentiment analysis completed")
     else:
