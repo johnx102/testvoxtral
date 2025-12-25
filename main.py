@@ -1543,9 +1543,18 @@ def apply_improved_hybrid_mode(wav_path: str, pyannote_segments: List[Dict], lan
     log("[HYBRID_V2] Step 1: Voxtral speaker identification")
 
     # Étape 1: Transcrire avec Voxtral SPEAKER_ID
-    instruction = "Transcribe this conversation and identify the different speakers. Use 'Agent:' for the receptionist/professional and 'Client:' for the caller/patient."
-    if language:
-        instruction = f"Transcribe this conversation in {language} and identify the different speakers. Use 'Agent:' for the receptionist/professional and 'Client:' for the caller/patient."
+    # Utiliser la MÊME instruction que VOXTRAL_SPEAKER_ID (qui fonctionne bien)
+    instruction = (
+        f"lang:{language or 'fr'} "
+        "Transcris cette conversation téléphonique en identifiant clairement qui parle. "
+        "Format requis:\n"
+        "Agent: [ce que dit l'agent/professionnel]\n"
+        "Client: [ce que dit le client/appelant]\n\n"
+        "Indications pour identifier les speakers:\n"
+        "- Agent = celui qui répond, dit 'bonjour', 'cabinet', 'je vais voir', 'on vous rappelle'\n"
+        "- Client = celui qui appelle, dit 'je voudrais', 'ma femme', 'est-ce que je peux'\n\n"
+        "Transcris mot à mot et sépare clairement chaque prise de parole."
+    )
 
     conv = [{
         "role": "user",
