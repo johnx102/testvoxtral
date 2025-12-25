@@ -1272,6 +1272,180 @@ def parse_speaker_identified_transcript(transcript: str, total_duration: float) 
     
     return segments
 
+def apply_pyannote_per_segment_transcription(wav_path: str, raw_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool):
+    """
+    PYANNOTE AUTO V2: Transcrit chaque segment PyAnnote individuellement
+    Plus lent mais beaucoup plus précis car chaque segment a son propre texte
+    """
+    import soundfile as sf
+    import numpy as np
+    from pydub import AudioSegment
+    import tempfile
+
+    log(f"[PYANNOTE_V2] Starting per-segment transcription for {len(raw_segments)} segments")
+
+    # Charger l'audio complet
+    audio_data, sample_rate = sf.read(wav_path)
+
+    # Post-traitement: enforce max 2 speakers, fix inversions, map roles
+    raw_segments = _enforce_max_two_speakers(raw_segments)
+    raw_segments = detect_and_fix_speaker_inversion(raw_segments)
+    _map_roles(raw_segments)
+
+    # Fusionner les segments très courts du même speaker
+    merged_segments = []
+    i = 0
+    while i < len(raw_segments):
+        current = raw_segments[i].copy()
+
+        # Fusionner les segments consécutifs du même speaker s'ils sont courts
+        while i + 1 < len(raw_segments):
+            next_seg = raw_segments[i + 1]
+            duration_current = current["end"] - current["start"]
+            duration_next = next_seg["end"] - next_seg["start"]
+            gap = next_seg["start"] - current["end"]
+
+            # Fusionner si même speaker ET (segment court OU gap très petit)
+            if (current["speaker"] == next_seg["speaker"] and
+                ((duration_current < 2.0 or duration_next < 2.0) and gap < 1.0)):
+                current["end"] = next_seg["end"]
+                i += 1
+            else:
+                break
+
+        merged_segments.append(current)
+        i += 1
+
+    log(f"[PYANNOTE_V2] After merging short segments: {len(merged_segments)} segments")
+
+    # Transcrire chaque segment individuellement
+    transcribed_segments = []
+
+    for idx, seg in enumerate(merged_segments):
+        start_time = seg["start"]
+        end_time = seg["end"]
+        speaker = seg["speaker"]
+        duration = end_time - start_time
+
+        # Ignorer les segments trop courts (< 0.3s)
+        if duration < 0.3:
+            log(f"[PYANNOTE_V2] Skipping very short segment {idx+1}/{len(merged_segments)}: {duration:.1f}s")
+            continue
+
+        # Extraire le segment audio
+        start_sample = int(start_time * sample_rate)
+        end_sample = int(end_time * sample_rate)
+        segment_audio = audio_data[start_sample:end_sample]
+
+        # Sauvegarder temporairement
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            sf.write(tmp_path, segment_audio, sample_rate)
+
+        try:
+            # Transcrire ce segment uniquement
+            log(f"[PYANNOTE_V2] Transcribing segment {idx+1}/{len(merged_segments)}: {speaker} ({duration:.1f}s)")
+
+            # Construction de la conversation pour Voxtral
+            instruction = "Transcribe."
+            if language:
+                instruction = f"Transcribe in {language}."
+
+            conv = [{
+                "role": "user",
+                "content": [
+                    {"type": "audio", "path": tmp_path},
+                    {"type": "text", "text": instruction}
+                ]
+            }]
+
+            # Adapter max_new_tokens à la durée du segment (environ 3 mots par seconde)
+            segment_max_tokens = min(int(duration * 5), 200)  # Max 200 tokens par segment
+
+            result = run_voxtral_with_timeout(conv, max_new_tokens=segment_max_tokens, timeout=30)
+            text = result.get("text", "").strip()
+
+            if text:
+                transcribed_segments.append({
+                    "speaker": speaker,
+                    "start": start_time,
+                    "end": end_time,
+                    "text": text,
+                    "mood": None
+                })
+                log(f"[PYANNOTE_V2]   → '{text[:50]}...'")
+            else:
+                log(f"[PYANNOTE_V2]   → (empty transcription)")
+
+        except Exception as e:
+            log(f"[PYANNOTE_V2] Error transcribing segment {idx+1}: {e}")
+            # Ajouter un segment vide en cas d'erreur
+            transcribed_segments.append({
+                "speaker": speaker,
+                "start": start_time,
+                "end": end_time,
+                "text": "",
+                "mood": None
+            })
+        finally:
+            # Nettoyer le fichier temporaire
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+
+    log(f"[PYANNOTE_V2] Transcription completed: {len(transcribed_segments)} segments with text")
+
+    # Construire le transcript complet
+    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in transcribed_segments if s.get("text"))
+
+    result = {
+        "segments": transcribed_segments,
+        "transcript": full_transcript
+    }
+
+    # Résumé si demandé
+    if with_summary:
+        result["summary"] = select_best_summary_approach(full_transcript)
+
+    # Analyse de sentiment si activé
+    if ENABLE_SENTIMENT:
+        log("[PYANNOTE_V2] Computing sentiment analysis by speaker...")
+        speaker_sentiments = analyze_sentiment_by_speaker(transcribed_segments)
+
+        if speaker_sentiments:
+            # Attribuer le sentiment à chaque segment
+            for seg in transcribed_segments:
+                speaker = seg.get("speaker")
+                if speaker and speaker in speaker_sentiments:
+                    seg["mood"] = speaker_sentiments[speaker]
+
+            # Mood overall
+            weighted_moods = []
+            for seg in transcribed_segments:
+                if seg.get("text") and seg.get("mood"):
+                    duration = float(seg["end"]) - float(seg["start"])
+                    weighted_moods.append((seg["mood"], duration))
+            result["mood_overall"] = aggregate_mood(weighted_moods) if weighted_moods else None
+
+            result["mood_by_speaker"] = speaker_sentiments
+
+            # Sentiment du client
+            client_mood = get_client_sentiment(speaker_sentiments, transcribed_segments)
+            result["mood_client"] = client_mood
+
+            confidence_raw = client_mood.get('confidence')
+            if confidence_raw is None:
+                confidence = 0.0
+                log(f"[PYANNOTE_V2] WARNING: Client sentiment confidence is None, using 0.0")
+            else:
+                confidence = float(confidence_raw)
+
+            label_fr = client_mood.get('label_fr') or 'inconnu'
+            log(f"[PYANNOTE_V2] Client sentiment: {label_fr} (confidence: {confidence:.2f})")
+
+    return result
+
 def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
     """
     MODE PYANNOTE AUTO PUR : 
@@ -1346,8 +1520,152 @@ def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_t
                 
                 seg["speaker"] = best_speaker
     
-    # Appliquer le mode hybride avec les segments PyAnnote auto (SANS ultra_merge)
-    return apply_hybrid_workflow_with_segments(wav_path, raw_segments, language, max_new_tokens, with_summary, skip_ultra_merge=True)
+    # CHOIX: Transcription segment par segment (plus lent mais plus précis)
+    # Ou mode hybride classique (plus rapide mais moins précis)
+    USE_PER_SEGMENT_TRANSCRIPTION = os.environ.get("PYANNOTE_PER_SEGMENT", "0") == "1"
+
+    if USE_PER_SEGMENT_TRANSCRIPTION:
+        log("[PYANNOTE_AUTO] Using per-segment transcription (slower but more accurate)")
+        return apply_pyannote_per_segment_transcription(wav_path, raw_segments, language, max_new_tokens, with_summary)
+    else:
+        # Nouveau mode HYBRID amélioré: Voxtral SPEAKER_ID + correction PyAnnote
+        log("[PYANNOTE_AUTO] Using improved hybrid: Voxtral speaker ID + PyAnnote timestamp correction")
+        return apply_improved_hybrid_mode(wav_path, raw_segments, language, max_new_tokens, with_summary)
+
+def apply_improved_hybrid_mode(wav_path: str, pyannote_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool):
+    """
+    MODE HYBRID AMÉLIORÉ:
+    1. Utilise Voxtral SPEAKER_ID pour transcrire avec identification des speakers
+    2. Utilise les timestamps PyAnnote pour corriger/valider l'attribution
+    3. Combine le meilleur des deux approches
+    """
+    log("[HYBRID_V2] Starting improved hybrid mode")
+    log("[HYBRID_V2] Step 1: Voxtral speaker identification")
+
+    # Étape 1: Transcrire avec Voxtral SPEAKER_ID
+    instruction = "Transcribe this conversation and identify the different speakers. Use 'Agent:' for the receptionist/professional and 'Client:' for the caller/patient."
+    if language:
+        instruction = f"Transcribe this conversation in {language} and identify the different speakers. Use 'Agent:' for the receptionist/professional and 'Client:' for the caller/patient."
+
+    conv = [{
+        "role": "user",
+        "content": [
+            {"type": "audio", "path": wav_path},
+            {"type": "text", "text": instruction}
+        ]
+    }]
+
+    voxtral_result = run_voxtral_with_timeout(conv, max_new_tokens=max_new_tokens, timeout=120)
+    transcript = voxtral_result.get("text", "").strip()
+
+    if not transcript:
+        log("[HYBRID_V2] Empty Voxtral transcription")
+        return {"error": "Empty transcription", "segments": [], "transcript": ""}
+
+    # Étape 2: Parser la transcription Voxtral
+    log("[HYBRID_V2] Step 2: Parsing Voxtral speaker-identified segments")
+    voxtral_segments = parse_speaker_identified_transcript(transcript, total_duration=0)
+
+    if not voxtral_segments:
+        log("[HYBRID_V2] Failed to parse speaker segments, using raw transcript")
+        return {"error": "Parsing failed", "segments": [], "transcript": transcript}
+
+    log(f"[HYBRID_V2] Voxtral identified {len(voxtral_segments)} segments")
+
+    # Étape 3: Corriger les timestamps Voxtral avec PyAnnote
+    log("[HYBRID_V2] Step 3: Correcting timestamps using PyAnnote voice detection")
+
+    # Préparer les segments PyAnnote
+    pyannote_segments = _enforce_max_two_speakers(pyannote_segments)
+    pyannote_segments = detect_and_fix_speaker_inversion(pyannote_segments)
+    _map_roles(pyannote_segments)
+
+    # Créer un mapping temporel: pour chaque timestamp, quel speaker parle selon PyAnnote
+    def get_pyannote_speaker_at_time(time_s):
+        """Retourne le speaker qui parle à un instant donné selon PyAnnote"""
+        for seg in pyannote_segments:
+            if seg["start"] <= time_s <= seg["end"]:
+                return seg["speaker"]
+        return None
+
+    # Fusionner les informations Voxtral (texte + speaker contextuel) et PyAnnote (timestamps précis)
+    corrected_segments = []
+
+    for v_seg in voxtral_segments:
+        # Utiliser le speaker identifié par Voxtral comme base
+        voxtral_speaker = v_seg["speaker"]
+        text = v_seg["text"]
+
+        # Trouver les timestamps PyAnnote qui correspondent à ce segment de texte
+        # Heuristique: le milieu du segment Voxtral
+        mid_time = (v_seg["start"] + v_seg["end"]) / 2
+        pyannote_speaker = get_pyannote_speaker_at_time(mid_time)
+
+        # Décider quel speaker utiliser
+        if pyannote_speaker and pyannote_speaker != voxtral_speaker:
+            # Conflit: PyAnnote dit un speaker différent
+            # Faire confiance à PyAnnote pour les timestamps, mais garder le texte de Voxtral
+            log(f"[HYBRID_V2] Speaker conflict at {mid_time:.1f}s: Voxtral={voxtral_speaker}, PyAnnote={pyannote_speaker} - Using PyAnnote")
+            final_speaker = pyannote_speaker
+        else:
+            final_speaker = voxtral_speaker
+
+        corrected_segments.append({
+            "speaker": final_speaker,
+            "start": v_seg["start"],
+            "end": v_seg["end"],
+            "text": text,
+            "mood": None
+        })
+
+    log(f"[HYBRID_V2] Created {len(corrected_segments)} corrected segments")
+
+    # Construire le résultat
+    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in corrected_segments if s.get("text"))
+
+    result = {
+        "segments": corrected_segments,
+        "transcript": full_transcript
+    }
+
+    # Résumé
+    if with_summary:
+        result["summary"] = select_best_summary_approach(full_transcript)
+
+    # Analyse de sentiment
+    if ENABLE_SENTIMENT:
+        log("[HYBRID_V2] Computing sentiment analysis by speaker...")
+        speaker_sentiments = analyze_sentiment_by_speaker(corrected_segments)
+
+        if speaker_sentiments:
+            for seg in corrected_segments:
+                speaker = seg.get("speaker")
+                if speaker and speaker in speaker_sentiments:
+                    seg["mood"] = speaker_sentiments[speaker]
+
+            weighted_moods = []
+            for seg in corrected_segments:
+                if seg.get("text") and seg.get("mood"):
+                    duration = float(seg["end"]) - float(seg["start"])
+                    weighted_moods.append((seg["mood"], duration))
+            result["mood_overall"] = aggregate_mood(weighted_moods) if weighted_moods else None
+
+            result["mood_by_speaker"] = speaker_sentiments
+
+            client_mood = get_client_sentiment(speaker_sentiments, corrected_segments)
+            result["mood_client"] = client_mood
+
+            confidence_raw = client_mood.get('confidence')
+            if confidence_raw is None:
+                confidence = 0.0
+                log(f"[HYBRID_V2] WARNING: Client sentiment confidence is None, using 0.0")
+            else:
+                confidence = float(confidence_raw)
+
+            label_fr = client_mood.get('label_fr') or 'inconnu'
+            log(f"[HYBRID_V2] Client sentiment: {label_fr} (confidence: {confidence:.2f})")
+
+    return result
 
 def ultra_aggressive_merge(segments: List[Dict[str, Any]], max_gap: float = 3.0) -> List[Dict[str, Any]]:
     """
