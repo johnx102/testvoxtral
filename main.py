@@ -1581,51 +1581,62 @@ def apply_improved_hybrid_mode(wav_path: str, pyannote_segments: List[Dict], lan
 
     log(f"[HYBRID_V2] Voxtral identified {len(voxtral_segments)} segments")
 
-    # Étape 3: Corriger les timestamps Voxtral avec PyAnnote
-    log("[HYBRID_V2] Step 3: Correcting timestamps using PyAnnote voice detection")
+    # Étape 3: Mapper le texte Voxtral sur les timestamps PyAnnote
+    log("[HYBRID_V2] Step 3: Mapping Voxtral text to PyAnnote timestamps")
 
     # Préparer les segments PyAnnote
     pyannote_segments = _enforce_max_two_speakers(pyannote_segments)
     pyannote_segments = detect_and_fix_speaker_inversion(pyannote_segments)
     _map_roles(pyannote_segments)
 
-    # Créer un mapping temporel: pour chaque timestamp, quel speaker parle selon PyAnnote
-    def get_pyannote_speaker_at_time(time_s):
-        """Retourne le speaker qui parle à un instant donné selon PyAnnote"""
-        for seg in pyannote_segments:
-            if seg["start"] <= time_s <= seg["end"]:
-                return seg["speaker"]
-        return None
-
-    # Fusionner les informations Voxtral (texte + speaker contextuel) et PyAnnote (timestamps précis)
-    corrected_segments = []
-
+    # Créer un index du texte Voxtral par speaker
+    voxtral_by_speaker = {"Agent": [], "Client": []}
     for v_seg in voxtral_segments:
-        # Utiliser le speaker identifié par Voxtral comme base
-        voxtral_speaker = v_seg["speaker"]
-        text = v_seg["text"]
+        speaker = v_seg["speaker"]
+        if speaker in voxtral_by_speaker:
+            voxtral_by_speaker[speaker].append(v_seg["text"])
 
-        # Trouver les timestamps PyAnnote qui correspondent à ce segment de texte
-        # Heuristique: le milieu du segment Voxtral
-        mid_time = (v_seg["start"] + v_seg["end"]) / 2
-        pyannote_speaker = get_pyannote_speaker_at_time(mid_time)
+    log(f"[HYBRID_V2] Voxtral text distribution: Agent={len(voxtral_by_speaker['Agent'])} segments, Client={len(voxtral_by_speaker['Client'])} segments")
 
-        # Décider quel speaker utiliser
-        if pyannote_speaker and pyannote_speaker != voxtral_speaker:
-            # Conflit: PyAnnote dit un speaker différent
-            # Faire confiance à PyAnnote pour les timestamps, mais garder le texte de Voxtral
-            log(f"[HYBRID_V2] Speaker conflict at {mid_time:.1f}s: Voxtral={voxtral_speaker}, PyAnnote={pyannote_speaker} - Using PyAnnote")
-            final_speaker = pyannote_speaker
+    # Mapper le texte Voxtral sur les segments PyAnnote
+    # PyAnnote fournit les timestamps précis de qui parle quand
+    # Voxtral fournit le texte de qualité avec identification contextuelle
+    corrected_segments = []
+    text_index = {"Agent": 0, "Client": 0}
+
+    for p_seg in pyannote_segments:
+        speaker = p_seg["speaker"]
+        start = p_seg["start"]  # PyAnnote timestamp (précis)
+        end = p_seg["end"]      # PyAnnote timestamp (précis)
+
+        # Récupérer le prochain texte Voxtral pour ce speaker
+        if speaker in text_index and text_index[speaker] < len(voxtral_by_speaker[speaker]):
+            text = voxtral_by_speaker[speaker][text_index[speaker]]
+            text_index[speaker] += 1
+
+            corrected_segments.append({
+                "speaker": speaker,
+                "start": start,  # Timestamp PyAnnote
+                "end": end,      # Timestamp PyAnnote
+                "text": text,    # Texte Voxtral
+                "mood": None
+            })
         else:
-            final_speaker = voxtral_speaker
+            # Plus de texte Voxtral pour ce speaker - segment sans texte
+            log(f"[HYBRID_V2] No more Voxtral text for {speaker} at {start:.1f}s-{end:.1f}s")
+            corrected_segments.append({
+                "speaker": speaker,
+                "start": start,
+                "end": end,
+                "text": "",
+                "mood": None
+            })
 
-        corrected_segments.append({
-            "speaker": final_speaker,
-            "start": v_seg["start"],
-            "end": v_seg["end"],
-            "text": text,
-            "mood": None
-        })
+    # Vérifier s'il reste du texte Voxtral non mappé
+    for speaker in ["Agent", "Client"]:
+        remaining = len(voxtral_by_speaker[speaker]) - text_index[speaker]
+        if remaining > 0:
+            log(f"[HYBRID_V2] WARNING: {remaining} Voxtral {speaker} segments not mapped to PyAnnote timestamps")
 
     log(f"[HYBRID_V2] Created {len(corrected_segments)} corrected segments")
 
