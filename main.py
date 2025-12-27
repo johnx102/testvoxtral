@@ -1581,90 +1581,77 @@ def apply_improved_hybrid_mode(wav_path: str, pyannote_segments: List[Dict], lan
 
     log(f"[HYBRID_V2] Voxtral identified {len(voxtral_segments)} segments")
 
-    # Étape 3: Mapper le texte Voxtral sur les timestamps PyAnnote
-    log("[HYBRID_V2] Step 3: Mapping Voxtral text to PyAnnote timestamps")
+    # Étape 3: Fusionner les segments Voxtral (texte) avec PyAnnote (timestamps)
+    log("[HYBRID_V2] Step 3: Merging Voxtral text with PyAnnote timestamps")
 
     # Préparer les segments PyAnnote
     pyannote_segments = _enforce_max_two_speakers(pyannote_segments)
     pyannote_segments = detect_and_fix_speaker_inversion(pyannote_segments)
     _map_roles(pyannote_segments)
 
-    # Créer un index du texte Voxtral par speaker
-    voxtral_by_speaker = {"Agent": [], "Client": []}
-    for v_seg in voxtral_segments:
-        speaker = v_seg["speaker"]
-        if speaker in voxtral_by_speaker:
-            voxtral_by_speaker[speaker].append(v_seg["text"])
+    # Fusionner les segments PyAnnote consécutifs du même speaker pour obtenir les "tours de parole"
+    pyannote_turns = []
+    if pyannote_segments:
+        current_turn = {
+            "speaker": pyannote_segments[0]["speaker"],
+            "start": pyannote_segments[0]["start"],
+            "end": pyannote_segments[0]["end"]
+        }
 
-    log(f"[HYBRID_V2] Voxtral text distribution: Agent={len(voxtral_by_speaker['Agent'])} segments, Client={len(voxtral_by_speaker['Client'])} segments")
-    log(f"[HYBRID_V2] PyAnnote segments: {len(pyannote_segments)} total")
+        for i in range(1, len(pyannote_segments)):
+            seg = pyannote_segments[i]
+            if seg["speaker"] == current_turn["speaker"]:
+                # Même speaker, étendre le tour
+                current_turn["end"] = seg["end"]
+            else:
+                # Nouveau speaker, sauver le tour actuel
+                pyannote_turns.append(current_turn)
+                current_turn = {
+                    "speaker": seg["speaker"],
+                    "start": seg["start"],
+                    "end": seg["end"]
+                }
 
-    # Regrouper les segments PyAnnote consécutifs du même speaker
-    # Chaque groupe recevra un texte Voxtral
-    segment_groups = []
-    current_group = []
-    current_speaker = None
+        # Ajouter le dernier tour
+        pyannote_turns.append(current_turn)
 
-    for p_seg in pyannote_segments:
-        speaker = p_seg["speaker"]
-        if speaker == current_speaker:
-            # Même speaker, ajouter au groupe
-            current_group.append(p_seg)
-        else:
-            # Changement de speaker, sauver le groupe et en créer un nouveau
-            if current_group:
-                segment_groups.append({
-                    "speaker": current_speaker,
-                    "segments": current_group,
-                    "start": current_group[0]["start"],
-                    "end": current_group[-1]["end"]
-                })
-            current_group = [p_seg]
-            current_speaker = speaker
+    log(f"[HYBRID_V2] Voxtral: {len(voxtral_segments)} text segments")
+    log(f"[HYBRID_V2] PyAnnote: {len(pyannote_turns)} speaking turns")
 
-    # Ajouter le dernier groupe
-    if current_group:
-        segment_groups.append({
-            "speaker": current_speaker,
-            "segments": current_group,
-            "start": current_group[0]["start"],
-            "end": current_group[-1]["end"]
+    # Mapper chaque segment Voxtral à un tour PyAnnote basé sur le speaker et l'ordre
+    corrected_segments = []
+    voxtral_idx_by_speaker = {"Agent": 0, "Client": 0}
+
+    for turn in pyannote_turns:
+        speaker = turn["speaker"]
+
+        # Trouver le prochain segment Voxtral pour ce speaker
+        text = ""
+        voxtral_idx = voxtral_idx_by_speaker.get(speaker, 0)
+
+        # Chercher le prochain segment Voxtral de ce speaker
+        while voxtral_idx < len(voxtral_segments):
+            v_seg = voxtral_segments[voxtral_idx]
+            if v_seg["speaker"] == speaker:
+                text = v_seg["text"]
+                voxtral_idx_by_speaker[speaker] = voxtral_idx + 1
+                break
+            voxtral_idx += 1
+
+        # Créer le segment fusionné
+        corrected_segments.append({
+            "speaker": speaker,
+            "start": turn["start"],  # Timestamp PyAnnote
+            "end": turn["end"],      # Timestamp PyAnnote
+            "text": text,            # Texte Voxtral
+            "mood": None
         })
 
-    log(f"[HYBRID_V2] Created {len(segment_groups)} speaker turn groups from {len(pyannote_segments)} PyAnnote segments")
-
-    # Mapper le texte Voxtral sur les groupes PyAnnote
-    corrected_segments = []
-    text_index = {"Agent": 0, "Client": 0}
-
-    for group in segment_groups:
-        speaker = group["speaker"]
-
-        # Récupérer le prochain texte Voxtral pour ce speaker
-        if speaker in text_index and text_index[speaker] < len(voxtral_by_speaker[speaker]):
-            text = voxtral_by_speaker[speaker][text_index[speaker]]
-            text_index[speaker] += 1
-        else:
-            text = ""
-            if speaker in text_index:
-                log(f"[HYBRID_V2] No more Voxtral text for {speaker} at {group['start']:.1f}s-{group['end']:.1f}s")
-
-        # Assigner ce texte au premier segment du groupe
-        # Les autres segments du groupe restent vides (ils sont des fragments vocaux du même texte)
-        for i, p_seg in enumerate(group["segments"]):
-            corrected_segments.append({
-                "speaker": speaker,
-                "start": p_seg["start"],
-                "end": p_seg["end"],
-                "text": text if i == 0 else "",  # Texte seulement sur le premier segment du groupe
-                "mood": None
-            })
-
-    # Vérifier s'il reste du texte Voxtral non mappé
+    # Statistiques
     for speaker in ["Agent", "Client"]:
-        remaining = len(voxtral_by_speaker[speaker]) - text_index[speaker]
-        if remaining > 0:
-            log(f"[HYBRID_V2] WARNING: {remaining} Voxtral {speaker} segments not mapped to PyAnnote timestamps")
+        used = voxtral_idx_by_speaker.get(speaker, 0)
+        total = sum(1 for seg in voxtral_segments if seg["speaker"] == speaker)
+        log(f"[HYBRID_V2] {speaker}: used {used}/{total} Voxtral texts")
 
     log(f"[HYBRID_V2] Created {len(corrected_segments)} corrected segments")
 
