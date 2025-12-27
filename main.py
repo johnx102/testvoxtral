@@ -1894,7 +1894,7 @@ def apply_pyannote_aligned(wav_path: str, pyannote_segments: List[Dict], languag
     if not word_timestamps:
         log("[PYANNOTE_ALIGNED] WARNING: Alignment failed, falling back to VOXTRAL_SPEAKER_ID")
         # Fallback vers le mode classique
-        return apply_voxtral_speaker_id(wav_path, language, max_new_tokens, with_summary)
+        return diarize_with_voxtral_speaker_id(wav_path, language, max_new_tokens, with_summary)
 
     log(f"[PYANNOTE_ALIGNED] Aligned {len(word_timestamps)} words")
 

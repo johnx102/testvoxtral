@@ -23,9 +23,9 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python && \
 
 WORKDIR /app
 
-# Torch (CUDA 12.1)
+# Torch (CUDA 12.1) - v2.6+ required for Wav2Vec2 alignment security fix
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
-    torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1
+    torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
 
 # Requirements
 COPY requirements.txt /app/requirements.txt
