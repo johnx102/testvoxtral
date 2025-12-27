@@ -314,7 +314,12 @@ def load_alignment_model():
 
         device = _device_str()
         _alignment_tokenizer = Wav2Vec2Processor.from_pretrained(alignment_model_id)
-        _alignment_model = Wav2Vec2ForCTC.from_pretrained(alignment_model_id).to(device)
+
+        # Force safetensors loading to avoid torch.load security warning
+        _alignment_model = Wav2Vec2ForCTC.from_pretrained(
+            alignment_model_id,
+            use_safetensors=True
+        ).to(device)
         _alignment_model.eval()
 
         log(f"[ALIGN] Alignment model loaded on {device}")
