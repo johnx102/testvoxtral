@@ -24,6 +24,7 @@ safetensors>=0.4.0
 
 # WhisperX - Mode alternatif (optionnel, activé via ENABLE_WHISPERX=1)
 # Alternative à Voxtral pour éviter les bugs de répétition
-whisperx @ git+https://github.com/m-bain/whisperX.git
+# Installation conditionnelle : décommenter pour activer
+# git+https://github.com/m-bain/whisperX.git
 
 runpod==1.6.2
