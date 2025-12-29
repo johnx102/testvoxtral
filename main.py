@@ -704,6 +704,45 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
         }
 
 
+def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
+    """
+    Détecte et supprime les boucles de répétition dans le texte généré par Voxtral.
+
+    Exemple: "michel.michel.michel.michel..." -> "michel"
+    """
+    if not text or len(text) < 20:
+        return text
+
+    # Détection de mots répétés consécutivement
+    words = text.split()
+    if len(words) < 10:
+        return text
+
+    cleaned_words = []
+    repetition_count = 1
+    last_word = None
+
+    for word in words:
+        if word == last_word:
+            repetition_count += 1
+            # Si le même mot se répète plus de max_repetitions fois, on arrête
+            if repetition_count > max_repetitions:
+                log(f"[CLEANUP] Detected repetitive loop: '{word}' repeated {repetition_count} times, truncating")
+                break
+        else:
+            repetition_count = 1
+            last_word = word
+
+        cleaned_words.append(word)
+
+    cleaned_text = " ".join(cleaned_words)
+
+    if len(cleaned_text) < len(text) * 0.8:  # Si on a perdu plus de 20% du texte
+        log(f"[CLEANUP] Removed repetitive content: {len(text)} -> {len(cleaned_text)} chars")
+
+    return cleaned_text
+
+
 def validate_sentiment_coherence(text: str, sentiment: Dict[str, Any]) -> Dict[str, Any]:
     """
     Valide et corrige le sentiment si incohérent avec le contenu
@@ -1279,15 +1318,18 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
         ]
     }]
     
-    # Ajuster les tokens selon la durée
-    speaker_tokens = min(max_new_tokens, int(est_dur * 10))  # Un peu plus pour les labels
-    out_speaker_id = run_voxtral_with_timeout(conv_speaker_id, max_new_tokens=speaker_tokens, timeout=90)
+    # Ajuster les tokens selon la durée (augmenté pour éviter les troncatures)
+    speaker_tokens = min(max_new_tokens, int(est_dur * 15))  # Augmenté de 10 à 15
+    out_speaker_id = run_voxtral_with_timeout(conv_speaker_id, max_new_tokens=speaker_tokens, timeout=120)
     speaker_transcript = (out_speaker_id.get("text") or "").strip()
-    
+
     if not speaker_transcript:
         log("[VOXTRAL_ID] Empty speaker identification result, falling back to hybrid mode")
         return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
-    
+
+    # Nettoyer les boucles de répétition (bug Voxtral)
+    speaker_transcript = remove_repetitive_loops(speaker_transcript, max_repetitions=5)
+
     log(f"[VOXTRAL_ID] Speaker identification completed: {len(speaker_transcript)} chars in {out_speaker_id.get('latency_s', 0):.1f}s")
 
     # PARSING DU RÉSULTAT AVEC SPEAKERS IDENTIFIÉS
@@ -1399,7 +1441,10 @@ def parse_speaker_identified_transcript(transcript: str, total_duration: float) 
                         speaker = "Agent"  # Défaut
                 
                 if text_part:  # Seulement si il y a du texte
-                    valid_lines.append((speaker, text_part))
+                    # Nettoyer les répétitions dans chaque segment aussi
+                    text_part = remove_repetitive_loops(text_part, max_repetitions=3)
+                    if text_part:  # Vérifier qu'il reste du texte après nettoyage
+                        valid_lines.append((speaker, text_part))
     
     if not valid_lines:
         log("[PARSE] No valid speaker lines found")
