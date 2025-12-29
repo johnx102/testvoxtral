@@ -203,7 +203,7 @@ def _input_len_from_batch(inputs) -> int:
 
 def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict[str, Any]:
     processor, model = load_voxtral()
-    
+
     try:
         inputs = processor.apply_chat_template(conversation, add_generation_prompt=True)
     except (TypeError, ValueError):
@@ -212,11 +212,15 @@ def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict
     device = _device_str()
     inputs = _move_to_device_no_cast(inputs, device)
 
+    # Pour les longues générations (>3000 tokens), utiliser une petite température
+    # pour éviter les boucles de répétition avec do_sample=False
+    use_sampling = max_new_tokens > 3000
+
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
-        do_sample=False,
-        temperature=None,
-        top_p=None,
+        do_sample=use_sampling,
+        temperature=0.1 if use_sampling else None,  # Très faible température pour rester déterministe
+        top_p=0.95 if use_sampling else None,
     )
 
     t0 = time.time()
@@ -708,12 +712,40 @@ def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
     """
     Détecte et supprime les boucles de répétition dans le texte généré par Voxtral.
 
-    Exemple: "michel.michel.michel.michel..." -> "michel"
+    Cas typiques:
+    - Mot répété avec espaces: "hello hello hello..."
+    - Pattern collé: "michel.michel.michel..." (sans espaces)
     """
     if not text or len(text) < 20:
         return text
 
-    # Détection de mots répétés consécutivement
+    # Cas 1: Détection de patterns courts répétés (ex: "michel.michel.michel...")
+    # Chercher un pattern de 3-20 caractères répété consécutivement
+    for pattern_len in range(3, 21):  # Longueurs de pattern de 3 à 20 chars
+        if len(text) < pattern_len * max_repetitions:
+            continue
+
+        # Extraire le pattern potentiel depuis la fin du texte
+        # (la répétition est souvent à la fin)
+        pattern = text[-pattern_len:]
+
+        # Compter combien de fois ce pattern se répète à la fin
+        repetitions = 0
+        pos = len(text)
+        while pos >= pattern_len:
+            if text[pos - pattern_len:pos] == pattern:
+                repetitions += 1
+                pos -= pattern_len
+            else:
+                break
+
+        if repetitions > max_repetitions:
+            # Tronquer au premier pattern
+            truncate_pos = pos
+            log(f"[CLEANUP] Detected pattern loop: '{pattern[:15]}...' repeated {repetitions} times, truncating from {len(text)} to {truncate_pos} chars")
+            return text[:truncate_pos]
+
+    # Cas 2: Mots séparés par espaces
     words = text.split()
     if len(words) < 10:
         return text
@@ -725,19 +757,17 @@ def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
     for word in words:
         if word == last_word:
             repetition_count += 1
-            # Si le même mot se répète plus de max_repetitions fois, on arrête
             if repetition_count > max_repetitions:
-                log(f"[CLEANUP] Detected repetitive loop: '{word}' repeated {repetition_count} times, truncating")
+                log(f"[CLEANUP] Detected word loop: '{word}' repeated {repetition_count} times, truncating")
                 break
         else:
             repetition_count = 1
             last_word = word
-
         cleaned_words.append(word)
 
     cleaned_text = " ".join(cleaned_words)
 
-    if len(cleaned_text) < len(text) * 0.8:  # Si on a perdu plus de 20% du texte
+    if len(cleaned_text) < len(text) * 0.8:
         log(f"[CLEANUP] Removed repetitive content: {len(text)} -> {len(cleaned_text)} chars")
 
     return cleaned_text
@@ -1319,7 +1349,8 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     }]
     
     # Ajuster les tokens selon la durée (augmenté pour éviter les troncatures)
-    speaker_tokens = min(max_new_tokens, int(est_dur * 15))  # Augmenté de 10 à 15
+    # Retirer le min() pour ne pas limiter par MAX_NEW_TOKENS global
+    speaker_tokens = int(est_dur * 15)  # ~15 tokens par seconde pour éviter les troncatures
     out_speaker_id = run_voxtral_with_timeout(conv_speaker_id, max_new_tokens=speaker_tokens, timeout=120)
     speaker_transcript = (out_speaker_id.get("text") or "").strip()
 
@@ -1328,7 +1359,16 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
         return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
 
     # Nettoyer les boucles de répétition (bug Voxtral)
+    original_len = len(speaker_transcript)
     speaker_transcript = remove_repetitive_loops(speaker_transcript, max_repetitions=5)
+
+    # Vérification de cohérence : ratio chars/seconde anormalement élevé ?
+    chars_per_sec = len(speaker_transcript) / max(est_dur, 1)
+    if chars_per_sec > 50:  # Normal = 15-30 chars/sec pour du français parlé
+        log(f"[VOXTRAL_ID] WARNING: Suspicious chars/sec ratio: {chars_per_sec:.1f} (expected ~15-30). Possible repetition bug.")
+
+    if original_len != len(speaker_transcript):
+        log(f"[VOXTRAL_ID] Cleaned repetitive loops: {original_len} -> {len(speaker_transcript)} chars")
 
     log(f"[VOXTRAL_ID] Speaker identification completed: {len(speaker_transcript)} chars in {out_speaker_id.get('latency_s', 0):.1f}s")
 
