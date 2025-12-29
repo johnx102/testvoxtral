@@ -13,10 +13,17 @@ requests>=2.32.0
 pyannote.audio==3.3.2
 sentencepiece>=0.2.0
 
-torchaudio>=2.0.0
-ctranslate2>=3.0.0
-
 # Voxtral dependencies - CRITICAL: mistral-common avec audio support
 mistral_common[audio]>=1.8.1
+
+# Forced alignment for word-level timestamps (WhisperX-style)
+# Utilisé pour mapper précisément les mots aux timestamps PyAnnote
+torchaudio>=2.0.0
+ctranslate2>=3.0.0
+safetensors>=0.4.0
+
+# WhisperX - Mode alternatif (optionnel, activé via ENABLE_WHISPERX=1)
+# Alternative à Voxtral pour éviter les bugs de répétition
+whisperx @ git+https://github.com/m-bain/whisperX.git
 
 runpod==1.6.2
