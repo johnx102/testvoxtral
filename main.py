@@ -1064,7 +1064,10 @@ def select_best_summary_approach(transcript: str) -> str:
     """Sélectionne la meilleure approche de résumé selon le contenu."""
     lines = transcript.split('\n')
     total_words = len(transcript.split())
-    
+
+    # Compter les segments avec speaker (lignes contenant ":")
+    speaker_lines = [l for l in lines if ':' in l and l.strip()]
+
     # Détection des annonces/IVR
     if len(lines) == 1 and "System:" in transcript:
         # C'est probablement une annonce
@@ -1073,18 +1076,19 @@ def select_best_summary_approach(transcript: str) -> str:
             return f"Annonce automatique: {content[:100]}{'...' if len(content) > 100 else ''}"
         else:
             return f"Message système: {content}"
-    
+
     if total_words < 20:
         return "Conversation très brève."
-    
-    if total_words > 30 and len(lines) > 3:
+
+    # Utiliser le résumé génératif si conversation substantielle (3+ échanges ou 30+ mots)
+    if total_words > 30 and len(speaker_lines) >= 3:
         generative_summary = generate_natural_summary(transcript)
-        
-        if (generative_summary and 
-            len(generative_summary) > 15 and 
+
+        if (generative_summary and
+            len(generative_summary) > 15 and
             not any(bad in generative_summary.lower() for bad in ['format', 'structure', 'décision/'])):
             return generative_summary
-    
+
     return create_extractive_summary(transcript)
 
 # ---------------------------
@@ -1437,6 +1441,61 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     log("[VOXTRAL_ID] Voxtral speaker identification completed successfully")
     return result
 
+def merge_micro_segments(segments: List[Dict[str, Any]], max_duration: float = 2.0, max_gap: float = 1.0) -> List[Dict[str, Any]]:
+    """
+    Fusionne les micro-segments consécutifs du même speaker.
+    Utile pour éviter les lignes multiples quand quelqu'un épelle des chiffres ou lettres.
+
+    Args:
+        segments: Liste des segments à fusionner
+        max_duration: Durée max d'un segment pour être considéré comme "micro" (secondes)
+        max_gap: Gap max entre deux segments pour les fusionner (secondes)
+
+    Returns:
+        Liste des segments fusionnés
+    """
+    if not segments:
+        return segments
+
+    log(f"[MERGE_MICRO] Input: {len(segments)} segments")
+
+    merged = []
+    i = 0
+
+    while i < len(segments):
+        current = segments[i].copy()
+
+        # Fusionner les segments consécutifs du même speaker s'ils sont très courts
+        while i + 1 < len(segments):
+            next_seg = segments[i + 1]
+            duration_current = current["end"] - current["start"]
+            duration_next = next_seg["end"] - next_seg["start"]
+            gap = next_seg["start"] - current["end"]
+
+            # Fusionner si:
+            # - Même speaker
+            # - Au moins un des deux segments est court (< max_duration)
+            # - Le gap entre eux est petit (< max_gap)
+            if (current["speaker"] == next_seg["speaker"] and
+                (duration_current < max_duration or duration_next < max_duration) and
+                gap < max_gap):
+
+                # Fusionner le texte
+                current["text"] = current["text"] + " " + next_seg["text"]
+                current["end"] = next_seg["end"]
+
+                log(f"[MERGE_MICRO] Merged: '{current['text'][:50]}...' ({duration_current:.1f}s + {duration_next:.1f}s)")
+
+                i += 1
+            else:
+                break
+
+        merged.append(current)
+        i += 1
+
+    log(f"[MERGE_MICRO] Output: {len(merged)} segments (reduced by {len(segments) - len(merged)})")
+    return merged
+
 def parse_speaker_identified_transcript(transcript: str, total_duration: float) -> List[Dict[str, Any]]:
     """
     Parse le transcript avec speakers identifiés par Voxtral
@@ -1540,15 +1599,15 @@ def parse_speaker_identified_transcript(transcript: str, total_duration: float) 
     
     # Créer les segments avec timestamps approximatifs
     total_words = sum(len(text.split()) for _, text in valid_lines)
-    
+
     for i, (speaker, text) in enumerate(valid_lines):
         # Calculer la durée basée sur le nombre de mots
         word_count = len(text.split())
         segment_duration = (word_count / total_words) * total_duration if total_words > 0 else total_duration / len(valid_lines)
-        
+
         start_time = current_time
         end_time = min(current_time + segment_duration, total_duration)
-        
+
         segments.append({
             "speaker": speaker,
             "start": start_time,
@@ -1556,11 +1615,14 @@ def parse_speaker_identified_transcript(transcript: str, total_duration: float) 
             "text": text,
             "mood": None
         })
-        
+
         current_time = end_time
-        
+
         log(f"[PARSE] Segment {i+1}: {speaker} ({start_time:.1f}s-{end_time:.1f}s) '{text[:30]}...'")
-    
+
+    # Fusionner les micro-segments consécutifs du même speaker
+    segments = merge_micro_segments(segments, max_duration=2.0, max_gap=1.0)
+
     return segments
 
 def apply_pyannote_per_segment_transcription(wav_path: str, raw_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool):
