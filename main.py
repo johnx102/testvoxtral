@@ -64,10 +64,6 @@ AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "1"
 VOXTRAL_SPEAKER_ID = os.environ.get("VOXTRAL_SPEAKER_ID", "1") == "1"  # NOUVEAU : Speaker ID par Voxtral
 PYANNOTE_AUTO = os.environ.get("PYANNOTE_AUTO", "0") == "1"  # NOUVEAU : PyAnnote auto pur
 
-# WhisperX - Mode alternatif
-ENABLE_WHISPERX = os.environ.get("ENABLE_WHISPERX", "0") == "1"  # Mode WhisperX au lieu de Voxtral
-WHISPERX_MODEL = os.environ.get("WHISPERX_MODEL", "large-v3")  # Modèle Whisper à utiliser
-
 # Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
 SMART_SUMMARY = os.environ.get("SMART_SUMMARY", "1") == "1"  
@@ -80,10 +76,6 @@ ROLE_LABELS = [r.strip() for r in os.environ.get("ROLE_LABELS", "Agent,Client").
 _processor = None
 _model = None
 _diarizer = None
-_whisperx_model = None
-_whisperx_align_model = None
-_whisperx_metadata = None
-
 # ---------------------------
 # Helpers généraux
 # ---------------------------
@@ -250,94 +242,6 @@ def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens:
     except Exception as e:
         log(f"[ERROR] Voxtral inference failed: {e}")
         return {"text": "", "latency_s": 0}
-
-# ---------------------------
-# WhisperX - Mode alternatif
-# ---------------------------
-def load_whisperx():
-    """Charge WhisperX model + alignment model"""
-    global _whisperx_model, _whisperx_align_model, _whisperx_metadata
-
-    if _whisperx_model is not None:
-        return _whisperx_model, _whisperx_align_model, _whisperx_metadata
-
-    try:
-        import whisperx
-    except ImportError:
-        log("[ERROR] WhisperX not installed. Install with: pip install whisperx")
-        raise
-
-    device = _device_str()
-    compute_type = "float16" if device == "cuda" else "int8"
-
-    log(f"[WHISPERX] Loading model: {WHISPERX_MODEL}")
-    _whisperx_model = whisperx.load_model(WHISPERX_MODEL, device, compute_type=compute_type)
-
-    log("[WHISPERX] Model loaded successfully")
-    return _whisperx_model, _whisperx_align_model, _whisperx_metadata
-
-def transcribe_with_whisperx(wav_path: str, language: str = "fr") -> Dict[str, Any]:
-    """
-    Transcrit avec WhisperX (Whisper + forced alignment + diarization PyAnnote)
-    Retourne un format compatible avec le reste du code
-    """
-    try:
-        import whisperx
-    except ImportError:
-        log("[ERROR] WhisperX not installed")
-        return {"segments": [], "language": language}
-
-    model, _, _ = load_whisperx()
-    device = _device_str()
-
-    # 1. Transcription avec Whisper
-    log(f"[WHISPERX] Transcribing audio: {wav_path}")
-    t0 = time.time()
-    audio = whisperx.load_audio(wav_path)
-    result = model.transcribe(audio, language=language, batch_size=16)
-    log(f"[WHISPERX] Transcription completed in {time.time() - t0:.1f}s")
-
-    # 2. Forced alignment pour timestamps précis
-    log("[WHISPERX] Performing forced alignment...")
-    global _whisperx_align_model, _whisperx_metadata
-    if _whisperx_align_model is None:
-        _whisperx_align_model, _whisperx_metadata = whisperx.load_align_model(
-            language_code=language, device=device
-        )
-
-    result = whisperx.align(
-        result["segments"], _whisperx_align_model, _whisperx_metadata,
-        audio, device, return_char_alignments=False
-    )
-
-    # 3. Diarization avec PyAnnote
-    log("[WHISPERX] Performing speaker diarization...")
-    diarizer = load_diarizer()
-    diarize_segments = diarizer({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": 16000})
-
-    # Convertir au format attendu par whisperx
-    diarize_result = []
-    for turn, _, speaker in diarize_segments.itertracks(yield_label=True):
-        diarize_result.append({
-            "start": turn.start,
-            "end": turn.end,
-            "speaker": speaker
-        })
-
-    result = whisperx.assign_word_speakers(diarize_result, result)
-    log(f"[WHISPERX] Diarization completed: {len(result.get('segments', []))} segments")
-
-    # 4. Convertir au format attendu par le reste du code
-    segments = []
-    for seg in result.get("segments", []):
-        segments.append({
-            "start": seg.get("start", 0),
-            "end": seg.get("end", 0),
-            "text": seg.get("text", "").strip(),
-            "speaker": seg.get("speaker", "SPEAKER_00")
-        })
-
-    return {"segments": segments, "language": result.get("language", language)}
 
 def _build_conv_transcribe_ultra_strict(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
     """Version ultra-stricte pour éviter les hallucinations"""
@@ -1536,50 +1440,99 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
 def parse_speaker_identified_transcript(transcript: str, total_duration: float) -> List[Dict[str, Any]]:
     """
     Parse le transcript avec speakers identifiés par Voxtral
+    Supporte deux formats:
+    1. Multi-lignes: chaque ligne = "Speaker: text"
+    2. Inline: tout sur une ligne avec "Agent: ... Client: ... Agent: ..."
     """
     if not transcript:
         return []
-    
+
     segments = []
-    lines = transcript.split('\n')
     current_time = 0.0
-    
+
+    # D'abord essayer de parser ligne par ligne
+    lines = transcript.split('\n')
     log(f"[PARSE] Processing {len(lines)} lines from speaker transcript")
-    
+
     valid_lines = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        
-        # Chercher les patterns Speaker: text
-        if ':' in line:
-            parts = line.split(':', 1)
-            if len(parts) == 2:
-                speaker_part = parts[0].strip()
-                text_part = parts[1].strip()
-                
-                # Normaliser les noms de speakers
-                if any(word in speaker_part.lower() for word in ['agent', 'professionnel', 'cabinet', 'secrétaire']):
-                    speaker = "Agent"
-                elif any(word in speaker_part.lower() for word in ['client', 'appelant', 'patient']):
-                    speaker = "Client"
-                elif speaker_part.lower() in ['agent', 'client']:
-                    speaker = speaker_part.capitalize()
-                else:
-                    # Speaker non identifié, essayer de deviner par le contenu
-                    if any(word in text_part.lower() for word in ['cabinet', 'bonjour', 'je vais voir', 'on vous rappelle']):
-                        speaker = "Agent"
-                    elif any(word in text_part.lower() for word in ['je voudrais', 'ma femme', 'est-ce que je peux']):
-                        speaker = "Client"
+
+    # Si une seule ligne, utiliser le parsing inline
+    if len(lines) == 1 or (len(lines) == 2 and not lines[1].strip()):
+        # Parsing inline: chercher tous les "Agent:" et "Client:"
+        text = lines[0].strip()
+
+        # Regex pour trouver tous les patterns "Agent:" ou "Client:" suivis de texte
+        import re
+        pattern = r'(Agent|Client):\s*([^:]+?)(?=\s*(?:Agent:|Client:|$))'
+        matches = re.findall(pattern, text, re.IGNORECASE)
+
+        log(f"[PARSE] Inline mode: found {len(matches)} speaker segments")
+
+        # Mapper Agent/Client vers SPEAKER_00/SPEAKER_01 pour que _map_roles fonctionne
+        speaker_mapping = {}
+        speaker_counter = 0
+
+        for speaker_raw, text_part in matches:
+            speaker_normalized = speaker_raw.capitalize()
+
+            # Créer le mapping vers SPEAKER_XX
+            if speaker_normalized not in speaker_mapping:
+                speaker_mapping[speaker_normalized] = f"SPEAKER_{speaker_counter:02d}"
+                speaker_counter += 1
+
+            speaker = speaker_mapping[speaker_normalized]
+            text_part = text_part.strip()
+
+            if text_part:
+                # Nettoyer les répétitions
+                text_part = remove_repetitive_loops(text_part, max_repetitions=3)
+                if text_part:
+                    valid_lines.append((speaker, text_part))
+    else:
+        # Parsing multi-lignes (mode original)
+        speaker_mapping = {}
+        speaker_counter = 0
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Chercher les patterns Speaker: text
+            if ':' in line:
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    speaker_part = parts[0].strip()
+                    text_part = parts[1].strip()
+
+                    # Normaliser les noms de speakers vers Agent/Client
+                    if any(word in speaker_part.lower() for word in ['agent', 'professionnel', 'cabinet', 'secrétaire']):
+                        speaker_normalized = "Agent"
+                    elif any(word in speaker_part.lower() for word in ['client', 'appelant', 'patient']):
+                        speaker_normalized = "Client"
+                    elif speaker_part.lower() in ['agent', 'client']:
+                        speaker_normalized = speaker_part.capitalize()
                     else:
-                        speaker = "Agent"  # Défaut
-                
-                if text_part:  # Seulement si il y a du texte
-                    # Nettoyer les répétitions dans chaque segment aussi
-                    text_part = remove_repetitive_loops(text_part, max_repetitions=3)
-                    if text_part:  # Vérifier qu'il reste du texte après nettoyage
-                        valid_lines.append((speaker, text_part))
+                        # Speaker non identifié, essayer de deviner par le contenu
+                        if any(word in text_part.lower() for word in ['cabinet', 'bonjour', 'je vais voir', 'on vous rappelle']):
+                            speaker_normalized = "Agent"
+                        elif any(word in text_part.lower() for word in ['je voudrais', 'ma femme', 'est-ce que je peux']):
+                            speaker_normalized = "Client"
+                        else:
+                            speaker_normalized = "Agent"  # Défaut
+
+                    # Mapper vers SPEAKER_XX pour que _map_roles fonctionne
+                    if speaker_normalized not in speaker_mapping:
+                        speaker_mapping[speaker_normalized] = f"SPEAKER_{speaker_counter:02d}"
+                        speaker_counter += 1
+
+                    speaker = speaker_mapping[speaker_normalized]
+
+                    if text_part:  # Seulement si il y a du texte
+                        # Nettoyer les répétitions dans chaque segment aussi
+                        text_part = remove_repetitive_loops(text_part, max_repetitions=3)
+                        if text_part:  # Vérifier qu'il reste du texte après nettoyage
+                            valid_lines.append((speaker, text_part))
     
     if not valid_lines:
         log("[PARSE] No valid speaker lines found")
@@ -3071,67 +3024,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         if task in ("transcribe_diarized", "diarized", "diarize"):
             log("[HANDLER] Starting diarized transcription...")
 
-            # MODE WHISPERX - Alternative à Voxtral
-            if ENABLE_WHISPERX:
-                log("[HANDLER] Using WhisperX mode (Whisper large-v3 + PyAnnote)")
-                try:
-                    result = transcribe_with_whisperx(local_path, language or "fr")
-                    segments = result["segments"]
-
-                    # Mapper les speakers (Agent/Client)
-                    _map_roles(segments)
-
-                    # Générer le transcript
-                    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
-
-                    # Résumé optionnel avec Voxtral
-                    summary = ""
-                    if with_summary:
-                        log("[WHISPERX] Generating summary with Voxtral...")
-                        summary = select_best_summary_approach(full_transcript)
-
-                    # Sentiment par speaker
-                    speaker_sentiments = {}
-                    mood_overall = None
-                    mood_client = None
-
-                    if ENABLE_SENTIMENT:
-                        log("[WHISPERX] Computing sentiment analysis by speaker...")
-                        speaker_sentiments = analyze_sentiment_by_speaker(segments)
-
-                        if speaker_sentiments:
-                            # Attribuer le sentiment à chaque segment
-                            for seg in segments:
-                                speaker = seg.get("speaker")
-                                if speaker and speaker in speaker_sentiments:
-                                    seg["mood"] = speaker_sentiments[speaker]
-
-                            # Mood overall (moyenne pondérée)
-                            weighted_moods = []
-                            for seg in segments:
-                                if seg.get("text") and seg.get("mood"):
-                                    duration = float(seg["end"]) - float(seg["start"])
-                                    weighted_moods.append((seg["mood"], duration))
-                            mood_overall = aggregate_mood(weighted_moods) if weighted_moods else None
-
-                            # Sentiment du client
-                            mood_client = get_client_sentiment(speaker_sentiments, segments)
-
-                    out = {
-                        "task": task,
-                        "segments": segments,
-                        "transcript": full_transcript,
-                        "summary": summary,
-                        "mood_by_speaker": speaker_sentiments,
-                        "mood_client": mood_client,
-                        "mood_overall": mood_overall
-                    }
-                except Exception as e:
-                    log(f"[ERROR] WhisperX failed: {e}")
-                    return {"error": f"WhisperX transcription failed: {str(e)}"}
-
             # NOUVEAU : Détection précoce du type de contenu (si activée)
-            elif ENABLE_SINGLE_VOICE_DETECTION:
+            if ENABLE_SINGLE_VOICE_DETECTION:
                 content_type = detect_single_voice_content(local_path, language)
                 
                 if content_type["type"] == "announcement":
