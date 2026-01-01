@@ -1394,11 +1394,10 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
         ]
     }]
     
-    # Utiliser le max_new_tokens demandé par l'utilisateur
-    # Avec un minimum de ~15 tokens/seconde pour éviter les troncatures sur les audios longs
-    estimated_tokens = int(est_dur * 15)
-    speaker_tokens = max(max_new_tokens, estimated_tokens)
-    log(f"[VOXTRAL_ID] Using {speaker_tokens} tokens (requested: {max_new_tokens}, estimated: {estimated_tokens})")
+    # Calcul automatique des tokens basé sur la durée (évite les hallucinations)
+    # Formule: ~15-18 tokens par seconde selon la densité de parole
+    speaker_tokens = int(est_dur * 18)  # Légèrement augmenté de 15 à 18 pour marge
+    log(f"[VOXTRAL_ID] Using {speaker_tokens} tokens (estimated from {est_dur:.1f}s audio)")
     out_speaker_id = run_voxtral_with_timeout(conv_speaker_id, max_new_tokens=speaker_tokens, timeout=120)
     speaker_transcript = (out_speaker_id.get("text") or "").strip()
 
