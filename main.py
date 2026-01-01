@@ -55,14 +55,15 @@ SINGLE_VOICE_SUMMARY_TOKENS = int(os.environ.get("SINGLE_VOICE_SUMMARY_TOKENS", 
 
 # Diarization - MODES AVANCÉS
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
-EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"   
-MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "5.0"))         
-MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "8.0")) 
-MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"  
+EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"
+MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "5.0"))
+MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "8.0"))
+MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"
 HYBRID_MODE = os.environ.get("HYBRID_MODE", "1") == "1"
 AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "1"
 VOXTRAL_SPEAKER_ID = os.environ.get("VOXTRAL_SPEAKER_ID", "1") == "1"  # NOUVEAU : Speaker ID par Voxtral
 PYANNOTE_AUTO = os.environ.get("PYANNOTE_AUTO", "0") == "1"  # NOUVEAU : PyAnnote auto pur
+DETECT_GLOBAL_SWAP = os.environ.get("DETECT_GLOBAL_SWAP", "0") == "1"  # NOUVEAU : Détection inversion globale Agent/Client
 
 # Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
@@ -76,6 +77,10 @@ ROLE_LABELS = [r.strip() for r in os.environ.get("ROLE_LABELS", "Agent,Client").
 _processor = None
 _model = None
 _diarizer = None
+_sentiment_clf = None
+_sentiment_zero_shot = None
+_alignment_model = None
+_alignment_tokenizer = None
 # ---------------------------
 # Helpers généraux
 # ---------------------------
@@ -714,13 +719,14 @@ def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
     Cas typiques:
     - Mot répété avec espaces: "hello hello hello..."
     - Pattern collé: "michel.michel.michel..." (sans espaces)
+    - Phrases complètes: "je vais voir ça je vais voir ça je vais voir ça"
     """
     if not text or len(text) < 20:
         return text
 
     # Cas 1: Détection de patterns courts répétés (ex: "michel.michel.michel...")
-    # Chercher un pattern de 3-20 caractères répété consécutivement
-    for pattern_len in range(3, 21):  # Longueurs de pattern de 3 à 20 chars
+    # Chercher un pattern de 3-100 caractères répété consécutivement (étendu pour phrases)
+    for pattern_len in range(3, min(101, len(text) // 3)):  # Étendu de 20 à 100 chars
         if len(text) < pattern_len * max_repetitions:
             continue
 
@@ -741,7 +747,7 @@ def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
         if repetitions > max_repetitions:
             # Tronquer au premier pattern
             truncate_pos = pos
-            log(f"[CLEANUP] Detected pattern loop: '{pattern[:15]}...' repeated {repetitions} times, truncating from {len(text)} to {truncate_pos} chars")
+            log(f"[CLEANUP] Detected pattern loop: '{pattern[:30]}...' repeated {repetitions} times, truncating from {len(text)} to {truncate_pos} chars")
             return text[:truncate_pos]
 
     # Cas 2: Mots séparés par espaces
@@ -1143,10 +1149,47 @@ def _map_roles(segments: List[Dict[str, Any]]):
     for s in segments:
         s["speaker"] = mapping.get(s["speaker"], s["speaker"])
 
+def merge_consecutive_segments(segments: List[Dict[str, Any]], max_gap: float = 2.0) -> List[Dict[str, Any]]:
+    """
+    Fusionne les segments consécutifs du même speaker avec un gap faible.
+    Version moins agressive que ultra_aggressive_merge.
+    """
+    if not segments:
+        return segments
+
+    merged = []
+    current = segments[0].copy()
+
+    log(f"[MERGE] Starting with {len(segments)} segments")
+
+    for next_seg in segments[1:]:
+        same_speaker = current["speaker"] == next_seg["speaker"]
+        gap = float(next_seg["start"]) - float(current["end"])
+
+        # Fusion conservative : seulement même speaker ET gap faible
+        if same_speaker and gap <= max_gap:
+            # Fusionner
+            current["end"] = next_seg["end"]
+            current_text = current.get("text", "").strip()
+            next_text = next_seg.get("text", "").strip()
+            if current_text and next_text:
+                current["text"] = f"{current_text} {next_text}"
+            elif next_text:
+                current["text"] = next_text
+        else:
+            # Ne peut pas fusionner
+            merged.append(current)
+            current = next_seg.copy()
+
+    merged.append(current)
+
+    log(f"[MERGE] Result: {len(segments)} → {len(merged)} segments")
+    return merged
+
 def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Optimise les segments de diarization avec fusion ultra-agressive."""
     log(f"[OPTIMIZE] Input: {len(segments)} segments")
-    
+
     # Filtrer les segments trop courts
     filtered = []
     for seg in segments:
@@ -1155,9 +1198,9 @@ def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[s
             filtered.append(seg)
         else:
             log(f"[OPTIMIZE] Filtered short segment: {duration:.1f}s < {MIN_SEG_DUR}s")
-    
+
     log(f"[OPTIMIZE] After filtering: {len(filtered)} segments")
-    
+
     # Fusion ULTRA-AGRESSIVE
     if AGGRESSIVE_MERGE and filtered:
         filtered = ultra_aggressive_merge(filtered, max_gap=3.0)
@@ -1351,9 +1394,11 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
         ]
     }]
     
-    # Ajuster les tokens selon la durée (augmenté pour éviter les troncatures)
-    # Retirer le min() pour ne pas limiter par MAX_NEW_TOKENS global
-    speaker_tokens = int(est_dur * 15)  # ~15 tokens par seconde pour éviter les troncatures
+    # Utiliser le max_new_tokens demandé par l'utilisateur
+    # Avec un minimum de ~15 tokens/seconde pour éviter les troncatures sur les audios longs
+    estimated_tokens = int(est_dur * 15)
+    speaker_tokens = max(max_new_tokens, estimated_tokens)
+    log(f"[VOXTRAL_ID] Using {speaker_tokens} tokens (requested: {max_new_tokens}, estimated: {estimated_tokens})")
     out_speaker_id = run_voxtral_with_timeout(conv_speaker_id, max_new_tokens=speaker_tokens, timeout=120)
     speaker_transcript = (out_speaker_id.get("text") or "").strip()
 
@@ -2318,8 +2363,10 @@ def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict]
             # NOUVEAU: Sentiment du client identifié
             client_mood = get_client_sentiment(speaker_sentiments, segments)
             result["mood_client"] = client_mood
-            log(f"[PYANNOTE] DEBUG: client_mood = {client_mood}")
-            log(f"[PYANNOTE] DEBUG: speaker_sentiments keys = {list(speaker_sentiments.keys())}")
+
+            if LOG_LEVEL == "DEBUG":
+                log(f"[PYANNOTE] DEBUG: client_mood = {client_mood}")
+                log(f"[PYANNOTE] DEBUG: speaker_sentiments keys = {list(speaker_sentiments.keys())}")
 
             # Protection maximale contre None
             confidence_raw = client_mood.get('confidence')
@@ -2335,57 +2382,8 @@ def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict]
     return result
 
 # ---------------------------
-# MODE HYBRIDE ULTRA-RAPIDE (fonction principale existante)
+# Post-traitements segments
 # ---------------------------
-    """
-    Fusion ultra-agressive pour créer de gros blocs cohérents et réduire les erreurs.
-    """
-    if not segments:
-        return segments
-    
-    merged = []
-    current = segments[0].copy()
-    
-    log(f"[ULTRA_MERGE] Starting with {len(segments)} segments")
-    
-    for next_seg in segments[1:]:
-        same_speaker = current["speaker"] == next_seg["speaker"]
-        gap = float(next_seg["start"]) - float(current["end"])
-        
-        # Fusion plus agressive : même speaker OU gap très petit
-        should_merge = (same_speaker and gap <= max_gap) or (gap <= 0.5)  # Fusionne même différents speakers si gap < 0.5s
-        
-        if should_merge:
-            # Fusionner
-            current["end"] = next_seg["end"]
-            
-            # Si même speaker, fusionner normalement
-            if same_speaker:
-                current_text = current.get("text", "").strip()
-                next_text = next_seg.get("text", "").strip()
-                if current_text and next_text:
-                    current["text"] = f"{current_text} {next_text}"
-                elif next_text:
-                    current["text"] = next_text
-            else:
-                # Différents speakers mais gap tiny = probablement erreur PyAnnote
-                log(f"[ULTRA_MERGE] Merging different speakers due to tiny gap: {gap:.2f}s")
-                # Garde le speaker du segment le plus long
-                current_dur = float(current["end"]) - float(current["start"])  
-                next_dur = float(next_seg["end"]) - float(next_seg["start"])
-                if next_dur > current_dur:
-                    current["speaker"] = next_seg["speaker"]
-                    
-        else:
-            # Ne peut pas fusionner
-            merged.append(current)
-            current = next_seg.copy()
-    
-    merged.append(current)
-    
-    log(f"[ULTRA_MERGE] Result: {len(segments)} → {len(merged)} segments ({100*(1-len(merged)/len(segments)):.1f}% reduction)")
-    return merged
-
 def intelligent_dialogue_correction(text: str, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Post-correction intelligente du dialogue basée sur les patterns de conversation.
@@ -2452,39 +2450,6 @@ def intelligent_dialogue_correction(text: str, segments: List[Dict[str, Any]]) -
         return corrected_segments
     
     return segments
-
-def post_correct_speaker_attribution(text: str, speaker: str, has_previous_speaker: bool) -> str:
-    """Post-correction améliorée de l'attribution basée sur les patterns de dialogue."""
-    if not text:
-        return text
-    
-    text_lower = text.lower().strip()
-    
-    # Patterns CLIENT plus spécifiques
-    client_patterns = [
-        ('je voudrais', 3), ('ma femme', 3), ('mon mari', 3), ('j\'ai appelé', 2),
-        ('est-ce que je pourrais', 3), ('où est-ce que', 2), ('quel autre centre', 3),
-        ('les rendez-vous ne conviennent pas', 4), ('je me permettais', 3)
-    ]
-    
-    # Patterns AGENT plus spécifiques  
-    agent_patterns = [
-        ('cabinet', 2), ('bonjour', 1), ('je vais voir ça', 3), ('dès que j\'ai', 2),
-        ('on vous rappelle', 3), ('vous avez mon numéro', 3), ('notre confrère', 2),
-        ('c\'est pour quoi faire', 2), ('allez ok', 2)
-    ]
-    
-    # Calcul des scores pondérés
-    client_score = sum(weight for pattern, weight in client_patterns if pattern in text_lower)
-    agent_score = sum(weight for pattern, weight in agent_patterns if pattern in text_lower)
-    
-    # Détection d'erreurs flagrantes
-    if client_score >= 3 and speaker == "Agent":
-        log(f"[CORRECTION] Strong client pattern in agent text: '{text[:40]}...'")
-    elif agent_score >= 3 and speaker == "Client":
-        log(f"[CORRECTION] Strong agent pattern in client text: '{text[:40]}...'")
-    
-    return re.sub(r'\s+', ' ', text).strip()
 
 def smart_sentence_split(text: str) -> List[str]:
     """
@@ -2586,6 +2551,71 @@ def post_correct_speaker_attribution(text: str, speaker: str, has_previous_speak
     
     return text.strip()
 
+def detect_global_speaker_swap(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Détecte si les labels Agent/Client sont inversés globalement.
+    DÉSACTIVÉ PAR DÉFAUT - Activer avec DETECT_GLOBAL_SWAP=1
+
+    Utilise l'analyse sémantique pour vérifier si les rôles sont cohérents.
+    """
+    if not DETECT_GLOBAL_SWAP or not segments or len(segments) < 2:
+        return segments
+
+    log("[GLOBAL_SWAP] Checking for global speaker inversion...")
+
+    # Mots très caractéristiques de chaque rôle
+    agent_keywords = [
+        'cabinet', 'secrétariat', 'bonjour', 'je vais voir', 'je vous propose',
+        'on vous rappelle', 'vous avez mon numéro', 'notre confrère',
+        'c\'est noté', 'je vérifie dans l\'agenda'
+    ]
+
+    client_keywords = [
+        'ma femme', 'mon mari', 'mon fils', 'ma fille', 'mes enfants',
+        'je voudrais', 'est-ce que je peux', 'pour moi', 'j\'ai appelé',
+        'rendez-vous pour moi'
+    ]
+
+    # Compter les occurrences pour chaque speaker
+    agent_says_agent = 0
+    agent_says_client = 0
+    client_says_agent = 0
+    client_says_client = 0
+
+    for seg in segments:
+        speaker = seg.get("speaker")
+        text = (seg.get("text", "") or "").lower()
+
+        agent_count = sum(1 for kw in agent_keywords if kw in text)
+        client_count = sum(1 for kw in client_keywords if kw in text)
+
+        if speaker == "Agent":
+            agent_says_agent += agent_count
+            agent_says_client += client_count
+        elif speaker == "Client":
+            client_says_agent += agent_count
+            client_says_client += client_count
+
+    # Calculer les scores de cohérence
+    agent_coherence = agent_says_agent - agent_says_client
+    client_coherence = client_says_client - client_says_agent
+
+    log(f"[GLOBAL_SWAP] Agent coherence: {agent_coherence} (says {agent_says_agent} agent words, {agent_says_client} client words)")
+    log(f"[GLOBAL_SWAP] Client coherence: {client_coherence} (says {client_says_client} client words, {client_says_agent} agent words)")
+
+    # Si les deux scores sont négatifs = inversion probable
+    if agent_coherence < -2 and client_coherence < -2:
+        log("[GLOBAL_SWAP] ⚠️ GLOBAL INVERSION DETECTED - Swapping all Agent ↔ Client labels")
+        for seg in segments:
+            if seg["speaker"] == "Agent":
+                seg["speaker"] = "Client"
+            elif seg["speaker"] == "Client":
+                seg["speaker"] = "Agent"
+        return segments
+
+    log("[GLOBAL_SWAP] ✅ No global inversion detected")
+    return segments
+
 def detect_and_fix_speaker_inversion(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Correction MINIMALE et CONSERVATRICE des erreurs de diarisation.
@@ -2598,10 +2628,15 @@ def detect_and_fix_speaker_inversion(segments: List[Dict[str, Any]]) -> List[Dic
     Cas corrigés:
     1. Segments courts (<2s) isolés entre 2 segments du même autre speaker
     2. Segments avec forte incohérence sémantique évidente
+    3. Inversion globale Agent/Client (si DETECT_GLOBAL_SWAP=1)
     """
     if not segments or len(segments) < 3:
         return segments
 
+    # ÉTAPE 1 : Détection globale (si activée)
+    segments = detect_global_speaker_swap(segments)
+
+    # ÉTAPE 2 : Corrections locales
     log("[SPEAKER_FIX] Checking for isolated segment errors...")
 
     corrections_made = 0
@@ -3043,12 +3078,6 @@ def health():
 # ---------------------------
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        global MAX_DURATION_S
-        MAX_DURATION_S = 9000  # Force à 9000 secondes (2h30)
-        log(f"[HANDLER] MAX_DURATION_S forced to: {MAX_DURATION_S}")
-        
-        log(f"[HANDLER] New job received: {job.get('input', {}).get('task', 'unknown')}")
-        inp = job.get("input", {}) or {}
         log(f"[HANDLER] New job received: {job.get('input', {}).get('task', 'unknown')}")
         inp = job.get("input", {}) or {}
 
