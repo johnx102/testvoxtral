@@ -2550,177 +2550,142 @@ def post_correct_speaker_attribution(text: str, speaker: str, has_previous_speak
 
     return text.strip()
 
-def fix_obvious_semantic_errors(segments: List[Dict[str, Any]]) -> int:
+def llm_verify_and_fix_attributions(segments: List[Dict[str, Any]]) -> int:
     """
-    Correction ULTRA-CONSERVATRICE basée sur l'analyse du contenu sémantique.
+    Relecture INTELLIGENTE par Voxtral LLM des attributions speaker.
 
-    Ne corrige QUE les incohérences ÉVIDENTES:
-    - Agent qui dit "ma femme", "j'ai mal", etc. (mots très spécifiques au Client)
-    - Client qui dit "cabinet", "secrétariat", etc. (mots très spécifiques à l'Agent)
+    Voxtral relit le transcript complet et identifie UNIQUEMENT les segments
+    évidemment mal attribués basés sur le contexte de la conversation.
 
-    ET seulement si le segment est:
-    - Court (< 2s)
-    - Isolé (entouré par l'autre speaker)
-
-    Double sécurité pour éviter les sur-corrections.
-    """
-    if not DETECT_GLOBAL_SWAP or len(segments) < 3:
-        return 0
-
-    log("[SEMANTIC_FIX] Checking for obvious semantic errors...")
-
-    # Mots TRÈS spécifiques (forte probabilité d'erreur si utilisés par l'autre speaker)
-    agent_exclusive_words = [
-        'cabinet', 'secrétariat', 'notre cabinet', 'notre confrère',
-        'je vais voir', 'je regarde l\'agenda', 'je vous rappelle',
-        'on vous rappelle', 'vous avez nos coordonnées'
-    ]
-
-    client_exclusive_words = [
-        'ma femme', 'mon mari', 'mon fils', 'ma fille', 'mes enfants',
-        'mon problème', 'j\'ai mal', 'je souffre', 'ma dent',
-        'mon abcès', 'ça me fait mal'
-    ]
-
-    corrections = 0
-
-    for i in range(1, len(segments) - 1):
-        current = segments[i]
-        prev = segments[i - 1]
-        next_seg = segments[i + 1]
-
-        current_speaker = current.get("speaker")
-        prev_speaker = prev.get("speaker")
-        next_speaker = next_seg.get("speaker")
-        text = (current.get("text", "") or "").lower()
-        duration = float(current["end"]) - float(current["start"])
-
-        # Condition 1 : Segment COURT (< 2s) ET ISOLÉ
-        if duration >= 2.0:
-            continue
-        if not (prev_speaker == next_speaker and current_speaker != prev_speaker):
-            continue
-
-        # Condition 2 : Incohérence sémantique ÉVIDENTE
-        semantic_error = False
-        detected_word = None
-
-        if current_speaker == "Agent":
-            for word in client_exclusive_words:
-                if word in text:
-                    semantic_error = True
-                    detected_word = word
-                    break
-        elif current_speaker == "Client":
-            for word in agent_exclusive_words:
-                if word in text:
-                    semantic_error = True
-                    detected_word = word
-                    break
-
-        # Si les 2 conditions sont remplies → correction
-        if semantic_error:
-            log(f"[SEMANTIC_FIX] Segment {i}: {current_speaker} says '{detected_word}' ({duration:.1f}s, isolated) - CORRECTING to {prev_speaker}")
-            current["speaker"] = prev_speaker
-            corrections += 1
-
-    if corrections > 0:
-        log(f"[SEMANTIC_FIX] ✅ Corrected {corrections} obvious semantic errors")
-    else:
-        log(f"[SEMANTIC_FIX] ✅ No obvious errors detected")
-
-    return corrections
-
-
-def detect_global_speaker_swap(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Détection SIMPLE d'inversion globale Agent/Client.
-    DÉSACTIVÉ PAR DÉFAUT - Activer avec DETECT_GLOBAL_SWAP=1
-
-    Utilise une analyse sémantique simple par mots-clés pour détecter
-    si tous les labels sont inversés.
+    Retourne le nombre de corrections effectuées.
     """
     if not DETECT_GLOBAL_SWAP or not segments or len(segments) < 2:
-        return segments
+        return 0
 
-    log("[GLOBAL_SWAP] Checking for global speaker inversion...")
+    log("[LLM_REVIEW] Starting intelligent transcript review by Voxtral...")
 
-    # Mots caractéristiques de chaque rôle
-    agent_keywords = [
-        'cabinet', 'secrétariat', 'je vais voir', 'je vous propose',
-        'on vous rappelle', 'vous avez mon numéro', 'notre confrère',
-        'c\'est noté', 'je vérifie', 'agenda', 'consultation'
-    ]
+    # Construire le transcript avec numéros de segments
+    transcript_lines = []
+    for i, seg in enumerate(segments, 1):
+        speaker = seg.get("speaker", "Unknown")
+        text = seg.get("text", "").strip()
+        transcript_lines.append(f"{i}. {speaker}: {text}")
 
-    client_keywords = [
-        'ma femme', 'mon mari', 'mon fils', 'ma fille', 'mes enfants',
-        'je voudrais', 'est-ce que je peux', 'pour moi', 'j\'ai appelé',
-        'rendez-vous pour moi', 'mon problème', 'j\'ai mal'
-    ]
+    transcript_text = "\n".join(transcript_lines)
 
-    agent_says_agent = 0
-    agent_says_client = 0
-    client_says_agent = 0
-    client_says_client = 0
+    # Limiter à 30 segments max pour ne pas surcharger (garder début + fin si > 30)
+    if len(segments) > 30:
+        middle_start = len(segments) // 2 - 5
+        middle_end = len(segments) // 2 + 5
+        transcript_lines_limited = transcript_lines[:15] + \
+                                   [f"... ({len(segments) - 30} segments omis) ..."] + \
+                                   transcript_lines[-15:]
+        transcript_text = "\n".join(transcript_lines_limited)
 
-    for seg in segments:
-        speaker = seg.get("speaker")
-        text = (seg.get("text", "") or "").lower()
+    # Prompt pour Voxtral
+    review_prompt = f"""Contexte: Cabinet médical/dentaire. L'Agent est le SECRÉTARIAT qui RÉPOND au téléphone. Le Client est la PERSONNE qui APPELLE pour prendre rendez-vous.
 
-        agent_count = sum(1 for kw in agent_keywords if kw in text)
-        client_count = sum(1 for kw in client_keywords if kw in text)
+Transcript avec attributions actuelles:
+{transcript_text}
 
-        if speaker == "Agent":
-            agent_says_agent += agent_count
-            agent_says_client += client_count
-        elif speaker == "Client":
-            client_says_agent += agent_count
-            client_says_client += client_count
+Mission: Identifie UNIQUEMENT les segments ÉVIDEMMENT mal attribués (incohérences flagrantes dans le contexte de la conversation).
 
-    agent_coherence = agent_says_agent - agent_says_client
-    client_coherence = client_says_client - client_says_agent
+Exemples d'erreurs à détecter:
+- Agent dit "ma femme a mal" (= devrait être Client)
+- Client dit "je regarde l'agenda" (= devrait être Agent)
+- Question posée par Agent puis réponse du même Agent (impossible)
 
-    log(f"[GLOBAL_SWAP] Coherence - Agent: {agent_coherence}, Client: {client_coherence}")
+Format de réponse STRICT (un par ligne):
+3:Client
+7:Agent
+12:Client
 
-    # Détection d'inversion : les deux scores négatifs OU forte asymétrie
-    both_negative = agent_coherence < 0 and client_coherence < 0
-    asymmetric = (client_says_agent >= 2 and agent_says_agent == 0) or \
-                 (agent_says_client >= 2 and client_says_client == 0)
+Si AUCUNE erreur évidente, réponds: "OK"
+"""
 
-    if both_negative or asymmetric:
-        log("[GLOBAL_SWAP] ⚠️ GLOBAL INVERSION DETECTED - Swapping all Agent ↔ Client")
-        for seg in segments:
-            if seg["speaker"] == "Agent":
-                seg["speaker"] = "Client"
-            elif seg["speaker"] == "Client":
-                seg["speaker"] = "Agent"
-    else:
-        log("[GLOBAL_SWAP] ✅ No global inversion detected")
+    try:
+        conv = [{
+            "role": "user",
+            "content": [{"type": "text", "text": review_prompt}]
+        }]
 
-    return segments
+        # Tokens estimés : ~50 tokens pour la réponse max
+        result = run_voxtral_with_timeout(conv, max_new_tokens=100, timeout=20)
+        response = result.get("text", "").strip()
+
+        log(f"[LLM_REVIEW] Response: {response}")
+
+        # Parser la réponse
+        if response.upper() == "OK" or not response:
+            log("[LLM_REVIEW] ✅ No attribution errors detected by LLM")
+            return 0
+
+        corrections = 0
+        lines = response.split("\n")
+
+        for line in lines:
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+
+            try:
+                # Format attendu: "3:Client" ou "7:Agent"
+                parts = line.split(":")
+                if len(parts) != 2:
+                    continue
+
+                segment_num = int(parts[0].strip())
+                new_speaker = parts[1].strip()
+
+                # Valider
+                if segment_num < 1 or segment_num > len(segments):
+                    log(f"[LLM_REVIEW] Invalid segment number: {segment_num}")
+                    continue
+
+                if new_speaker not in ["Agent", "Client"]:
+                    log(f"[LLM_REVIEW] Invalid speaker: {new_speaker}")
+                    continue
+
+                # Appliquer la correction
+                idx = segment_num - 1  # Index 0-based
+                old_speaker = segments[idx]["speaker"]
+
+                if old_speaker != new_speaker:
+                    log(f"[LLM_REVIEW] Correcting segment {segment_num}: {old_speaker} → {new_speaker}")
+                    log(f"[LLM_REVIEW]   Text: '{segments[idx].get('text', '')[:60]}...'")
+                    segments[idx]["speaker"] = new_speaker
+                    corrections += 1
+
+            except (ValueError, IndexError) as e:
+                log(f"[LLM_REVIEW] Error parsing line '{line}': {e}")
+                continue
+
+        if corrections > 0:
+            log(f"[LLM_REVIEW] ✅ Corrected {corrections} attributions based on LLM review")
+        else:
+            log(f"[LLM_REVIEW] ✅ No corrections needed")
+
+        return corrections
+
+    except Exception as e:
+        log(f"[LLM_REVIEW] Error during LLM review: {e}")
+        return 0
 
 def detect_and_fix_speaker_inversion(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Correction MINIMALE et CONSERVATRICE des erreurs de diarisation.
+    Relecture INTELLIGENTE par Voxtral LLM pour corriger les attributions évidentes mal placées.
 
     PHILOSOPHIE:
-    - La reconnaissance vocale PyAnnote est LA VÉRITÉ DE BASE
-    - On corrige UNIQUEMENT les segments suspects isolés
-    - PAS de swap global - seulement correction de segments individuels
-
-    Cas corrigés:
-    1. Segments courts (<2s) isolés entre 2 segments du même autre speaker
-    2. Segments avec forte incohérence sémantique évidente
-    3. Inversion globale Agent/Client (si DETECT_GLOBAL_SWAP=1)
+    - La diarisation Voxtral est LA VÉRITÉ DE BASE
+    - Voxtral se relit lui-même et identifie UNIQUEMENT les incohérences évidentes
+    - Pas de règles rigides : compréhension contextuelle du dialogue complet
+    - DÉSACTIVÉ PAR DÉFAUT - Activer avec DETECT_GLOBAL_SWAP=1
     """
-    if not segments or len(segments) < 3:
+    if not segments or len(segments) < 2:
         return segments
 
-    # ÉTAPE 1 : Détection globale (si activée)
-    segments = detect_global_speaker_swap(segments)
-
-    # ÉTAPE 2 : Correction sémantique ultra-conservatrice
-    fix_obvious_semantic_errors(segments)
+    # Relecture intelligente par LLM (si activée)
+    llm_verify_and_fix_attributions(segments)
 
     return segments
 
