@@ -64,7 +64,6 @@ AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "1"
 VOXTRAL_SPEAKER_ID = os.environ.get("VOXTRAL_SPEAKER_ID", "1") == "1"  # NOUVEAU : Speaker ID par Voxtral
 PYANNOTE_AUTO = os.environ.get("PYANNOTE_AUTO", "0") == "1"  # NOUVEAU : PyAnnote auto pur
 DETECT_GLOBAL_SWAP = os.environ.get("DETECT_GLOBAL_SWAP", "0") == "1"  # NOUVEAU : Détection inversion globale Agent/Client
-DEEP_COHERENCE_CHECK = os.environ.get("DEEP_COHERENCE_CHECK", "0") == "1"  # NOUVEAU : Vérification LLM approfondie (plus lent)
 
 # Transcription & résumé
 STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
@@ -2551,125 +2550,39 @@ def post_correct_speaker_attribution(text: str, speaker: str, has_previous_speak
 
     return text.strip()
 
-# ========================================
-# NIVEAU 1 : DÉTECTIONS RAPIDES (HEURISTIQUES)
-# ========================================
-
-def detect_question_answer_conflicts(segments: List[Dict[str, Any]]) -> List[int]:
+def fix_obvious_semantic_errors(segments: List[Dict[str, Any]]) -> int:
     """
-    NIVEAU 1 - RAPIDE (<0.1s)
-    Détecte les patterns question-réponse du même speaker (impossible).
+    Correction ULTRA-CONSERVATRICE basée sur l'analyse du contenu sémantique.
 
-    Retourne les indices des segments suspects.
+    Ne corrige QUE les incohérences ÉVIDENTES:
+    - Agent qui dit "ma femme", "j'ai mal", etc. (mots très spécifiques au Client)
+    - Client qui dit "cabinet", "secrétariat", etc. (mots très spécifiques à l'Agent)
+
+    ET seulement si le segment est:
+    - Court (< 2s)
+    - Isolé (entouré par l'autre speaker)
+
+    Double sécurité pour éviter les sur-corrections.
     """
-    if len(segments) < 2:
-        return []
+    if not DETECT_GLOBAL_SWAP or len(segments) < 3:
+        return 0
 
-    suspicious_indices = []
+    log("[SEMANTIC_FIX] Checking for obvious semantic errors...")
 
-    # Patterns de questions
-    question_patterns = [
-        r'\?$',  # Finit par ?
-        r'^(quel|quelle|quels|quelles|qui|quoi|où|quand|comment|pourquoi|combien)',  # Mots interrogatifs
-        r'est-ce que',
-        r'vous (voulez|pouvez|avez|êtes)',
-    ]
-
-    # Patterns de réponses courtes
-    answer_patterns = [
-        r'^(oui|non|ok|d\'accord|bien sûr|peut-être|voilà|exactement)',
-        r'^(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)',  # Jours
-        r'^\d+h\d*',  # Horaires
-    ]
-
-    for i in range(len(segments) - 1):
-        current = segments[i]
-        next_seg = segments[i + 1]
-
-        current_speaker = current.get("speaker")
-        next_speaker = next_seg.get("speaker")
-        current_text = (current.get("text", "") or "").strip().lower()
-        next_text = (next_seg.get("text", "") or "").strip().lower()
-
-        # Même speaker consécutif
-        if current_speaker == next_speaker:
-            # Le premier segment est une question
-            is_question = any(re.search(pat, current_text) for pat in question_patterns)
-            # Le second segment est une réponse courte
-            is_answer = any(re.search(pat, next_text) for pat in answer_patterns)
-
-            if is_question and is_answer:
-                log(f"[QA_CONFLICT] Segments {i}-{i+1}: Question-Answer from same speaker '{current_speaker}' - SUSPICIOUS")
-                suspicious_indices.append(i + 1)  # La réponse est probablement mal attribuée
-
-    return suspicious_indices
-
-
-def check_semantic_keywords(segments: List[Dict[str, Any]]) -> List[int]:
-    """
-    NIVEAU 1 - RAPIDE (<0.5s)
-    Détecte les segments avec des mots incompatibles avec leur contexte.
-
-    Retourne les indices des segments suspects.
-    """
-    if not segments:
-        return []
-
-    suspicious_indices = []
-
-    # Mots TRÈS caractéristiques de chaque rôle (liste étendue)
-    agent_strong_keywords = [
-        'cabinet', 'secrétariat', 'notre confrère', 'docteur',
-        'je vais voir', 'je regarde l\'agenda', 'je vous propose',
+    # Mots TRÈS spécifiques (forte probabilité d'erreur si utilisés par l'autre speaker)
+    agent_exclusive_words = [
+        'cabinet', 'secrétariat', 'notre cabinet', 'notre confrère',
+        'je vais voir', 'je regarde l\'agenda', 'je vous rappelle',
         'on vous rappelle', 'vous avez nos coordonnées'
     ]
 
-    client_strong_keywords = [
+    client_exclusive_words = [
         'ma femme', 'mon mari', 'mon fils', 'ma fille', 'mes enfants',
-        'mon problème', 'j\'ai mal', 'je souffre', 'depuis hier',
-        'pour moi', 'mon rendez-vous'
+        'mon problème', 'j\'ai mal', 'je souffre', 'ma dent',
+        'mon abcès', 'ça me fait mal'
     ]
 
-    for i, seg in enumerate(segments):
-        speaker = seg.get("speaker")
-        text = (seg.get("text", "") or "").lower()
-
-        # Agent qui utilise des mots Client
-        if speaker == "Agent":
-            for kw in client_strong_keywords:
-                if kw in text:
-                    log(f"[KEYWORD_CONFLICT] Segment {i}: Agent says '{kw}' - SUSPICIOUS")
-                    suspicious_indices.append(i)
-                    break
-
-        # Client qui utilise des mots Agent
-        elif speaker == "Client":
-            for kw in agent_strong_keywords:
-                if kw in text:
-                    log(f"[KEYWORD_CONFLICT] Segment {i}: Client says '{kw}' - SUSPICIOUS")
-                    suspicious_indices.append(i)
-                    break
-
-    return suspicious_indices
-
-
-def detect_local_speaker_errors(segments: List[Dict[str, Any]], suspicious_indices: Optional[List[int]] = None) -> int:
-    """
-    NIVEAU 1 - RAPIDE (<0.5s)
-    Détecte et corrige les erreurs LOCALES de speaker (segments isolés mal attribués).
-    Ces erreurs locales sont souvent la SOURCE des inversions globales.
-
-    Args:
-        segments: Liste des segments
-        suspicious_indices: Indices de segments marqués suspects par d'autres détections
-
-    Retourne le nombre de corrections effectuées.
-    """
-    if len(segments) < 3:
-        return 0
-
     corrections = 0
-    suspicious_set = set(suspicious_indices or [])
 
     for i in range(1, len(segments) - 1):
         current = segments[i]
@@ -2679,279 +2592,60 @@ def detect_local_speaker_errors(segments: List[Dict[str, Any]], suspicious_indic
         current_speaker = current.get("speaker")
         prev_speaker = prev.get("speaker")
         next_speaker = next_seg.get("speaker")
+        text = (current.get("text", "") or "").lower()
+        duration = float(current["end"]) - float(current["start"])
 
-        # Cas 1 : segment isolé entre 2 segments du même autre speaker
-        if prev_speaker == next_speaker and current_speaker != prev_speaker:
-            duration = float(current["end"]) - float(current["start"])
-
-            # Critères de correction
-            should_correct = False
-
-            # 1a. Segment court (< 3s) - correction automatique
-            if duration < 3.0:
-                should_correct = True
-                reason = f"{duration:.1f}s (short)"
-
-            # 1b. Segment plus long mais marqué suspect par d'autres détections
-            elif i in suspicious_set and duration < 10.0:
-                should_correct = True
-                reason = f"{duration:.1f}s (suspicious keyword/QA)"
-
-            # 1c. Segment isolé très court dans le contexte global (< 5s et < 10% du temps de parole)
-            elif duration < 5.0:
-                total_time = sum(float(s["end"]) - float(s["start"]) for s in segments if s.get("speaker") == current_speaker)
-                if total_time > 0 and duration / total_time < 0.1:
-                    should_correct = True
-                    reason = f"{duration:.1f}s (< 10% of speaker time)"
-
-            if should_correct:
-                log(f"[LOCAL_ERROR] Segment {i} isolated as '{current_speaker}' between '{prev_speaker}' - {reason} - CORRECTING")
-                current["speaker"] = prev_speaker
-                corrections += 1
-
-        # Cas 2 : segment marqué suspect par détection sémantique (même si pas isolé)
-        elif i in suspicious_set:
-            duration = float(current["end"]) - float(current["start"])
-            # Si court ET suspect sémantiquement, corriger vers le voisin majoritaire
-            if duration < 5.0:
-                # Déterminer le speaker majoritaire autour
-                neighbor_speakers = []
-                if i > 0:
-                    neighbor_speakers.append(prev_speaker)
-                if i < len(segments) - 1:
-                    neighbor_speakers.append(next_speaker)
-
-                if neighbor_speakers and all(s == neighbor_speakers[0] for s in neighbor_speakers):
-                    majority_speaker = neighbor_speakers[0]
-                    if current_speaker != majority_speaker:
-                        log(f"[LOCAL_ERROR] Segment {i} semantically suspect + surrounded by '{majority_speaker}' - CORRECTING")
-                        current["speaker"] = majority_speaker
-                        corrections += 1
-
-    if corrections > 0:
-        log(f"[LOCAL_ERROR] Corrected {corrections} local speaker errors")
-
-    return corrections
-
-
-# ========================================
-# NIVEAU 2 : VÉRIFICATION LLM (SI NÉCESSAIRE)
-# ========================================
-
-def verify_suspicious_segments_batch(segments: List[Dict[str, Any]], suspicious_indices: List[int]) -> int:
-    """
-    NIVEAU 2 - PRÉCIS (+5-10s si appelé)
-    Vérifie par batch les segments suspects avec Voxtral LLM.
-
-    Args:
-        segments: Liste complète des segments
-        suspicious_indices: Indices des segments à vérifier
-
-    Retourne le nombre de corrections effectuées.
-    """
-    if not suspicious_indices or not DEEP_COHERENCE_CHECK:
-        return 0
-
-    log(f"[LLM_BATCH] Verifying {len(suspicious_indices)} suspicious segments with Voxtral...")
-
-    corrections = 0
-
-    # Limiter à 5 segments max pour ne pas surcharger
-    suspicious_indices = suspicious_indices[:5]
-
-    for idx in suspicious_indices:
-        if idx >= len(segments):
+        # Condition 1 : Segment COURT (< 2s) ET ISOLÉ
+        if duration >= 2.0:
+            continue
+        if not (prev_speaker == next_speaker and current_speaker != prev_speaker):
             continue
 
-        # Construire le contexte (segment suspect + voisins)
-        context_start = max(0, idx - 2)
-        context_end = min(len(segments), idx + 3)
-        context_segments = segments[context_start:context_end]
+        # Condition 2 : Incohérence sémantique ÉVIDENTE
+        semantic_error = False
+        detected_word = None
 
-        # Position du segment suspect dans le contexte
-        suspect_position = idx - context_start
+        if current_speaker == "Agent":
+            for word in client_exclusive_words:
+                if word in text:
+                    semantic_error = True
+                    detected_word = word
+                    break
+        elif current_speaker == "Client":
+            for word in agent_exclusive_words:
+                if word in text:
+                    semantic_error = True
+                    detected_word = word
+                    break
 
-        # Construire le texte de la conversation
-        conversation_text = ""
-        for i, seg in enumerate(context_segments):
-            speaker = seg.get("speaker", "Unknown")
-            text = seg.get("text", "")
-            marker = " ← SUSPECT" if i == suspect_position else ""
-            conversation_text += f"{i+1}. {speaker}: {text}{marker}\n"
-
-        # Prompt pour Voxtral
-        verification_prompt = f"""Contexte: Cabinet médical. Agent = secrétariat qui répond. Client = personne qui appelle.
-
-Conversation:
-{conversation_text}
-
-Le segment marqué SUSPECT est-il attribué au BON speaker?
-Si NON, qui devrait-il être (Agent ou Client)?
-
-Réponds UNIQUEMENT: "OK" OU "INVERSER vers Agent" OU "INVERSER vers Client"."""
-
-        try:
-            conv = [{
-                "role": "user",
-                "content": [{"type": "text", "text": verification_prompt}]
-            }]
-
-            result = run_voxtral_with_timeout(conv, max_new_tokens=20, timeout=15)
-            response = result.get("text", "").strip().upper()
-
-            log(f"[LLM_BATCH] Segment {idx}: {response}")
-
-            # Parser la réponse
-            if "INVERSER" in response:
-                if "AGENT" in response:
-                    new_speaker = "Agent"
-                elif "CLIENT" in response:
-                    new_speaker = "Client"
-                else:
-                    continue
-
-                old_speaker = segments[idx]["speaker"]
-                if old_speaker != new_speaker:
-                    log(f"[LLM_BATCH] Correcting segment {idx}: {old_speaker} → {new_speaker}")
-                    segments[idx]["speaker"] = new_speaker
-                    corrections += 1
-
-        except Exception as e:
-            log(f"[LLM_BATCH] Error verifying segment {idx}: {e}")
-            continue
+        # Si les 2 conditions sont remplies → correction
+        if semantic_error:
+            log(f"[SEMANTIC_FIX] Segment {i}: {current_speaker} says '{detected_word}' ({duration:.1f}s, isolated) - CORRECTING to {prev_speaker}")
+            current["speaker"] = prev_speaker
+            corrections += 1
 
     if corrections > 0:
-        log(f"[LLM_BATCH] Corrected {corrections} segments after LLM verification")
+        log(f"[SEMANTIC_FIX] ✅ Corrected {corrections} obvious semantic errors")
+    else:
+        log(f"[SEMANTIC_FIX] ✅ No obvious errors detected")
 
     return corrections
-
-
-def verify_roles_with_llm(segments: List[Dict[str, Any]]) -> bool:
-    """
-    Utilise Voxtral pour vérifier si les rôles Agent/Client sont corrects.
-    Analyse les premiers segments pour détecter une inversion.
-
-    Retourne True si une inversion est détectée.
-    """
-    if not segments:
-        return False
-
-    # Construire un texte représentatif des premiers échanges
-    conversation_sample = ""
-    for i, seg in enumerate(segments[:5], 1):  # 5 premiers segments
-        speaker = seg.get("speaker", "Unknown")
-        text = seg.get("text", "")
-        conversation_sample += f"{i}. {speaker}: {text}\n"
-
-    # Prompt pour Voxtral
-    verification_prompt = f"""Contexte: Cabinet médical/dentaire. L'Agent est le secrétariat qui RÉPOND au téléphone. Le Client est la personne qui APPELLE.
-
-Conversation:
-{conversation_sample}
-
-Question: Les labels Agent/Client sont-ils INVERSÉS? Réponds UNIQUEMENT par "OUI" ou "NON"."""
-
-    try:
-        conv = [{
-            "role": "user",
-            "content": [{"type": "text", "text": verification_prompt}]
-        }]
-
-        result = run_voxtral_with_timeout(conv, max_new_tokens=10, timeout=15)
-        response = result.get("text", "").strip().upper()
-
-        log(f"[LLM_VERIFY] Response: {response}")
-
-        return "OUI" in response
-
-    except Exception as e:
-        log(f"[LLM_VERIFY] Error: {e}")
-        return False
 
 
 def detect_global_speaker_swap(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Détection OPTIMISÉE À 2 NIVEAUX des inversions et erreurs de diarisation.
+    Détection SIMPLE d'inversion globale Agent/Client.
     DÉSACTIVÉ PAR DÉFAUT - Activer avec DETECT_GLOBAL_SWAP=1
 
-    NIVEAU 1 - RAPIDE (+1-2s):
-    - Détection question-réponse
-    - Analyse sémantique par mots-clés
-    - Correction des erreurs locales (segments isolés)
-    - Premier locuteur et temps de parole
-
-    NIVEAU 2 - PRÉCIS (+5-10s si nécessaire):
-    - Vérification LLM des segments suspects (si DEEP_COHERENCE_CHECK=1)
-    - Vérification globale par LLM si doute
-
-    Focus: COHÉRENCE LOCALE pour éviter les bulles de conversation incorrectes.
+    Utilise une analyse sémantique simple par mots-clés pour détecter
+    si tous les labels sont inversés.
     """
     if not DETECT_GLOBAL_SWAP or not segments or len(segments) < 2:
         return segments
 
-    log("[GLOBAL_SWAP] ═══ 2-LEVEL COHERENCE DETECTION STARTED ═══")
-    log(f"[GLOBAL_SWAP] Mode: LEVEL 1 (fast) {'+ LEVEL 2 (LLM)' if DEEP_COHERENCE_CHECK else '(LLM disabled)'}")
+    log("[GLOBAL_SWAP] Checking for global speaker inversion...")
 
-    # ═══════════════════════════════════════════════════════
-    # NIVEAU 1 : DÉTECTIONS RAPIDES (HEURISTIQUES)
-    # ═══════════════════════════════════════════════════════
-
-    suspicious_indices = []
-
-    # 1.1 Détection question-réponse (RAPIDE)
-    log("[LEVEL1] Checking question-answer patterns...")
-    qa_suspects = detect_question_answer_conflicts(segments)
-    suspicious_indices.extend(qa_suspects)
-    if qa_suspects:
-        log(f"[LEVEL1] Found {len(qa_suspects)} Q-A conflicts: {qa_suspects}")
-
-    # 1.2 Analyse sémantique par mots-clés (RAPIDE)
-    log("[LEVEL1] Checking semantic keywords...")
-    keyword_suspects = check_semantic_keywords(segments)
-    suspicious_indices.extend(keyword_suspects)
-    if keyword_suspects:
-        log(f"[LEVEL1] Found {len(keyword_suspects)} keyword conflicts: {keyword_suspects}")
-
-    # Dédupliquer les indices suspects
-    suspicious_indices = list(set(suspicious_indices))
-
-    # 1.3 Correction des erreurs locales avec contexte suspect (RAPIDE)
-    log("[LEVEL1] Correcting local speaker errors...")
-    local_corrections = detect_local_speaker_errors(segments, suspicious_indices)
-
-    # 1.4 Premier locuteur et temps de parole (RAPIDE)
-    inversion_score = 0
-    first_speaker = segments[0].get("speaker")
-    first_text = segments[0].get("text", "").lower()
-
-    if first_speaker == "Client":
-        log(f"[LEVEL1] ⚠️ First speaker is Client (should be Agent for cabinet)")
-        inversion_score += 50
-    elif any(kw in first_text for kw in ['cabinet', 'secrétariat']):
-        log(f"[LEVEL1] ✅ First speaker is Agent with cabinet greeting")
-        inversion_score -= 20
-
-    # Temps de parole
-    agent_time = sum(float(s["end"]) - float(s["start"]) for s in segments if s.get("speaker") == "Agent")
-    client_time = sum(float(s["end"]) - float(s["start"]) for s in segments if s.get("speaker") == "Client")
-    total_time = agent_time + client_time
-
-    if total_time > 0:
-        agent_ratio = agent_time / total_time
-        log(f"[LEVEL1] Speaking time - Agent: {agent_ratio:.1%}, Client: {(1-agent_ratio):.1%}")
-
-        if agent_ratio > 0.70:
-            log(f"[LEVEL1] ⚠️ Agent speaks too much - suspicious")
-            inversion_score += 25
-        elif agent_ratio < 0.20:
-            log(f"[LEVEL1] ⚠️ Agent speaks too little - suspicious")
-            inversion_score += 15
-
-    # Réduire le score si corrections locales effectuées
-    if local_corrections > 0:
-        inversion_score = max(0, inversion_score - 10 * local_corrections)
-
-    # Analyse de cohérence globale par mots-clés
+    # Mots caractéristiques de chaque rôle
     agent_keywords = [
         'cabinet', 'secrétariat', 'je vais voir', 'je vous propose',
         'on vous rappelle', 'vous avez mon numéro', 'notre confrère',
@@ -2986,60 +2680,22 @@ def detect_global_speaker_swap(segments: List[Dict[str, Any]]) -> List[Dict[str,
     agent_coherence = agent_says_agent - agent_says_client
     client_coherence = client_says_client - client_says_agent
 
-    log(f"[LEVEL1] Global coherence - Agent: {agent_coherence}, Client: {client_coherence}")
+    log(f"[GLOBAL_SWAP] Coherence - Agent: {agent_coherence}, Client: {client_coherence}")
 
-    if agent_coherence < 0 and client_coherence < 0:
-        log(f"[LEVEL1] ⚠️ Both coherence scores negative - strong inversion signal")
-        inversion_score += 40
+    # Détection d'inversion : les deux scores négatifs OU forte asymétrie
+    both_negative = agent_coherence < 0 and client_coherence < 0
+    asymmetric = (client_says_agent >= 2 and agent_says_agent == 0) or \
+                 (agent_says_client >= 2 and client_says_client == 0)
 
-    if (client_says_agent >= 2 and agent_says_agent == 0) or \
-       (agent_says_client >= 2 and client_says_client == 0):
-        log(f"[LEVEL1] ⚠️ Strong asymmetry detected")
-        inversion_score += 30
-
-    log(f"[LEVEL1] ✅ Fast detection completed - Score: {inversion_score}, Suspects: {len(suspicious_indices)}, Corrections: {local_corrections}")
-
-    # ═══════════════════════════════════════════════════════
-    # NIVEAU 2 : VÉRIFICATION LLM (SI ACTIVÉ)
-    # ═══════════════════════════════════════════════════════
-
-    llm_corrections = 0
-
-    # 2.1 Vérification des segments suspects restants (si DEEP_COHERENCE_CHECK=1)
-    if suspicious_indices and len(suspicious_indices) > local_corrections:
-        # Filtrer les indices déjà corrigés (approximation)
-        remaining_suspects = suspicious_indices[:5]  # Limiter à 5 max
-        llm_corrections = verify_suspicious_segments_batch(segments, remaining_suspects)
-
-    # 2.2 Vérification globale par LLM si doute
-    if 40 <= inversion_score < 80:
-        log(f"[LEVEL2] Score in doubt zone ({inversion_score}) - asking LLM for global verification")
-        llm_confirms_swap = verify_roles_with_llm(segments[:5])
-        if llm_confirms_swap:
-            log(f"[LEVEL2] ⚠️ LLM confirms global inversion")
-            inversion_score += 40
-        else:
-            log(f"[LEVEL2] ✅ LLM says roles are correct")
-            inversion_score -= 20
-
-    # ═══════════════════════════════════════════════════════
-    # DÉCISION FINALE
-    # ═══════════════════════════════════════════════════════
-
-    log(f"[FINAL] Inversion score: {inversion_score}")
-    log(f"[FINAL] Total corrections: {local_corrections + llm_corrections}")
-
-    if inversion_score >= 70:
-        log("[FINAL] ⚠️ GLOBAL INVERSION DETECTED - Swapping all Agent ↔ Client labels")
+    if both_negative or asymmetric:
+        log("[GLOBAL_SWAP] ⚠️ GLOBAL INVERSION DETECTED - Swapping all Agent ↔ Client")
         for seg in segments:
             if seg["speaker"] == "Agent":
                 seg["speaker"] = "Client"
             elif seg["speaker"] == "Client":
                 seg["speaker"] = "Agent"
     else:
-        log("[FINAL] ✅ No global inversion detected")
-
-    log("[GLOBAL_SWAP] ═══ DETECTION COMPLETED ═══")
+        log("[GLOBAL_SWAP] ✅ No global inversion detected")
 
     return segments
 
@@ -3063,71 +2719,8 @@ def detect_and_fix_speaker_inversion(segments: List[Dict[str, Any]]) -> List[Dic
     # ÉTAPE 1 : Détection globale (si activée)
     segments = detect_global_speaker_swap(segments)
 
-    # ÉTAPE 2 : Corrections locales
-    log("[SPEAKER_FIX] Checking for isolated segment errors...")
-
-    corrections_made = 0
-
-    # Phrases TRÈS caractéristiques qui indiquent FORTEMENT un rôle
-    agent_strong_phrases = [
-        "cabinet", "secrétariat", "je prends note", "je vous mets en ligne",
-        "c'est noté", "je vérifie dans l'agenda", "vous êtes madame", "votre nom"
-    ]
-
-    client_strong_phrases = [
-        "ma femme", "mon mari", "mon fils", "ma fille", "mes enfants",
-        "rendez-vous pour moi", "j'appelle pour prendre"
-    ]
-
-    for i in range(1, len(segments) - 1):
-        current = segments[i]
-        prev = segments[i - 1]
-        next_seg = segments[i + 1]
-
-        current_speaker = current.get("speaker")
-        prev_speaker = prev.get("speaker")
-        next_speaker = next_seg.get("speaker")
-        text = (current.get("text", "") or "").lower()
-
-        # CAS 1: Segment court isolé entre 2 segments du même autre speaker
-        duration = current.get("end", 0) - current.get("start", 0)
-        is_isolated = (prev_speaker == next_speaker and prev_speaker != current_speaker)
-        is_very_short = duration < 1.5  # Très court = probablement erreur
-        has_few_words = len(text.split()) < 4
-
-        if is_isolated and (is_very_short or has_few_words):
-            # Vérifier conflit sémantique FORT
-            has_strong_semantic_conflict = False
-
-            current_says_agent_phrase = any(phrase in text for phrase in agent_strong_phrases)
-            current_says_client_phrase = any(phrase in text for phrase in client_strong_phrases)
-
-            if current_says_agent_phrase or current_says_client_phrase:
-                # Vérifier si le speaker environnant dit le contraire
-                prev_text = (prev.get("text", "") or "").lower()
-                next_text = (next_seg.get("text", "") or "").lower()
-                surrounding_text = prev_text + " " + next_text
-
-                prev_says_agent = any(phrase in surrounding_text for phrase in agent_strong_phrases)
-                prev_says_client = any(phrase in surrounding_text for phrase in client_strong_phrases)
-
-                # Conflit = current dit "ma femme" mais prev/next dit "cabinet"
-                if (current_says_client_phrase and prev_says_agent) or \
-                   (current_says_agent_phrase and prev_says_client):
-                    has_strong_semantic_conflict = True
-
-            # Correction si segment très court isolé OU conflit sémantique fort
-            if is_very_short or has_strong_semantic_conflict:
-                log(f"[SPEAKER_FIX] Correcting isolated segment [{i}]: '{text[:40]}' ({duration:.1f}s)")
-                log(f"[SPEAKER_FIX]   Reason: {'semantic_conflict' if has_strong_semantic_conflict else 'very_short_isolated'}")
-                log(f"[SPEAKER_FIX]   Changing {current_speaker} → {prev_speaker}")
-                current["speaker"] = prev_speaker
-                corrections_made += 1
-
-    if corrections_made > 0:
-        log(f"[SPEAKER_FIX] ✅ Corrected {corrections_made} isolated segment(s)")
-    else:
-        log("[SPEAKER_FIX] ✅ No suspicious segments, keeping PyAnnote attribution")
+    # ÉTAPE 2 : Correction sémantique ultra-conservatrice
+    fix_obvious_semantic_errors(segments)
 
     return segments
 
