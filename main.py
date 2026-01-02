@@ -2550,32 +2550,161 @@ def post_correct_speaker_attribution(text: str, speaker: str, has_previous_speak
     
     return text.strip()
 
+def detect_local_speaker_errors(segments: List[Dict[str, Any]]) -> int:
+    """
+    Détecte et corrige les erreurs LOCALES de speaker (segments isolés mal attribués).
+    Ces erreurs locales sont souvent la SOURCE des inversions globales.
+
+    Retourne le nombre de corrections effectuées.
+    """
+    if len(segments) < 3:
+        return 0
+
+    corrections = 0
+
+    for i in range(1, len(segments) - 1):
+        current = segments[i]
+        prev = segments[i - 1]
+        next_seg = segments[i + 1]
+
+        # Cas suspect : segment court isolé entre 2 segments du même autre speaker
+        current_speaker = current.get("speaker")
+        prev_speaker = prev.get("speaker")
+        next_speaker = next_seg.get("speaker")
+
+        if prev_speaker == next_speaker and current_speaker != prev_speaker:
+            duration = float(current["end"]) - float(current["start"])
+
+            # Si le segment est court (< 3s), c'est probablement une erreur
+            if duration < 3.0:
+                log(f"[LOCAL_ERROR] Segment {i} ({duration:.1f}s) isolated as '{current_speaker}' between '{prev_speaker}' - CORRECTING")
+                current["speaker"] = prev_speaker
+                corrections += 1
+
+    if corrections > 0:
+        log(f"[LOCAL_ERROR] Corrected {corrections} local speaker errors")
+
+    return corrections
+
+
+def verify_roles_with_llm(segments: List[Dict[str, Any]]) -> bool:
+    """
+    Utilise Voxtral pour vérifier si les rôles Agent/Client sont corrects.
+    Analyse les premiers segments pour détecter une inversion.
+
+    Retourne True si une inversion est détectée.
+    """
+    if not segments:
+        return False
+
+    # Construire un texte représentatif des premiers échanges
+    conversation_sample = ""
+    for i, seg in enumerate(segments[:5], 1):  # 5 premiers segments
+        speaker = seg.get("speaker", "Unknown")
+        text = seg.get("text", "")
+        conversation_sample += f"{i}. {speaker}: {text}\n"
+
+    # Prompt pour Voxtral
+    verification_prompt = f"""Contexte: Cabinet médical/dentaire. L'Agent est le secrétariat qui RÉPOND au téléphone. Le Client est la personne qui APPELLE.
+
+Conversation:
+{conversation_sample}
+
+Question: Les labels Agent/Client sont-ils INVERSÉS? Réponds UNIQUEMENT par "OUI" ou "NON"."""
+
+    try:
+        conv = [{
+            "role": "user",
+            "content": [{"type": "text", "text": verification_prompt}]
+        }]
+
+        result = run_voxtral_with_timeout(conv, max_new_tokens=10, timeout=15)
+        response = result.get("text", "").strip().upper()
+
+        log(f"[LLM_VERIFY] Response: {response}")
+
+        return "OUI" in response
+
+    except Exception as e:
+        log(f"[LLM_VERIFY] Error: {e}")
+        return False
+
+
 def detect_global_speaker_swap(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Détecte si les labels Agent/Client sont inversés globalement.
+    Détection MULTI-NIVEAUX des inversions Agent/Client.
     DÉSACTIVÉ PAR DÉFAUT - Activer avec DETECT_GLOBAL_SWAP=1
 
-    Utilise l'analyse sémantique pour vérifier si les rôles sont cohérents.
+    STRATÉGIE À 5 NIVEAUX:
+    1. Vérifier le premier locuteur (Agent répond toujours en premier dans un cabinet)
+    2. Analyser le temps de parole relatif (Agent parle généralement 30-50%)
+    3. Détecter et corriger les erreurs LOCALES (segments isolés mal attribués)
+    4. Analyse sémantique par mots-clés
+    5. Vérification par Voxtral LLM si doute
+
+    Les erreurs locales sont souvent la SOURCE des inversions globales.
     """
     if not DETECT_GLOBAL_SWAP or not segments or len(segments) < 2:
         return segments
 
-    log("[GLOBAL_SWAP] Checking for global speaker inversion...")
+    log("[GLOBAL_SWAP] Multi-level inversion detection started...")
 
-    # Mots très caractéristiques de chaque rôle
+    inversion_score = 0
+
+    # NIVEAU 1 : Vérification du premier locuteur (SIGNAL FORT)
+    first_speaker = segments[0].get("speaker")
+    first_text = segments[0].get("text", "").lower()
+
+    # Dans un cabinet, l'Agent répond TOUJOURS en premier
+    if first_speaker == "Client":
+        log(f"[GLOBAL_SWAP] ⚠️ First speaker is Client (should be Agent for cabinet)")
+        inversion_score += 50
+
+    # Bonus si le premier dit "cabinet" ou "secrétariat" (= Agent certain)
+    if first_speaker == "Agent" and any(kw in first_text for kw in ['cabinet', 'secrétariat']):
+        log(f"[GLOBAL_SWAP] ✅ First speaker is Agent with cabinet greeting")
+        inversion_score -= 20  # Renforce la confiance (score négatif = pas d'inversion)
+
+    # NIVEAU 2 : Analyse du temps de parole
+    agent_time = sum(float(s["end"]) - float(s["start"]) for s in segments if s.get("speaker") == "Agent")
+    client_time = sum(float(s["end"]) - float(s["start"]) for s in segments if s.get("speaker") == "Client")
+    total_time = agent_time + client_time
+
+    if total_time > 0:
+        agent_ratio = agent_time / total_time
+        log(f"[GLOBAL_SWAP] Speaking time - Agent: {agent_ratio:.1%}, Client: {(1-agent_ratio):.1%}")
+
+        # Dans un cabinet, l'Agent parle généralement 30-50% du temps
+        # Si "Agent" parle 70%+, c'est suspect (probablement le vrai client)
+        if agent_ratio > 0.70:
+            log(f"[GLOBAL_SWAP] ⚠️ Agent speaks too much ({agent_ratio:.1%}) - suspicious")
+            inversion_score += 25
+        # Si "Agent" parle < 20%, aussi suspect (trop peu pour un secrétariat)
+        elif agent_ratio < 0.20:
+            log(f"[GLOBAL_SWAP] ⚠️ Agent speaks too little ({agent_ratio:.1%}) - suspicious")
+            inversion_score += 15
+
+    # NIVEAU 3 : Correction des erreurs LOCALES (segments isolés)
+    # CES ERREURS CAUSENT SOUVENT LES INVERSIONS GLOBALES
+    local_corrections = detect_local_speaker_errors(segments)
+    if local_corrections > 0:
+        log(f"[GLOBAL_SWAP] Corrected {local_corrections} local errors - recalculating...")
+        # Recalculer le score après correction
+        inversion_score = max(0, inversion_score - 10 * local_corrections)
+
+    # NIVEAU 4 : Analyse sémantique par mots-clés
     agent_keywords = [
-        'cabinet', 'secrétariat', 'bonjour', 'je vais voir', 'je vous propose',
+        'cabinet', 'secrétariat', 'je vais voir', 'je vous propose',
         'on vous rappelle', 'vous avez mon numéro', 'notre confrère',
-        'c\'est noté', 'je vérifie dans l\'agenda'
+        'c\'est noté', 'je vérifie', 'agenda', 'consultation'
     ]
 
     client_keywords = [
         'ma femme', 'mon mari', 'mon fils', 'ma fille', 'mes enfants',
         'je voudrais', 'est-ce que je peux', 'pour moi', 'j\'ai appelé',
-        'rendez-vous pour moi'
+        'rendez-vous pour moi', 'mon problème', 'j\'ai mal'
     ]
 
-    # Compter les occurrences pour chaque speaker
     agent_says_agent = 0
     agent_says_client = 0
     client_says_agent = 0
@@ -2595,24 +2724,46 @@ def detect_global_speaker_swap(segments: List[Dict[str, Any]]) -> List[Dict[str,
             client_says_agent += agent_count
             client_says_client += client_count
 
-    # Calculer les scores de cohérence
     agent_coherence = agent_says_agent - agent_says_client
     client_coherence = client_says_client - client_says_agent
 
-    log(f"[GLOBAL_SWAP] Agent coherence: {agent_coherence} (says {agent_says_agent} agent words, {agent_says_client} client words)")
-    log(f"[GLOBAL_SWAP] Client coherence: {client_coherence} (says {client_says_client} client words, {client_says_agent} agent words)")
+    log(f"[GLOBAL_SWAP] Keyword coherence - Agent: {agent_coherence}, Client: {client_coherence}")
 
-    # Si les deux scores sont négatifs = inversion probable
-    if agent_coherence < -2 and client_coherence < -2:
+    # Les deux négatifs = inversion probable
+    if agent_coherence < 0 and client_coherence < 0:
+        log(f"[GLOBAL_SWAP] ⚠️ Both coherence scores negative - strong inversion signal")
+        inversion_score += 40
+
+    # Asymétrie forte
+    if (client_says_agent >= 2 and agent_says_agent == 0) or \
+       (agent_says_client >= 2 and client_says_client == 0):
+        log(f"[GLOBAL_SWAP] ⚠️ Strong asymmetry detected")
+        inversion_score += 30
+
+    # NIVEAU 5 : Vérification par Voxtral LLM si doute
+    if 40 <= inversion_score < 80:
+        log(f"[GLOBAL_SWAP] Score in doubt zone ({inversion_score}) - asking LLM for verification")
+        llm_confirms_swap = verify_roles_with_llm(segments[:5])
+        if llm_confirms_swap:
+            log(f"[GLOBAL_SWAP] ⚠️ LLM confirms inversion")
+            inversion_score += 40
+        else:
+            log(f"[GLOBAL_SWAP] ✅ LLM says roles are correct")
+            inversion_score -= 20
+
+    # DÉCISION FINALE
+    log(f"[GLOBAL_SWAP] Final inversion score: {inversion_score}")
+
+    if inversion_score >= 70:
         log("[GLOBAL_SWAP] ⚠️ GLOBAL INVERSION DETECTED - Swapping all Agent ↔ Client labels")
         for seg in segments:
             if seg["speaker"] == "Agent":
                 seg["speaker"] = "Client"
             elif seg["speaker"] == "Client":
                 seg["speaker"] = "Agent"
-        return segments
+    else:
+        log("[GLOBAL_SWAP] ✅ No global inversion detected")
 
-    log("[GLOBAL_SWAP] ✅ No global inversion detected")
     return segments
 
 def detect_and_fix_speaker_inversion(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3212,10 +3363,14 @@ try:
     else:
         log("[INIT] Preloading Voxtral...")
         load_voxtral()
-        
-        log("[INIT] Preloading diarizer...")
-        load_diarizer()
-        
+
+        # Lazy loading PyAnnote : charger seulement si modes qui l'utilisent
+        if VOXTRAL_SPEAKER_ID and not (PYANNOTE_AUTO or HYBRID_MODE):
+            log("[INIT] Skipping PyAnnote preload (Voxtral Speaker ID mode only)")
+        else:
+            log("[INIT] Preloading diarizer...")
+            load_diarizer()
+
         log("[INIT] Preload completed successfully")
         
 except Exception as e:
