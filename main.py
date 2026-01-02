@@ -216,14 +216,14 @@ def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict
     device = _device_str()
     inputs = _move_to_device_no_cast(inputs, device)
 
-    # Pour les longues générations (>3000 tokens), utiliser une température faible
-    # pour éviter les boucles de répétition tout en gardant la fidélité maximale
+    # Pour les longues générations (>3000 tokens), utiliser une petite température
+    # pour éviter les boucles de répétition avec do_sample=False
     use_sampling = max_new_tokens > 3000
 
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         do_sample=use_sampling,
-        temperature=0.2 if use_sampling else None,  # Température faible pour fidélité + anti-boucles
+        temperature=0.1 if use_sampling else None,  # Très faible température pour rester déterministe
         top_p=0.95 if use_sampling else None,
     )
 
@@ -1394,11 +1394,9 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
         ]
     }]
     
-    # Calcul automatique des tokens basé sur la durée avec marge de sécurité
-    # Coefficient 22 au lieu de 18 = +22% de marge pour gérer les boucles de répétition
-    # sans causer d'hallucinations (un coefficient trop élevé ferait inventer du contenu)
-    speaker_tokens = int(est_dur * 22)
-    log(f"[VOXTRAL_ID] Using {speaker_tokens} tokens for {est_dur:.1f}s audio (22 tokens/sec with safety margin)")
+    # Ajuster les tokens selon la durée (augmenté pour éviter les troncatures)
+    # Retirer le min() pour ne pas limiter par MAX_NEW_TOKENS global
+    speaker_tokens = int(est_dur * 15)  # ~15 tokens par seconde pour éviter les troncatures
     out_speaker_id = run_voxtral_with_timeout(conv_speaker_id, max_new_tokens=speaker_tokens, timeout=120)
     speaker_transcript = (out_speaker_id.get("text") or "").strip()
 
