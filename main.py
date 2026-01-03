@@ -1430,8 +1430,8 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
 
     # POST-TRAITEMENT STANDARD
     segments = _enforce_max_two_speakers(segments)
-    segments = detect_and_fix_speaker_inversion(segments)  # AVANT _map_roles
-    _map_roles(segments)
+    _map_roles(segments)  # D'abord mapper SPEAKER_XX → Agent/Client
+    segments = detect_and_fix_speaker_inversion(segments)  # Puis corriger les erreurs évidentes
     
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
     result = {"segments": segments, "transcript": full_transcript}
@@ -1570,14 +1570,13 @@ def parse_speaker_identified_transcript(transcript: str, total_duration: float) 
 
         log(f"[PARSE] Inline mode: found {len(matches)} speaker segments")
 
-        # Mapper Agent/Client vers SPEAKER_00/SPEAKER_01 pour que _map_roles fonctionne
+        # Mapper vers SPEAKER_00/SPEAKER_01 pour uniformiser
         speaker_mapping = {}
         speaker_counter = 0
 
         for speaker_raw, text_part in matches:
             speaker_normalized = speaker_raw.capitalize()
 
-            # Créer le mapping vers SPEAKER_XX
             if speaker_normalized not in speaker_mapping:
                 speaker_mapping[speaker_normalized] = f"SPEAKER_{speaker_counter:02d}"
                 speaker_counter += 1
@@ -1683,10 +1682,10 @@ def apply_pyannote_per_segment_transcription(wav_path: str, raw_segments: List[D
     # Charger l'audio complet
     audio_data, sample_rate = sf.read(wav_path)
 
-    # Post-traitement: enforce max 2 speakers, fix inversions, map roles
+    # Post-traitement: enforce max 2 speakers, map roles, fix inversions
     raw_segments = _enforce_max_two_speakers(raw_segments)
-    raw_segments = detect_and_fix_speaker_inversion(raw_segments)
-    _map_roles(raw_segments)
+    _map_roles(raw_segments)  # D'abord mapper SPEAKER_XX → Agent/Client
+    raw_segments = detect_and_fix_speaker_inversion(raw_segments)  # Puis corriger les erreurs évidentes
 
     # Fusionner les segments très courts du même speaker
     merged_segments = []
@@ -1982,8 +1981,8 @@ def apply_improved_hybrid_mode(wav_path: str, pyannote_segments: List[Dict], lan
 
     # Préparer les segments PyAnnote
     pyannote_segments = _enforce_max_two_speakers(pyannote_segments)
-    pyannote_segments = detect_and_fix_speaker_inversion(pyannote_segments)
-    _map_roles(pyannote_segments)
+    _map_roles(pyannote_segments)  # D'abord mapper SPEAKER_XX → Agent/Client
+    pyannote_segments = detect_and_fix_speaker_inversion(pyannote_segments)  # Puis corriger les erreurs évidentes
 
     # Fusionner les segments PyAnnote consécutifs du même speaker pour obtenir les "tours de parole"
     pyannote_turns = []
@@ -2144,8 +2143,8 @@ def apply_pyannote_aligned(wav_path: str, pyannote_segments: List[Dict], languag
     # Étape 3: Préparer les segments PyAnnote
     log("[PYANNOTE_ALIGNED] Step 3: Preparing PyAnnote speaker segments")
     pyannote_segments = _enforce_max_two_speakers(pyannote_segments)
-    pyannote_segments = detect_and_fix_speaker_inversion(pyannote_segments)
-    _map_roles(pyannote_segments)
+    _map_roles(pyannote_segments)  # D'abord mapper SPEAKER_XX → Agent/Client
+    pyannote_segments = detect_and_fix_speaker_inversion(pyannote_segments)  # Puis corriger les erreurs évidentes
 
     log(f"[PYANNOTE_ALIGNED] PyAnnote: {len(pyannote_segments)} speaker segments")
 
@@ -2325,12 +2324,12 @@ def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict]
     
     # Post-traitement standard
     segments = _enforce_max_two_speakers(segments)
-    segments = detect_and_fix_speaker_inversion(segments)  # AVANT _map_roles
-    _map_roles(segments)
-    
+    _map_roles(segments)  # D'abord mapper SPEAKER_XX → Agent/Client
+    segments = detect_and_fix_speaker_inversion(segments)  # Puis corriger les erreurs évidentes
+
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
     result = {"segments": segments, "transcript": full_transcript}
-    
+
     if with_summary:
         result["summary"] = select_best_summary_approach(full_transcript)
     
@@ -2850,8 +2849,8 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     # Seule correction possible: relecture LLM si DETECT_GLOBAL_SWAP=1
     log("[HYBRID] Step 4: Post-processing...")
     segments = _enforce_max_two_speakers(segments)
+    _map_roles(segments)  # D'abord mapper SPEAKER_XX → Agent/Client
     segments = detect_and_fix_speaker_inversion(segments)  # Relecture LLM si activée
-    _map_roles(segments)
     
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
     
@@ -2977,12 +2976,12 @@ def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max
     
     # Post-traitement
     segments = _enforce_max_two_speakers(segments)
-    segments = detect_and_fix_speaker_inversion(segments)  # AVANT _map_roles
-    _map_roles(segments)
-    
+    _map_roles(segments)  # D'abord mapper SPEAKER_XX → Agent/Client
+    segments = detect_and_fix_speaker_inversion(segments)  # Puis corriger les erreurs évidentes
+
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
     result = {"segments": segments, "transcript": full_transcript}
-    
+
     if with_summary:
         result["summary"] = select_best_summary_approach(full_transcript)
     
