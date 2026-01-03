@@ -2608,8 +2608,10 @@ Si AUCUNE erreur évidente, réponds: "OK"
             "content": [{"type": "text", "text": review_prompt}]
         }]
 
-        # Tokens estimés : ~50 tokens pour la réponse max
-        result = run_voxtral_with_timeout(conv, max_new_tokens=100, timeout=20)
+        # Tokens estimés : ~4 tokens par segment pour "N:Agent\n" ou "N:Client\n"
+        # Plus une marge de sécurité pour les numéros à 2 chiffres
+        max_tokens_needed = max(100, len(segments) * 5 + 20)
+        result = run_voxtral_with_timeout(conv, max_new_tokens=max_tokens_needed, timeout=30)
         response = result.get("text", "").strip()
 
         log(f"[LLM_REVIEW] Response: {response}")
