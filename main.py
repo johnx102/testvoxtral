@@ -41,7 +41,7 @@ APP_VERSION = os.environ.get("APP_VERSION", "ultra-fast-hybrid-v1.0")
 MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "664"))       
-MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "9000"))      
+MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "3600"))  # 1 heure max      
 DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
@@ -927,27 +927,55 @@ def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, An
 # ---------------------------
 # RÉSUMÉS OPTIMISÉS
 # ---------------------------
-def generate_natural_summary(full_transcript: str, language: Optional[str] = None) -> str:
+def calculate_summary_tokens(duration_seconds: float, transcript_length: int) -> int:
+    """Calcule le nombre de tokens optimal pour le résumé selon la durée."""
+    # Base: 72 tokens pour conversations courtes (<2 min)
+    # Augmente progressivement pour conversations plus longues
+    if duration_seconds <= 120:
+        base_tokens = 72
+    elif duration_seconds <= 300:  # 2-5 min
+        base_tokens = 96
+    elif duration_seconds <= 600:  # 5-10 min
+        base_tokens = 128
+    elif duration_seconds <= 900:  # 10-15 min
+        base_tokens = 160
+    else:  # >15 min
+        base_tokens = 200
+
+    # Ajustement selon la longueur du transcript (beaucoup de contenu = besoin de plus de tokens)
+    if transcript_length > 10000:
+        base_tokens = max(base_tokens, 160)
+    if transcript_length > 15000:
+        base_tokens = max(base_tokens, 200)
+
+    return min(base_tokens, 256)  # Cap à 256 tokens max
+
+
+def generate_natural_summary(full_transcript: str, language: Optional[str] = None, duration_seconds: float = 0) -> str:
     """Génère un résumé naturel et utile sans structure artificielle."""
     if not full_transcript.strip():
         return "Conversation vide."
-    
+
+    # Calculer le nombre de tokens adapté à la durée
+    summary_tokens = calculate_summary_tokens(duration_seconds, len(full_transcript))
+    log(f"[SUMMARY] Using {summary_tokens} tokens for summary (duration={duration_seconds:.1f}s, transcript={len(full_transcript)} chars)")
+
     lang_prefix = f"lang:{language} " if language else ""
     instruction = (
         f"{lang_prefix}Résume cette conversation en 1-2 phrases simples et claires. "
         "Dis juste l'essentiel : qui appelle pourquoi, et ce qui va se passer. "
-        "Sois direct et naturel, sans format particulier."
+        "Sois direct et naturel, sans format particulier. Ne cite pas le texte, résume-le."
     )
-    
+
     conversation = [{
         "role": "user",
         "content": [
             {"type": "text", "text": f"{instruction}\n\nConversation:\n{full_transcript}"}
         ]
     }]
-    
+
     try:
-        result = run_voxtral_with_timeout(conversation, max_new_tokens=72, timeout=25)
+        result = run_voxtral_with_timeout(conversation, max_new_tokens=summary_tokens, timeout=30)
         summary = (result.get("text") or "").strip()
         
         summary = clean_generated_summary(summary)
@@ -1067,7 +1095,7 @@ def create_extractive_summary(transcript: str) -> str:
     
     return ". ".join(summary_parts) + "."
 
-def select_best_summary_approach(transcript: str) -> str:
+def select_best_summary_approach(transcript: str, duration_seconds: float = 0) -> str:
     """Sélectionne la meilleure approche de résumé selon le contenu."""
     lines = transcript.split('\n')
     total_words = len(transcript.split())
@@ -1089,7 +1117,7 @@ def select_best_summary_approach(transcript: str) -> str:
 
     # Utiliser le résumé génératif si conversation substantielle (3+ échanges ou 30+ mots)
     if total_words > 30 and len(speaker_lines) >= 3:
-        generative_summary = generate_natural_summary(transcript)
+        generative_summary = generate_natural_summary(transcript, duration_seconds=duration_seconds)
 
         if (generative_summary and
             len(generative_summary) > 15 and
@@ -1437,10 +1465,10 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
     result = {"segments": segments, "transcript": full_transcript}
     
-    # Résumé
+    # Résumé (utilise la durée audio pour adapter le nombre de tokens)
     if with_summary:
         log("[VOXTRAL_ID] Generating summary...")
-        result["summary"] = select_best_summary_approach(full_transcript)
+        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=est_dur)
     
     # Sentiment par speaker (analyse améliorée)
     if ENABLE_SENTIMENT:
@@ -1802,7 +1830,8 @@ def apply_pyannote_per_segment_transcription(wav_path: str, raw_segments: List[D
 
     # Résumé si demandé
     if with_summary:
-        result["summary"] = select_best_summary_approach(full_transcript)
+        audio_duration = max((s.get("end", 0) for s in transcribed_segments), default=0)
+        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
 
     # Analyse de sentiment si activé
     if ENABLE_SENTIMENT:
@@ -2061,7 +2090,8 @@ def apply_improved_hybrid_mode(wav_path: str, pyannote_segments: List[Dict], lan
 
     # Résumé
     if with_summary:
-        result["summary"] = select_best_summary_approach(full_transcript)
+        audio_duration = max((s.get("end", 0) for s in corrected_segments), default=0)
+        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
 
     # Analyse de sentiment
     if ENABLE_SENTIMENT:
@@ -2196,7 +2226,8 @@ def apply_pyannote_aligned(wav_path: str, pyannote_segments: List[Dict], languag
 
     # Résumé
     if with_summary:
-        result["summary"] = select_best_summary_approach(full_transcript)
+        audio_duration = max((s.get("end", 0) for s in segments), default=0)
+        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
 
     # Analyse de sentiment
     if ENABLE_SENTIMENT:
@@ -2332,8 +2363,9 @@ def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict]
     result = {"segments": segments, "transcript": full_transcript}
 
     if with_summary:
-        result["summary"] = select_best_summary_approach(full_transcript)
-    
+        audio_duration = max((s.get("end", 0) for s in segments), default=0)
+        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
+
     if ENABLE_SENTIMENT:
         log("[PYANNOTE] Computing sentiment analysis by speaker...")
 
@@ -2860,8 +2892,9 @@ def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_n
     # Résumé
     if with_summary:
         log("[HYBRID] Generating summary...")
-        result["summary"] = select_best_summary_approach(full_transcript)
-    
+        audio_duration = max((s.get("end", 0) for s in segments), default=0)
+        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
+
     # Sentiment par speaker (analyse améliorée)
     if ENABLE_SENTIMENT:
         log("[HYBRID] Computing sentiment analysis by speaker...")
@@ -2984,8 +3017,9 @@ def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max
     result = {"segments": segments, "transcript": full_transcript}
 
     if with_summary:
-        result["summary"] = select_best_summary_approach(full_transcript)
-    
+        audio_duration = max((s.get("end", 0) for s in segments), default=0)
+        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
+
     return result
 
 # ---------------------------
@@ -3151,10 +3185,12 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 temp_result = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, False)
                 if "error" in temp_result:
                     return temp_result
-                
+
                 transcript = temp_result.get("transcript", "")
-                summary = select_best_summary_approach(transcript) if transcript else "Audio indisponible."
-                
+                segments = temp_result.get("segments", [])
+                audio_duration = max((s.get("end", 0) for s in segments), default=0) if segments else 0
+                summary = select_best_summary_approach(transcript, duration_seconds=audio_duration) if transcript else "Audio indisponible."
+
                 log("[HANDLER] Summary task completed")
                 return {"task": "summary", "text": summary, "latency_s": 0}
             except Exception as e:
