@@ -725,8 +725,8 @@ def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
         return text
 
     # Cas 1: Détection de patterns courts répétés (ex: "michel.michel.michel...")
-    # Chercher un pattern de 3-100 caractères répété consécutivement (étendu pour phrases)
-    for pattern_len in range(3, min(101, len(text) // 3)):  # Étendu de 20 à 100 chars
+    # Chercher un pattern de 3-20 caractères répété consécutivement
+    for pattern_len in range(3, 21):  # Patterns de 3 à 20 chars max
         if len(text) < pattern_len * max_repetitions:
             continue
 
@@ -745,9 +745,10 @@ def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
                 break
 
         if repetitions > max_repetitions:
-            # Tronquer au premier pattern
-            truncate_pos = pos
-            log(f"[CLEANUP] Detected pattern loop: '{pattern[:30]}...' repeated {repetitions} times, truncating from {len(text)} to {truncate_pos} chars")
+            # Garder le contenu avant la boucle + 1-2 occurrences du pattern (contenu légitime)
+            truncate_pos = pos + pattern_len * 2  # Garder 2 occurrences
+            truncate_pos = min(truncate_pos, len(text))  # Ne pas dépasser
+            log(f"[CLEANUP] Detected pattern loop: '{pattern[:15]}...' repeated {repetitions} times, truncating from {len(text)} to {truncate_pos} chars")
             return text[:truncate_pos]
 
     # Cas 2: Mots séparés par espaces
