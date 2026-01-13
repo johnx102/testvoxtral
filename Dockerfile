@@ -21,16 +21,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Torch (CUDA 12.8) - PyTorch 2.8.0 pour pyannote 4.x + support TOUS les GPUs
+# Torch (CUDA 12.8) - PyTorch 2.7.1 = support TOUS les GPUs (RTX 6000 Ada inclus)
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
-    torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
-
-# Fix numba/llvmlite conflict AVANT pyannote
-RUN pip install --no-cache-dir numba==0.60.0 llvmlite==0.43.0
+    torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
 
 # Requirements
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# FIX PyTorch 2.6+ weights_only : Patcher speechbrain pour forcer weights_only=False
+RUN SITE=$(python -c "import site; print(site.getsitepackages()[0])") && \
+    if [ -f "$SITE/speechbrain/utils/checkpoints.py" ]; then \
+        sed -i 's/torch\.load(/torch.load(weights_only=False, /g' "$SITE/speechbrain/utils/checkpoints.py" && \
+        echo "[BUILD] Patched speechbrain checkpoints.py"; \
+    fi && \
+    if [ -f "$SITE/pyannote/audio/core/io.py" ]; then \
+        sed -i 's/torch\.load(/torch.load(weights_only=False, /g' "$SITE/pyannote/audio/core/io.py" && \
+        echo "[BUILD] Patched pyannote io.py"; \
+    fi
 
 # Create cache directories (RunPod will mount /workspace)
 RUN mkdir -p /workspace/.cache/huggingface /workspace/.cache/torch
