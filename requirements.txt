@@ -37,16 +37,15 @@ sentencepiece>=0.2.0
 
 # -----------------------------------------------------------------------------
 # AUDIO PROCESSING
+# Note: librosa est installé automatiquement par pyannote avec versions compatibles
 # -----------------------------------------------------------------------------
 soundfile>=0.12.1
-librosa>=0.10.2
-scipy>=1.10.0,<2.0.0
 pydub>=0.25.1
 
 # -----------------------------------------------------------------------------
-# NUMPY - CRITIQUE: numpy 2.0 casse beaucoup de dépendances
+# NUMPY/SCIPY - Laisser pyannote gérer les versions compatibles
 # -----------------------------------------------------------------------------
-numpy>=1.26.4,<2.0.0
+numpy<2.0.0
 
 # -----------------------------------------------------------------------------
 # AUTRES DÉPENDANCES
@@ -54,9 +53,6 @@ numpy>=1.26.4,<2.0.0
 requests>=2.32.0
 safetensors>=0.4.0
 einops>=0.6.0
-
-# ctranslate2 pour WhisperX (optionnel)
-ctranslate2>=3.0.0,<5.0.0
 
 # -----------------------------------------------------------------------------
 # RUNPOD

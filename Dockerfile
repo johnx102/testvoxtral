@@ -25,6 +25,9 @@ WORKDIR /app
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
     torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
 
+# Fix numba/llvmlite conflict AVANT pyannote
+RUN pip install --no-cache-dir numba==0.60.0 llvmlite==0.43.0
+
 # Requirements
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
