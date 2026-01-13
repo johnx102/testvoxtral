@@ -1434,13 +1434,14 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     instruction = (
         f"lang:{language or 'fr'} "
         "Transcris cette conversation téléphonique en identifiant clairement qui parle. "
+        "IGNORE la musique d'attente, les silences et les tonalités - transcris UNIQUEMENT les paroles. "
         "Format requis:\n"
         "Agent: [ce que dit l'agent/professionnel]\n"
         "Client: [ce que dit le client/appelant]\n\n"
         "Indications pour identifier les speakers:\n"
         "- Agent = celui qui répond, dit 'bonjour', 'cabinet', 'je vais voir', 'on vous rappelle'\n"
         "- Client = celui qui appelle, dit 'je voudrais', 'ma femme', 'est-ce que je peux'\n\n"
-        "Transcris mot à mot et sépare clairement chaque prise de parole."
+        "Transcris mot à mot. Ne mentionne PAS [Musique] ou [Silence]."
     )
     
     # TRANSCRIPTION AVEC IDENTIFICATION DES SPEAKERS EN UNE PASSE
