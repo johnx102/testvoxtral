@@ -5,14 +5,13 @@
 
 # -----------------------------------------------------------------------------
 # PYTORCH - Versions IDENTIQUES au Dockerfile (éviter conflits)
-# PyTorch 2.7.1 + CUDA 12.8 = Support UNIVERSEL tous GPUs
-# (V100, T4, A10, A100, L40S, RTX 6000 Ada, H100, RTX 4090, etc.)
+# PyTorch 2.8.0 requis pour pyannote 4.x + support TOUS les GPUs
 # IMPORTANT: Ces versions doivent correspondre au Dockerfile!
 # -----------------------------------------------------------------------------
 --extra-index-url https://download.pytorch.org/whl/cu128
-torch==2.7.1
-torchaudio==2.7.1
-torchvision==0.22.1
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
 
 # -----------------------------------------------------------------------------
 # TRANSFORMERS + ACCELERATE (versions compatibles entre elles)

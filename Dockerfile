@@ -21,9 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Torch (CUDA 12.8) - PyTorch 2.7.1 pour support TOUS les GPUs (V100, A100, L40S, RTX 6000 Ada, H100, etc.)
+# Torch (CUDA 12.8) - PyTorch 2.8.0 pour pyannote 4.x + support TOUS les GPUs
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
-    torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
+    torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
 
 # Requirements
 COPY requirements.txt /app/requirements.txt
