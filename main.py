@@ -5,6 +5,35 @@ import os, time, base64, tempfile, uuid, requests, json, traceback, re
 from typing import Optional, List, Dict, Any, Tuple
 
 import torch
+
+# =============================================================================
+# DIAGNOSTIC GPU/CUDA AU DÉMARRAGE - CRITIQUE POUR DEBUG
+# =============================================================================
+print("=" * 70)
+print("[STARTUP] PyTorch & CUDA Diagnostic")
+print(f"[STARTUP] torch version: {torch.__version__}")
+print(f"[STARTUP] CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"[STARTUP] CUDA version: {torch.version.cuda}")
+    print(f"[STARTUP] cuDNN version: {torch.backends.cudnn.version()}")
+    print(f"[STARTUP] GPU count: {torch.cuda.device_count()}")
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        print(f"[STARTUP] GPU {i}: {props.name}")
+        print(f"[STARTUP]   - Compute capability: {props.major}.{props.minor} (sm_{props.major}{props.minor})")
+        print(f"[STARTUP]   - Total memory: {props.total_memory / 1e9:.1f} GB")
+    # Test rapide CUDA
+    try:
+        test_tensor = torch.zeros(1).cuda()
+        print(f"[STARTUP] CUDA test: OK (tensor on {test_tensor.device})")
+        del test_tensor
+    except Exception as e:
+        print(f"[STARTUP] CUDA test: FAILED - {e}")
+else:
+    print("[STARTUP] WARNING: CUDA not available, running on CPU!")
+print("=" * 70)
+# =============================================================================
+
 from transformers import (
     AutoProcessor, AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline,
     pipeline as hf_pipeline

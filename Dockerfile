@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -23,9 +23,9 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python && \
 
 WORKDIR /app
 
-# Torch (CUDA 12.1) - Latest stable version
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
-    torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
+# Torch (CUDA 12.8) - PyTorch 2.7.1 pour support TOUS les GPUs (V100, A100, L40S, RTX 6000 Ada, H100, etc.)
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+    torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
 
 # Requirements
 COPY requirements.txt /app/requirements.txt

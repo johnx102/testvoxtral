@@ -1,38 +1,71 @@
-# PyTorch - VERSION UNIVERSELLE compatible avec tous les GPUs RunPod
-# CUDA 12.1 inclut les kernels pour: V100, T4, A10, A100, L40S, RTX 30xx/40xx, H100
-# L'index PyTorch officiel compile avec toutes les architectures (sm_50 à sm_90)
---extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.4.0
-torchvision==0.19.0
+# =============================================================================
+# REQUIREMENTS.TXT - Versions testées et compatibles entre elles
+# Dernière mise à jour: 2026-01-13
+# =============================================================================
 
-# Transformers - VERSION STABLE avec support Voxtral (ajouté en 4.54.0)
-transformers>=4.54.0
-accelerate==0.34.2
-huggingface_hub>=0.34.0,<1.0
-scipy>=1.10.0
-soundfile>=0.12.1
-librosa>=0.10.2.post1
-numpy>=1.26.4,<2.0.0
-pydub>=0.25.1
-requests>=2.32.0
+# -----------------------------------------------------------------------------
+# PYTORCH - Versions IDENTIQUES au Dockerfile (éviter conflits)
+# PyTorch 2.7.1 + CUDA 12.8 = Support UNIVERSEL tous GPUs
+# (V100, T4, A10, A100, L40S, RTX 6000 Ada, H100, RTX 4090, etc.)
+# IMPORTANT: Ces versions doivent correspondre au Dockerfile!
+# -----------------------------------------------------------------------------
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1
+torchaudio==2.7.1
+torchvision==0.22.1
 
-# PyAnnote - version stable compatible
+# -----------------------------------------------------------------------------
+# TRANSFORMERS + ACCELERATE (versions compatibles entre elles)
+# Voxtral support ajouté en transformers 4.54.0
+# -----------------------------------------------------------------------------
+transformers>=4.54.0,<4.58.0
+accelerate>=1.0.0,<2.0.0
+huggingface_hub>=0.24.0,<1.0
+
+# -----------------------------------------------------------------------------
+# PYANNOTE - Speaker diarization
+# IMPORTANT: pyannote 3.3.2 nécessite lightning (pas pytorch-lightning)
+# -----------------------------------------------------------------------------
 pyannote.audio==3.3.2
+lightning>=2.0.1,<3.0.0
+
+# -----------------------------------------------------------------------------
+# MISTRAL / VOXTRAL - Audio transcription
+# mistral_common[audio] nécessite Python >= 3.10
+# -----------------------------------------------------------------------------
+mistral_common[audio]>=1.8.1,<2.0.0
 sentencepiece>=0.2.0
 
-# Voxtral dependencies - CRITICAL: mistral-common avec audio support
-mistral_common[audio]>=1.8.1
+# -----------------------------------------------------------------------------
+# AUDIO PROCESSING
+# -----------------------------------------------------------------------------
+soundfile>=0.12.1
+librosa>=0.10.2
+scipy>=1.10.0,<2.0.0
+pydub>=0.25.1
 
-# Forced alignment for word-level timestamps (WhisperX-style)
-# Utilisé pour mapper précisément les mots aux timestamps PyAnnote
-# Note: torchaudio DOIT correspondre exactement à la version de torch
-torchaudio==2.4.0
-ctranslate2>=3.0.0
+# -----------------------------------------------------------------------------
+# NUMPY - CRITIQUE: numpy 2.0 casse beaucoup de dépendances
+# -----------------------------------------------------------------------------
+numpy>=1.26.4,<2.0.0
+
+# -----------------------------------------------------------------------------
+# AUTRES DÉPENDANCES
+# -----------------------------------------------------------------------------
+requests>=2.32.0
 safetensors>=0.4.0
+einops>=0.6.0
 
-# WhisperX - Mode alternatif (optionnel, activé via ENABLE_WHISPERX=1)
+# ctranslate2 pour WhisperX (optionnel)
+ctranslate2>=3.0.0,<5.0.0
+
+# -----------------------------------------------------------------------------
+# RUNPOD
+# -----------------------------------------------------------------------------
+runpod>=1.6.0,<2.0.0
+
+# -----------------------------------------------------------------------------
+# OPTIONNEL - WhisperX (décommenter si nécessaire)
 # Alternative à Voxtral pour éviter les bugs de répétition
-# Installation conditionnelle : décommenter pour activer
+# -----------------------------------------------------------------------------
 # git+https://github.com/m-bain/whisperX.git
-
-runpod==1.6.2
