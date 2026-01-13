@@ -5,23 +5,7 @@ import os, time, base64, tempfile, uuid, requests, json, traceback, re
 from typing import Optional, List, Dict, Any, Tuple
 
 import torch
-
-# =============================================================================
-# FIX PyTorch 2.6+ : Forcer weights_only=False via variable d'environnement
-# La variable TORCH_FORCE_WEIGHTS_ONLY_LOAD=0 est définie dans le Dockerfile
-# Ce patch est un backup au cas où la variable ne suffit pas
-# =============================================================================
-import os
-os.environ.setdefault('TORCH_FORCE_WEIGHTS_ONLY_LOAD', '0')
-
-# Backup: patch direct si la variable d'environnement ne fonctionne pas
-_original_torch_load = torch.load
-def _safe_torch_load(*args, **kwargs):
-    kwargs.setdefault('weights_only', False)
-    return _original_torch_load(*args, **kwargs)
-torch.load = _safe_torch_load
-
-print(f"[STARTUP] PyTorch {torch.__version__} - weights_only=False enforced")
+print(f"[STARTUP] PyTorch {torch.__version__}")
 
 # =============================================================================
 # DIAGNOSTIC GPU/CUDA AU DÉMARRAGE - CRITIQUE POUR DEBUG
