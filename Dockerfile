@@ -1,4 +1,5 @@
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# Image RunPod officielle - testée avec TOUS leurs GPUs (A100, RTX 6000, L40S, etc.)
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -8,18 +9,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_DISABLE_TELEMETRY=1 \
     TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
     PYTORCH_JIT=0 \
+    TORCH_FORCE_WEIGHTS_ONLY_LOAD=0 \
     APP_VERSION=2025-08-23-02 \
     HF_HOME=/workspace/.cache/huggingface \
     TORCH_HOME=/workspace/.cache/torch
 
-# System deps
+# System deps (ffmpeg pour audio processing)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv \
-    ffmpeg libsndfile1 git ca-certificates \
+    ffmpeg libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
-
-RUN ln -sf /usr/bin/python3 /usr/bin/python && \
-    python -m pip install --upgrade pip setuptools wheel
 
 WORKDIR /app
 
