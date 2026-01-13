@@ -7,6 +7,25 @@ from typing import Optional, List, Dict, Any, Tuple
 import torch
 
 # =============================================================================
+# FIX PyTorch 2.6+ : weights_only=True par défaut casse pyannote/speechbrain
+# On enregistre les globals nécessaires comme sûrs
+# =============================================================================
+try:
+    from torch.torch_version import TorchVersion
+    torch.serialization.add_safe_globals([TorchVersion])
+except Exception:
+    pass
+
+# Patch global pour forcer weights_only=False sur les anciens checkpoints
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
+print("[STARTUP] Patched torch.load for PyTorch 2.6+ compatibility")
+
+# =============================================================================
 # DIAGNOSTIC GPU/CUDA AU DÉMARRAGE - CRITIQUE POUR DEBUG
 # =============================================================================
 print("=" * 70)
