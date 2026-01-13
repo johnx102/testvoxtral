@@ -29,16 +29,32 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu12
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# FIX PyTorch 2.6+ weights_only : Patcher speechbrain pour forcer weights_only=False
+# FIX PyTorch 2.6+ weights_only : Patcher speechbrain/pyannote proprement
+# On remplace torch.load(X) par torch.load(X, weights_only=False) avec regex
 RUN SITE=$(python -c "import site; print(site.getsitepackages()[0])") && \
-    if [ -f "$SITE/speechbrain/utils/checkpoints.py" ]; then \
-        sed -i 's/torch\.load(/torch.load(weights_only=False, /g' "$SITE/speechbrain/utils/checkpoints.py" && \
-        echo "[BUILD] Patched speechbrain checkpoints.py"; \
-    fi && \
-    if [ -f "$SITE/pyannote/audio/core/io.py" ]; then \
-        sed -i 's/torch\.load(/torch.load(weights_only=False, /g' "$SITE/pyannote/audio/core/io.py" && \
-        echo "[BUILD] Patched pyannote io.py"; \
-    fi
+    for FILE in "$SITE/speechbrain/utils/checkpoints.py" "$SITE/pyannote/audio/core/io.py"; do \
+        if [ -f "$FILE" ]; then \
+            python3 -c "
+import re, sys
+with open('$FILE', 'r') as f:
+    content = f.read()
+# Skip if already patched
+if 'weights_only=False' in content:
+    print('[BUILD] Already patched: $FILE')
+    sys.exit(0)
+# Replace torch.load(args) with torch.load(args, weights_only=False)
+# This regex matches simple single-line torch.load calls
+patched = re.sub(
+    r'torch\.load\(([^)]+)\)',
+    r'torch.load(\1, weights_only=False)',
+    content
+)
+with open('$FILE', 'w') as f:
+    f.write(patched)
+print('[BUILD] Patched: $FILE')
+" && echo "[BUILD] Done: $FILE"; \
+        fi; \
+    done
 
 # Create cache directories (RunPod will mount /workspace)
 RUN mkdir -p /workspace/.cache/huggingface /workspace/.cache/torch
