@@ -1433,15 +1433,16 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     # INSTRUCTION SPÉCIALISÉE POUR IDENTIFICATION DES SPEAKERS
     instruction = (
         f"lang:{language or 'fr'} "
-        "Transcris cette conversation téléphonique en identifiant clairement qui parle. "
-        "IGNORE la musique d'attente, les silences et les tonalités - transcris UNIQUEMENT les paroles. "
+        "Écoute TOUT l'audio jusqu'à la fin, même s'il y a de la musique d'attente ou du silence au début. "
+        "SAUTE la musique, les annonces d'attente, les silences et les tonalités - ne génère RIEN pour ces parties. "
+        "Transcris UNIQUEMENT les conversations humaines.\n\n"
         "Format requis:\n"
         "Agent: [ce que dit l'agent/professionnel]\n"
         "Client: [ce que dit le client/appelant]\n\n"
         "Indications pour identifier les speakers:\n"
         "- Agent = celui qui répond, dit 'bonjour', 'cabinet', 'je vais voir', 'on vous rappelle'\n"
         "- Client = celui qui appelle, dit 'je voudrais', 'ma femme', 'est-ce que je peux'\n\n"
-        "Transcris mot à mot. Ne mentionne PAS [Musique] ou [Silence]."
+        "Ne mentionne JAMAIS [Musique], [Silence] ou [Attente]. Transcris mot à mot uniquement les paroles."
     )
     
     # TRANSCRIPTION AVEC IDENTIFICATION DES SPEAKERS EN UNE PASSE
@@ -1478,10 +1479,18 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
 
     log(f"[VOXTRAL_ID] Speaker identification completed: {len(speaker_transcript)} chars in {out_speaker_id.get('latency_s', 0):.1f}s")
 
+    # Vérifier si le résultat ne contient que de la musique/silence (pas de vraie conversation)
+    import re
+    cleaned_for_check = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]', '', speaker_transcript, flags=re.IGNORECASE)
+    cleaned_for_check = re.sub(r'[\s\.\,\:\-]+', '', cleaned_for_check)  # Enlever ponctuation et espaces
+    if len(cleaned_for_check) < 20:
+        log(f"[VOXTRAL_ID] Transcript contains only music/silence tags ({len(cleaned_for_check)} chars of real content), falling back to hybrid mode")
+        return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
+
     # PARSING DU RÉSULTAT AVEC SPEAKERS IDENTIFIÉS
     log("[VOXTRAL_ID] Parsing speaker-identified transcript...")
     segments = parse_speaker_identified_transcript(speaker_transcript, est_dur)
-    
+
     if not segments:
         log("[VOXTRAL_ID] Failed to parse speaker transcript, falling back to hybrid mode")
         return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
