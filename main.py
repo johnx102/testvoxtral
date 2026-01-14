@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, time, base64, tempfile, uuid, requests, json, traceback, re
+import os, time, base64, tempfile, uuid, requests, json, traceback, re, gc
 from typing import Optional, List, Dict, Any, Tuple
 
 import torch
@@ -263,7 +263,17 @@ def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict
 
     inp_len = _input_len_from_batch(inputs)
     decoded = processor.batch_decode(outputs[:, inp_len:], skip_special_tokens=True)
-    return {"text": decoded[0] if decoded else "", "latency_s": dt}
+    result_text = decoded[0] if decoded else ""
+
+    # Nettoyage mémoire GPU après inférence
+    del outputs
+    del inputs
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        log("[VOXTRAL] GPU memory cleared")
+
+    return {"text": result_text, "latency_s": dt}
 
 def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens: int, timeout: int = 45) -> Dict[str, Any]:
     """Wrapper simplifié sans signaux Unix"""
@@ -3300,10 +3310,19 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         log(f"[HANDLER] CRITICAL ERROR: {type(e).__name__}: {e}")
         return {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc(limit=3)}
     finally:
+        # Nettoyage mémoire GPU après chaque tâche
+        try:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                log("[HANDLER] GPU memory cleared after task")
+        except Exception:
+            pass
+        # Nettoyage fichier audio temporaire
         try:
             if 'cleanup' in locals() and cleanup and local_path and os.path.exists(local_path):
                 os.remove(local_path)
-                log("[HANDLER] Cleanup completed")
+                log("[HANDLER] Temp file cleanup completed")
         except Exception:
             pass
 
