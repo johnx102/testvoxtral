@@ -1436,13 +1436,16 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
         "Écoute TOUT l'audio jusqu'à la fin, même s'il y a de la musique d'attente ou du silence au début. "
         "SAUTE la musique, les annonces d'attente, les silences et les tonalités - ne génère RIEN pour ces parties. "
         "Transcris UNIQUEMENT les conversations humaines.\n\n"
-        "Format requis:\n"
-        "Agent: [ce que dit l'agent/professionnel]\n"
-        "Client: [ce que dit le client/appelant]\n\n"
-        "Indications pour identifier les speakers:\n"
+        "FORMAT OBLIGATOIRE - chaque prise de parole sur une nouvelle ligne:\n"
+        "Agent: [phrase de l'agent]\n"
+        "Client: [phrase du client]\n"
+        "Agent: [phrase suivante de l'agent]\n"
+        "etc.\n\n"
+        "IMPORTANT: Alterne Agent/Client à chaque changement de locuteur. "
+        "Indications:\n"
         "- Agent = celui qui répond, dit 'bonjour', 'cabinet', 'je vais voir', 'on vous rappelle'\n"
         "- Client = celui qui appelle, dit 'je voudrais', 'ma femme', 'est-ce que je peux'\n\n"
-        "Ne mentionne JAMAIS [Musique], [Silence] ou [Attente]. Transcris mot à mot uniquement les paroles."
+        "Ne mentionne JAMAIS [Musique], [Silence] ou [Attente]."
     )
     
     # TRANSCRIPTION AVEC IDENTIFICATION DES SPEAKERS EN UNE PASSE
@@ -1494,7 +1497,16 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     if not segments:
         log("[VOXTRAL_ID] Failed to parse speaker transcript, falling back to hybrid mode")
         return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
-    
+
+    # Si un seul segment pour un audio long (>30s), Voxtral n'a pas séparé les speakers
+    # Fallback vers hybrid mode pour avoir une vraie diarization
+    if len(segments) == 1 and est_dur > 30:
+        segment_text = segments[0].get("text", "")
+        # Vérifier si le texte semble être une conversation (plusieurs répliques)
+        if len(segment_text) > 100 and any(word in segment_text.lower() for word in ["oui", "d'accord", "merci", "au revoir", "bonjour"]):
+            log(f"[VOXTRAL_ID] Only 1 segment for {est_dur:.0f}s audio - Voxtral didn't separate speakers, falling back to hybrid mode")
+            return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
+
     log(f"[VOXTRAL_ID] Parsed {len(segments)} segments from speaker-identified transcript")
 
     # POST-TRAITEMENT STANDARD
