@@ -1481,31 +1481,61 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
         log(f"[VOXTRAL_ID] Cleaned repetitive loops: {original_len} -> {len(speaker_transcript)} chars")
 
     log(f"[VOXTRAL_ID] Speaker identification completed: {len(speaker_transcript)} chars in {out_speaker_id.get('latency_s', 0):.1f}s")
+    log(f"[VOXTRAL_ID] Raw transcript (first 500 chars): {speaker_transcript[:500]}")
 
-    # Vérifier si le résultat ne contient que de la musique/silence (pas de vraie conversation)
+    # Nettoyer les tags musique/silence du transcript
     import re
-    cleaned_for_check = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]', '', speaker_transcript, flags=re.IGNORECASE)
-    cleaned_for_check = re.sub(r'[\s\.\,\:\-]+', '', cleaned_for_check)  # Enlever ponctuation et espaces
-    if len(cleaned_for_check) < 20:
-        log(f"[VOXTRAL_ID] Transcript contains only music/silence tags ({len(cleaned_for_check)} chars of real content), falling back to hybrid mode")
-        return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
+    speaker_transcript = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]\s*', '', speaker_transcript, flags=re.IGNORECASE)
+    speaker_transcript = speaker_transcript.strip()
+
+    if len(speaker_transcript) < 10:
+        log(f"[VOXTRAL_ID] Transcript too short after cleanup ({len(speaker_transcript)} chars), returning empty result")
+        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée (musique/silence uniquement)."}
 
     # PARSING DU RÉSULTAT AVEC SPEAKERS IDENTIFIÉS
     log("[VOXTRAL_ID] Parsing speaker-identified transcript...")
     segments = parse_speaker_identified_transcript(speaker_transcript, est_dur)
 
     if not segments:
-        log("[VOXTRAL_ID] Failed to parse speaker transcript, falling back to hybrid mode")
-        return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
+        # Premier essai échoué - Voxtral n'a pas séparé les speakers
+        # On réessaie avec un prompt plus forcé
+        log("[VOXTRAL_ID] No speaker format found, retrying with forced diarization prompt...")
 
-    # Si un seul segment pour un audio long (>30s), Voxtral n'a pas séparé les speakers
-    # Fallback vers hybrid mode pour avoir une vraie diarization
-    if len(segments) == 1 and est_dur > 30:
-        segment_text = segments[0].get("text", "")
-        # Vérifier si le texte semble être une conversation (plusieurs répliques)
-        if len(segment_text) > 100 and any(word in segment_text.lower() for word in ["oui", "d'accord", "merci", "au revoir", "bonjour"]):
-            log(f"[VOXTRAL_ID] Only 1 segment for {est_dur:.0f}s audio - Voxtral didn't separate speakers, falling back to hybrid mode")
-            return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
+        forced_instruction = (
+            f"lang:{language or 'fr'} "
+            "Tu DOIS séparer les speakers. Voici le transcript brut, reformate-le:\n\n"
+            f"{speaker_transcript}\n\n"
+            "REFORMATE en séparant OBLIGATOIREMENT Agent et Client. Format:\n"
+            "Agent: [sa phrase]\n"
+            "Client: [sa phrase]\n"
+            "Agent: [sa phrase]\n"
+            "etc.\n\n"
+            "L'Agent est celui qui répond/travaille. Le Client est celui qui appelle/demande."
+        )
+
+        conv_retry = [{
+            "role": "user",
+            "content": [{"type": "text", "text": forced_instruction}]
+        }]
+
+        retry_tokens = min(max_new_tokens, int(len(speaker_transcript) * 1.5))
+        out_retry = run_voxtral_with_timeout(conv_retry, max_new_tokens=retry_tokens, timeout=60)
+        retry_transcript = (out_retry.get("text") or "").strip()
+
+        if retry_transcript:
+            log(f"[VOXTRAL_ID] Retry transcript: {len(retry_transcript)} chars")
+            log(f"[VOXTRAL_ID] Retry raw (first 300 chars): {retry_transcript[:300]}")
+            segments = parse_speaker_identified_transcript(retry_transcript, est_dur)
+
+        # Si toujours pas de segments, on garde le transcript brut
+        if not segments:
+            log("[VOXTRAL_ID] Retry failed, using raw transcript as single segment")
+            segments = [{
+                "speaker": "Agent",
+                "start": 0.0,
+                "end": est_dur,
+                "text": speaker_transcript.strip()
+            }]
 
     log(f"[VOXTRAL_ID] Parsed {len(segments)} segments from speaker-identified transcript")
 
