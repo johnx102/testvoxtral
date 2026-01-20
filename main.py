@@ -270,6 +270,7 @@ def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict
     del inputs
     gc.collect()
     if torch.cuda.is_available():
+        torch.cuda.synchronize()  # IMPORTANT: attendre fin des opérations async avant libération
         torch.cuda.empty_cache()
         log("[VOXTRAL] GPU memory cleared")
 
@@ -286,6 +287,15 @@ def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens:
         return result
     except Exception as e:
         log(f"[ERROR] Voxtral inference failed: {e}")
+        # Nettoyage mémoire CRITIQUE en cas d'erreur (surtout OOM)
+        try:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                log("[VOXTRAL] GPU memory cleared after error")
+        except Exception:
+            pass
         return {"text": "", "latency_s": 0}
 
 def _build_conv_transcribe_ultra_strict(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
@@ -3314,6 +3324,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         try:
             gc.collect()
             if torch.cuda.is_available():
+                torch.cuda.synchronize()  # IMPORTANT: attendre fin des opérations async
                 torch.cuda.empty_cache()
                 log("[HANDLER] GPU memory cleared after task")
         except Exception:

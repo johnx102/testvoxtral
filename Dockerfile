@@ -10,6 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
     PYTORCH_JIT=0 \
     TORCH_FORCE_WEIGHTS_ONLY_LOAD=0 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     APP_VERSION=2025-08-23-02 \
     HF_HOME=/workspace/.cache/huggingface \
     TORCH_HOME=/workspace/.cache/torch
