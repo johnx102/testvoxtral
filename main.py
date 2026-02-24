@@ -1317,10 +1317,11 @@ def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[s
 def detect_hold_music(audio_path: str) -> Dict[str, Any]:
     """
     Détecte si un fichier audio est de la musique d'attente en analysant
-    le ratio de frames contenant de la parole via l'énergie RMS (librosa).
+    le ratio de frames contenant de la parole via l'énergie RMS.
+    Utilise soundfile (lecture native sans resampling) + numpy pur.
     Temps d'exécution typique : < 0.5s.
     """
-    import librosa
+    import soundfile as sf
     import numpy as np
 
     t0 = time.time()
@@ -1333,8 +1334,13 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
     }
 
     try:
-        # Charger l'audio à 16 kHz mono
-        y, sr = librosa.load(audio_path, sr=16000, mono=True)
+        # Lecture rapide à la fréquence native (pas de resampling)
+        y, sr = sf.read(audio_path, dtype="float32")
+
+        # Convertir en mono si stéréo
+        if y.ndim > 1:
+            y = np.mean(y, axis=1)
+
         duration = len(y) / sr
         result["duration"] = round(duration, 2)
 
@@ -1345,15 +1351,19 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
             log(f"[HOLD_MUSIC] Skip: {result['reason']}")
             return result
 
-        # Énergie RMS par frame (30 ms frames, 10 ms hop)
-        frame_length = int(0.030 * sr)  # 480 samples
-        hop_length = int(0.010 * sr)    # 160 samples
-        rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+        # Énergie RMS par frame (30 ms frames, 10 ms hop) - numpy pur
+        frame_length = int(0.030 * sr)
+        hop_length = int(0.010 * sr)
+        n_frames = 1 + (len(y) - frame_length) // hop_length
+        rms = np.empty(n_frames, dtype=np.float32)
+        for i in range(n_frames):
+            start = i * hop_length
+            frame = y[start:start + frame_length]
+            rms[i] = np.sqrt(np.mean(frame * frame))
 
         # Normaliser par le pic d'amplitude
         peak = np.max(np.abs(y))
         if peak < 1e-6:
-            # Audio quasi-silencieux
             result["is_hold_music"] = True
             result["speech_ratio"] = 0.0
             result["reason"] = "silent_audio"
@@ -1364,12 +1374,13 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
         rms_norm = rms / peak
 
         # Seuil dynamique : médiane + 1.5 * écart-type
-        median_rms = np.median(rms_norm)
-        std_rms = np.std(rms_norm)
+        median_rms = float(np.median(rms_norm))
+        std_rms = float(np.std(rms_norm))
         speech_threshold = median_rms + 1.5 * std_rms
 
         # Ratio de frames "parole" (énergie > seuil)
-        speech_frames = np.sum(rms_norm > speech_threshold)
+        speech_mask = rms_norm > speech_threshold
+        speech_frames = int(np.sum(speech_mask))
         total_frames = len(rms_norm)
         speech_ratio = speech_frames / total_frames if total_frames > 0 else 1.0
         result["speech_ratio"] = round(float(speech_ratio), 4)
@@ -1377,19 +1388,24 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
         log(f"[HOLD_MUSIC] Analysis: duration={duration:.1f}s, speech_ratio={speech_ratio:.4f}, "
             f"threshold={speech_threshold:.4f}, median_rms={median_rms:.4f}")
 
+        # Vérification commune : parole concentrée à la fin (attente puis conversation)
+        def _speech_at_end() -> bool:
+            if speech_frames <= 0:
+                return False
+            last_quarter_start = int(total_frames * 0.75)
+            speech_in_last_quarter = int(np.sum(speech_mask[last_quarter_start:]))
+            ratio_in_last_quarter = speech_in_last_quarter / speech_frames
+            if ratio_in_last_quarter > 0.7:
+                log(f"[HOLD_MUSIC] Skip: speech concentrated at end ({ratio_in_last_quarter:.2f})")
+                return True
+            return False
+
         # Seuil dur : en dessous = musique d'attente certaine
         if speech_ratio < HOLD_MUSIC_SPEECH_RATIO_HARD:
-            # Vérifier si la parole est concentrée à la fin (attente puis conversation)
-            if total_frames > 0 and speech_frames > 0:
-                speech_mask = rms_norm > speech_threshold
-                last_quarter_start = int(total_frames * 0.75)
-                speech_in_last_quarter = np.sum(speech_mask[last_quarter_start:])
-                ratio_in_last_quarter = speech_in_last_quarter / max(speech_frames, 1)
-                if ratio_in_last_quarter > 0.7:
-                    result["reason"] = "speech_concentrated_at_end"
-                    result["detection_time"] = round(time.time() - t0, 3)
-                    log(f"[HOLD_MUSIC] Skip: speech concentrated at end ({ratio_in_last_quarter:.2f})")
-                    return result
+            if _speech_at_end():
+                result["reason"] = "speech_concentrated_at_end"
+                result["detection_time"] = round(time.time() - t0, 3)
+                return result
 
             result["is_hold_music"] = True
             result["reason"] = f"hard_threshold (ratio={speech_ratio:.4f} < {HOLD_MUSIC_SPEECH_RATIO_HARD})"
@@ -1399,15 +1415,9 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
 
         # Seuil souple : ratio bas + durée longue = probable musique d'attente
         if speech_ratio < HOLD_MUSIC_SPEECH_RATIO_SOFT and duration > 60.0:
-            # Même vérification : parole concentrée à la fin ?
-            speech_mask = rms_norm > speech_threshold
-            last_quarter_start = int(total_frames * 0.75)
-            speech_in_last_quarter = np.sum(speech_mask[last_quarter_start:])
-            ratio_in_last_quarter = speech_in_last_quarter / max(speech_frames, 1)
-            if ratio_in_last_quarter > 0.7:
+            if _speech_at_end():
                 result["reason"] = "speech_concentrated_at_end"
                 result["detection_time"] = round(time.time() - t0, 3)
-                log(f"[HOLD_MUSIC] Skip: speech concentrated at end ({ratio_in_last_quarter:.2f})")
                 return result
 
             result["is_hold_music"] = True
