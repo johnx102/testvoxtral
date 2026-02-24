@@ -1385,81 +1385,102 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
         speech_ratio = speech_frames / total_frames if total_frames > 0 else 1.0
         result["speech_ratio"] = round(float(speech_ratio), 4)
 
+        # --- Analyse par blocs : découper en chunks de 5s et classer speech/music ---
+        chunk_sec = 5.0
+        chunk_frames = max(1, int(chunk_sec * sr / hop_length))
+        n_chunks = max(1, total_frames // chunk_frames)
+        chunk_is_speech = []
+        for ci in range(n_chunks):
+            cstart = ci * chunk_frames
+            cend = min(cstart + chunk_frames, total_frames)
+            density = float(np.mean(speech_mask[cstart:cend]))
+            chunk_is_speech.append(density >= 0.05)
+
+        # Construire les blocs de parole contigus (avec marge de 2s)
+        speech_blocks = []
+        in_block = False
+        block_start_idx = 0
+        for ci, is_sp in enumerate(chunk_is_speech):
+            if is_sp and not in_block:
+                block_start_idx = ci
+                in_block = True
+            elif not is_sp and in_block:
+                s = max(0.0, block_start_idx * chunk_sec - 2.0)
+                e = min(duration, ci * chunk_sec + 2.0)
+                if e - s >= 3.0:
+                    speech_blocks.append((round(s, 2), round(e, 2)))
+                in_block = False
+        if in_block:
+            s = max(0.0, block_start_idx * chunk_sec - 2.0)
+            e = duration
+            if e - s >= 3.0:
+                speech_blocks.append((round(s, 2), round(e, 2)))
+
+        # Fusionner les blocs proches (gap < 10s)
+        if len(speech_blocks) > 1:
+            merged = [list(speech_blocks[0])]
+            for sb in speech_blocks[1:]:
+                if sb[0] - merged[-1][1] <= 10.0:
+                    merged[-1][1] = sb[1]
+                else:
+                    merged.append(list(sb))
+            speech_blocks = [(round(s, 2), round(e, 2)) for s, e in merged]
+
+        has_speech_start = any(s < duration * 0.30 for s, _ in speech_blocks)
+        has_speech_end = any(e > duration * 0.70 for _, e in speech_blocks)
+        total_speech_sec = sum(e - s for s, e in speech_blocks)
+        total_gap_sec = duration - total_speech_sec
+
         log(f"[HOLD_MUSIC] Analysis: duration={duration:.1f}s, speech_ratio={speech_ratio:.4f}, "
-            f"threshold={speech_threshold:.4f}, median_rms={median_rms:.4f}")
+            f"blocks={speech_blocks}, speech_start={has_speech_start}, speech_end={has_speech_end}, "
+            f"speech_sec={total_speech_sec:.1f}s, gap_sec={total_gap_sec:.1f}s")
 
-        # Trouver le timestamp de début de parole (premier bloc continu de speech)
-        def _find_speech_start_sec() -> Optional[float]:
-            """Retourne le timestamp (en secondes) où la parole commence, avec une marge de 2s."""
-            # Chercher la première fenêtre de 0.5s avec au moins 30% de frames speech
-            window_frames = max(1, int(0.5 * sr / hop_length))
-            for i in range(0, total_frames - window_frames):
-                window = speech_mask[i:i + window_frames]
-                if np.mean(window) >= 0.3:
-                    # Début de parole trouvé - reculer de 2s pour marge
-                    start_sec = max(0.0, (i * hop_length / sr) - 2.0)
-                    return round(start_sec, 2)
-            return None
+        # --- Règle 1 : parole au début ET à la fin → JAMAIS musique d'attente ---
+        if has_speech_start and has_speech_end:
+            result["reason"] = "conversation_with_gaps"
+            if total_gap_sec > 30 and len(speech_blocks) >= 1:
+                result["speech_blocks"] = speech_blocks
+            result["detection_time"] = round(time.time() - t0, 3)
+            log(f"[HOLD_MUSIC] Conversation with gaps, {len(speech_blocks)} block(s), "
+                f"trimmable={total_gap_sec:.0f}s")
+            return result
 
-        # Vérification commune : parole concentrée à la fin (attente puis conversation)
-        def _speech_at_end() -> bool:
-            if speech_frames <= 0:
-                return False
-            last_quarter_start = int(total_frames * 0.75)
-            speech_in_last_quarter = int(np.sum(speech_mask[last_quarter_start:]))
-            ratio_in_last_quarter = speech_in_last_quarter / speech_frames
-            if ratio_in_last_quarter > 0.7:
-                log(f"[HOLD_MUSIC] Speech concentrated at end ({ratio_in_last_quarter:.2f})")
-                return True
-            return False
+        # --- Règle 2 : parole quelque part → pas musique d'attente, trimmer ---
+        if has_speech_start or has_speech_end:
+            result["reason"] = "partial_speech"
+            if total_gap_sec > 15:
+                result["speech_blocks"] = speech_blocks
+            result["detection_time"] = round(time.time() - t0, 3)
+            log(f"[HOLD_MUSIC] Partial speech detected, blocks={speech_blocks}")
+            return result
 
-        # Seuil dur : en dessous = musique d'attente certaine
+        # --- Règle 3 : aucun bloc de parole détecté + ratio très bas → musique d'attente ---
         if speech_ratio < HOLD_MUSIC_SPEECH_RATIO_HARD:
-            if _speech_at_end():
-                speech_start = _find_speech_start_sec()
-                result["reason"] = "speech_concentrated_at_end"
-                result["speech_start_sec"] = speech_start
-                result["detection_time"] = round(time.time() - t0, 3)
-                log(f"[HOLD_MUSIC] Not hold music, speech starts at {speech_start}s")
-                return result
-
             result["is_hold_music"] = True
-            result["reason"] = f"hard_threshold (ratio={speech_ratio:.4f} < {HOLD_MUSIC_SPEECH_RATIO_HARD})"
+            result["reason"] = f"hard_threshold (ratio={speech_ratio:.4f}, no speech blocks)"
             result["detection_time"] = round(time.time() - t0, 3)
             log(f"[HOLD_MUSIC] Detected: {result['reason']} ({duration:.1f}s)")
             return result
 
-        # Seuil souple : ratio bas + durée longue = probable musique d'attente
         if speech_ratio < HOLD_MUSIC_SPEECH_RATIO_SOFT and duration > 60.0:
-            if _speech_at_end():
-                speech_start = _find_speech_start_sec()
-                result["reason"] = "speech_concentrated_at_end"
-                result["speech_start_sec"] = speech_start
-                result["detection_time"] = round(time.time() - t0, 3)
-                log(f"[HOLD_MUSIC] Not hold music, speech starts at {speech_start}s")
-                return result
-
             result["is_hold_music"] = True
-            result["reason"] = (f"soft_threshold (ratio={speech_ratio:.4f} < {HOLD_MUSIC_SPEECH_RATIO_SOFT}, "
-                                f"duration={duration:.1f}s > 60s)")
+            result["reason"] = (f"soft_threshold (ratio={speech_ratio:.4f}, no speech blocks, "
+                                f"duration={duration:.1f}s)")
             result["detection_time"] = round(time.time() - t0, 3)
             log(f"[HOLD_MUSIC] Detected: {result['reason']}")
             return result
 
-        # Même au-dessus des seuils : si le ratio est bas et la parole est à la fin,
-        # calculer speech_start_sec pour permettre le trim de la musique d'attente initiale
-        if speech_ratio < 0.20 and duration > 60.0 and _speech_at_end():
-            speech_start = _find_speech_start_sec()
-            if speech_start and speech_start > 10.0:
-                result["reason"] = "speech_after_hold_music"
-                result["speech_start_sec"] = speech_start
-                result["detection_time"] = round(time.time() - t0, 3)
-                log(f"[HOLD_MUSIC] Not hold music but long intro detected, speech starts at {speech_start}s")
-                return result
+        # --- Pas de musique d'attente, mais vérifier s'il y a des gaps à trimmer ---
+        if total_gap_sec > 30 and speech_blocks:
+            result["reason"] = "normal_with_trimmable_gaps"
+            result["speech_blocks"] = speech_blocks
+            result["detection_time"] = round(time.time() - t0, 3)
+            log(f"[HOLD_MUSIC] Normal speech with {total_gap_sec:.0f}s trimmable gaps")
+            return result
 
         result["reason"] = "normal_speech"
         result["detection_time"] = round(time.time() - t0, 3)
-        log(f"[HOLD_MUSIC] Not hold music: speech_ratio={speech_ratio:.4f} ({duration:.1f}s) [{result['detection_time']:.3f}s]")
+        log(f"[HOLD_MUSIC] Normal: ratio={speech_ratio:.4f} ({duration:.1f}s) [{result['detection_time']:.3f}s]")
         return result
 
     except Exception as e:
@@ -1491,6 +1512,55 @@ def build_hold_music_response(hold_music_result: Dict[str, Any], with_summary: b
         out["summary"] = "Aucune conversation détectée - musique d'attente uniquement."
 
     return out
+
+
+def trim_audio_to_speech_blocks(local_path: str, hold_music_result: Dict[str, Any], cleanup: bool) -> Tuple[str, bool]:
+    """
+    Extrait les blocs de parole et supprime les sections de musique d'attente.
+    Retourne (nouveau_chemin, nouveau_cleanup).
+    """
+    speech_blocks = hold_music_result.get("speech_blocks")
+    if not speech_blocks:
+        return local_path, cleanup
+
+    try:
+        audio = AudioSegment.from_file(local_path)
+        original_sec = len(audio) / 1000.0
+
+        # Extraire et concaténer les blocs de parole
+        parts = []
+        for s, e in speech_blocks:
+            start_ms = int(s * 1000)
+            end_ms = int(e * 1000)
+            parts.append(audio[start_ms:end_ms])
+
+        if not parts:
+            return local_path, cleanup
+
+        trimmed = parts[0]
+        for part in parts[1:]:
+            trimmed += part
+
+        trimmed_sec = len(trimmed) / 1000.0
+        removed_sec = original_sec - trimmed_sec
+
+        # Ne trimmer que si on gagne au moins 15 secondes
+        if removed_sec < 15:
+            log(f"[TRIM] Only {removed_sec:.0f}s to remove, keeping original")
+            return local_path, cleanup
+
+        trimmed_path = local_path.rsplit(".", 1)[0] + "_trimmed.wav"
+        trimmed.export(trimmed_path, format="wav")
+        log(f"[TRIM] Extracted {len(speech_blocks)} speech block(s): "
+            f"{original_sec:.1f}s → {trimmed_sec:.1f}s (removed {removed_sec:.0f}s of music)")
+
+        if cleanup:
+            os.remove(local_path)
+        return trimmed_path, True
+
+    except Exception as e:
+        log(f"[TRIM] Failed, using original: {e}")
+        return local_path, cleanup
 
 
 # ---------------------------
@@ -3440,23 +3510,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     out = build_hold_music_response(hold_music_result, with_summary)
                     return {"task": "transcribe_diarized", **out}
 
-                # Trimmer la musique d'attente initiale si parole concentrée à la fin
-                speech_start = hold_music_result.get("speech_start_sec")
-                if speech_start and speech_start > 10.0:
-                    try:
-                        audio = AudioSegment.from_file(local_path)
-                        trimmed = audio[int(speech_start * 1000):]
-                        trimmed_path = local_path.rsplit(".", 1)[0] + "_trimmed.wav"
-                        trimmed.export(trimmed_path, format="wav")
-                        log(f"[HANDLER] Trimmed {speech_start:.1f}s of hold music, "
-                            f"{len(audio)/1000:.1f}s → {len(trimmed)/1000:.1f}s")
-                        # Remplacer le chemin pour tout le pipeline
-                        if cleanup:
-                            os.remove(local_path)
-                        local_path = trimmed_path
-                        cleanup = True
-                    except Exception as e:
-                        log(f"[HANDLER] Trim failed, using original: {e}")
+                # Extraire les blocs de parole, supprimer la musique d'attente
+                if hold_music_result.get("speech_blocks"):
+                    local_path, cleanup = trim_audio_to_speech_blocks(local_path, hold_music_result, cleanup)
 
             # NOUVEAU : Détection précoce du type de contenu (si activée)
             if ENABLE_SINGLE_VOICE_DETECTION:
@@ -3518,22 +3574,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         "latency_s": hold_music_result.get("detection_time", 0.0),
                     }
 
-                # Trimmer la musique d'attente initiale si parole concentrée à la fin
-                speech_start = hold_music_result.get("speech_start_sec")
-                if speech_start and speech_start > 10.0:
-                    try:
-                        audio = AudioSegment.from_file(local_path)
-                        trimmed = audio[int(speech_start * 1000):]
-                        trimmed_path = local_path.rsplit(".", 1)[0] + "_trimmed.wav"
-                        trimmed.export(trimmed_path, format="wav")
-                        log(f"[HANDLER] Trimmed {speech_start:.1f}s of hold music, "
-                            f"{len(audio)/1000:.1f}s → {len(trimmed)/1000:.1f}s")
-                        if cleanup:
-                            os.remove(local_path)
-                        local_path = trimmed_path
-                        cleanup = True
-                    except Exception as e:
-                        log(f"[HANDLER] Trim failed, using original: {e}")
+                # Extraire les blocs de parole, supprimer la musique d'attente
+                if hold_music_result.get("speech_blocks"):
+                    local_path, cleanup = trim_audio_to_speech_blocks(local_path, hold_music_result, cleanup)
 
             try:
                 temp_result = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, False)
@@ -3577,22 +3620,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         "latency_s": hold_music_result.get("detection_time", 0.0),
                     }
 
-                # Trimmer la musique d'attente initiale si parole concentrée à la fin
-                speech_start = hold_music_result.get("speech_start_sec")
-                if speech_start and speech_start > 10.0:
-                    try:
-                        audio = AudioSegment.from_file(local_path)
-                        trimmed = audio[int(speech_start * 1000):]
-                        trimmed_path = local_path.rsplit(".", 1)[0] + "_trimmed.wav"
-                        trimmed.export(trimmed_path, format="wav")
-                        log(f"[HANDLER] Trimmed {speech_start:.1f}s of hold music, "
-                            f"{len(audio)/1000:.1f}s → {len(trimmed)/1000:.1f}s")
-                        if cleanup:
-                            os.remove(local_path)
-                        local_path = trimmed_path
-                        cleanup = True
-                    except Exception as e:
-                        log(f"[HANDLER] Trim failed, using original: {e}")
+                # Extraire les blocs de parole, supprimer la musique d'attente
+                if hold_music_result.get("speech_blocks"):
+                    local_path, cleanup = trim_audio_to_speech_blocks(local_path, hold_music_result, cleanup)
 
             conv = _build_conv_transcribe_ultra_strict(local_path, language)
             out = run_voxtral_with_timeout(conv, max_new_tokens=min(max_new_tokens, 64), timeout=30)
