@@ -83,6 +83,12 @@ ENABLE_SINGLE_VOICE_DETECTION = os.environ.get("ENABLE_SINGLE_VOICE_DETECTION", 
 SINGLE_VOICE_DETECTION_TIMEOUT = int(os.environ.get("SINGLE_VOICE_DETECTION_TIMEOUT", "30"))
 SINGLE_VOICE_SUMMARY_TOKENS = int(os.environ.get("SINGLE_VOICE_SUMMARY_TOKENS", "48"))
 
+# Détection musique d'attente (pré-inférence, via librosa)
+ENABLE_HOLD_MUSIC_DETECTION = os.environ.get("ENABLE_HOLD_MUSIC_DETECTION", "1") == "1"
+HOLD_MUSIC_SPEECH_RATIO_HARD = float(os.environ.get("HOLD_MUSIC_SPEECH_RATIO_HARD", "0.03"))
+HOLD_MUSIC_SPEECH_RATIO_SOFT = float(os.environ.get("HOLD_MUSIC_SPEECH_RATIO_SOFT", "0.08"))
+HOLD_MUSIC_MIN_DURATION = float(os.environ.get("HOLD_MUSIC_MIN_DURATION", "30.0"))
+
 # Diarization - MODES AVANCÉS
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
 EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"
@@ -1303,6 +1309,149 @@ def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[s
     
     log(f"[OPTIMIZE] Final: {len(segments)} → {len(filtered)} segments")
     return filtered
+
+# ---------------------------
+# DÉTECTION MUSIQUE D'ATTENTE (pré-inférence, librosa)
+# ---------------------------
+
+def detect_hold_music(audio_path: str) -> Dict[str, Any]:
+    """
+    Détecte si un fichier audio est de la musique d'attente en analysant
+    le ratio de frames contenant de la parole via l'énergie RMS (librosa).
+    Temps d'exécution typique : < 0.5s.
+    """
+    import librosa
+    import numpy as np
+
+    t0 = time.time()
+    result = {
+        "is_hold_music": False,
+        "speech_ratio": 1.0,
+        "duration": 0.0,
+        "reason": "",
+        "detection_time": 0.0,
+    }
+
+    try:
+        # Charger l'audio à 16 kHz mono
+        y, sr = librosa.load(audio_path, sr=16000, mono=True)
+        duration = len(y) / sr
+        result["duration"] = round(duration, 2)
+
+        # Fichiers trop courts : pas de détection
+        if duration < HOLD_MUSIC_MIN_DURATION:
+            result["reason"] = f"too_short ({duration:.1f}s < {HOLD_MUSIC_MIN_DURATION}s)"
+            result["detection_time"] = round(time.time() - t0, 3)
+            log(f"[HOLD_MUSIC] Skip: {result['reason']}")
+            return result
+
+        # Énergie RMS par frame (30 ms frames, 10 ms hop)
+        frame_length = int(0.030 * sr)  # 480 samples
+        hop_length = int(0.010 * sr)    # 160 samples
+        rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+
+        # Normaliser par le pic d'amplitude
+        peak = np.max(np.abs(y))
+        if peak < 1e-6:
+            # Audio quasi-silencieux
+            result["is_hold_music"] = True
+            result["speech_ratio"] = 0.0
+            result["reason"] = "silent_audio"
+            result["detection_time"] = round(time.time() - t0, 3)
+            log(f"[HOLD_MUSIC] Detected: silent audio ({duration:.1f}s)")
+            return result
+
+        rms_norm = rms / peak
+
+        # Seuil dynamique : médiane + 1.5 * écart-type
+        median_rms = np.median(rms_norm)
+        std_rms = np.std(rms_norm)
+        speech_threshold = median_rms + 1.5 * std_rms
+
+        # Ratio de frames "parole" (énergie > seuil)
+        speech_frames = np.sum(rms_norm > speech_threshold)
+        total_frames = len(rms_norm)
+        speech_ratio = speech_frames / total_frames if total_frames > 0 else 1.0
+        result["speech_ratio"] = round(float(speech_ratio), 4)
+
+        log(f"[HOLD_MUSIC] Analysis: duration={duration:.1f}s, speech_ratio={speech_ratio:.4f}, "
+            f"threshold={speech_threshold:.4f}, median_rms={median_rms:.4f}")
+
+        # Seuil dur : en dessous = musique d'attente certaine
+        if speech_ratio < HOLD_MUSIC_SPEECH_RATIO_HARD:
+            # Vérifier si la parole est concentrée à la fin (attente puis conversation)
+            if total_frames > 0 and speech_frames > 0:
+                speech_mask = rms_norm > speech_threshold
+                last_quarter_start = int(total_frames * 0.75)
+                speech_in_last_quarter = np.sum(speech_mask[last_quarter_start:])
+                ratio_in_last_quarter = speech_in_last_quarter / max(speech_frames, 1)
+                if ratio_in_last_quarter > 0.7:
+                    result["reason"] = "speech_concentrated_at_end"
+                    result["detection_time"] = round(time.time() - t0, 3)
+                    log(f"[HOLD_MUSIC] Skip: speech concentrated at end ({ratio_in_last_quarter:.2f})")
+                    return result
+
+            result["is_hold_music"] = True
+            result["reason"] = f"hard_threshold (ratio={speech_ratio:.4f} < {HOLD_MUSIC_SPEECH_RATIO_HARD})"
+            result["detection_time"] = round(time.time() - t0, 3)
+            log(f"[HOLD_MUSIC] Detected: {result['reason']} ({duration:.1f}s)")
+            return result
+
+        # Seuil souple : ratio bas + durée longue = probable musique d'attente
+        if speech_ratio < HOLD_MUSIC_SPEECH_RATIO_SOFT and duration > 60.0:
+            # Même vérification : parole concentrée à la fin ?
+            speech_mask = rms_norm > speech_threshold
+            last_quarter_start = int(total_frames * 0.75)
+            speech_in_last_quarter = np.sum(speech_mask[last_quarter_start:])
+            ratio_in_last_quarter = speech_in_last_quarter / max(speech_frames, 1)
+            if ratio_in_last_quarter > 0.7:
+                result["reason"] = "speech_concentrated_at_end"
+                result["detection_time"] = round(time.time() - t0, 3)
+                log(f"[HOLD_MUSIC] Skip: speech concentrated at end ({ratio_in_last_quarter:.2f})")
+                return result
+
+            result["is_hold_music"] = True
+            result["reason"] = (f"soft_threshold (ratio={speech_ratio:.4f} < {HOLD_MUSIC_SPEECH_RATIO_SOFT}, "
+                                f"duration={duration:.1f}s > 60s)")
+            result["detection_time"] = round(time.time() - t0, 3)
+            log(f"[HOLD_MUSIC] Detected: {result['reason']}")
+            return result
+
+        result["reason"] = "normal_speech"
+        result["detection_time"] = round(time.time() - t0, 3)
+        log(f"[HOLD_MUSIC] Not hold music: speech_ratio={speech_ratio:.4f} ({duration:.1f}s) [{result['detection_time']:.3f}s]")
+        return result
+
+    except Exception as e:
+        log(f"[HOLD_MUSIC] Error during detection: {e} - skipping")
+        result["reason"] = f"error: {e}"
+        result["detection_time"] = round(time.time() - t0, 3)
+        return result
+
+
+def build_hold_music_response(hold_music_result: Dict[str, Any], with_summary: bool) -> Dict[str, Any]:
+    """
+    Construit une réponse structurée identique au format existant
+    pour un fichier détecté comme musique d'attente.
+    """
+    out: Dict[str, Any] = {
+        "segments": [],
+        "transcript": "",
+        "language": "fr",
+        "audio_duration": hold_music_result.get("duration", 0.0),
+        "hold_music_detected": True,
+        "hold_music_speech_ratio": hold_music_result.get("speech_ratio", 0.0),
+        "hold_music_reason": hold_music_result.get("reason", ""),
+        "hold_music_detection_time": hold_music_result.get("detection_time", 0.0),
+        "mood_overall": "neutral",
+        "mood_by_speaker": {},
+    }
+
+    if with_summary:
+        out["summary"] = "Aucune conversation détectée - musique d'attente uniquement."
+
+    return out
+
 
 # ---------------------------
 # DÉTECTION ET TRAITEMENT DES ANNONCES/IVR
@@ -3156,6 +3305,12 @@ def health():
         "single_voice_detection": ENABLE_SINGLE_VOICE_DETECTION,  # NOUVEAU
         "single_voice_detection_timeout": SINGLE_VOICE_DETECTION_TIMEOUT,  # NOUVEAU
         "single_voice_summary_tokens": SINGLE_VOICE_SUMMARY_TOKENS,  # NOUVEAU
+        "hold_music_detection": ENABLE_HOLD_MUSIC_DETECTION,
+        "hold_music_thresholds": {
+            "speech_ratio_hard": HOLD_MUSIC_SPEECH_RATIO_HARD,
+            "speech_ratio_soft": HOLD_MUSIC_SPEECH_RATIO_SOFT,
+            "min_duration": HOLD_MUSIC_MIN_DURATION,
+        },
         "diarization_modes": {  # NOUVEAU : résumé des modes disponibles
             "voxtral_speaker_id": VOXTRAL_SPEAKER_ID,
             "pyannote_auto": PYANNOTE_AUTO, 
@@ -3237,6 +3392,14 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         if task in ("transcribe_diarized", "diarized", "diarize"):
             log("[HANDLER] Starting diarized transcription...")
 
+            # Détection musique d'attente AVANT toute inférence Voxtral
+            if ENABLE_HOLD_MUSIC_DETECTION:
+                hold_music_result = detect_hold_music(local_path)
+                if hold_music_result["is_hold_music"]:
+                    log(f"[HANDLER] Hold music detected, skipping Voxtral inference")
+                    out = build_hold_music_response(hold_music_result, with_summary)
+                    return {"task": "transcribe_diarized", **out}
+
             # NOUVEAU : Détection précoce du type de contenu (si activée)
             if ENABLE_SINGLE_VOICE_DETECTION:
                 content_type = detect_single_voice_content(local_path, language)
@@ -3283,6 +3446,20 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             return {"task": "transcribe_diarized", **out}
         elif task in ("summary", "summarize"):
             log("[HANDLER] Starting summary task...")
+
+            # Détection musique d'attente AVANT toute inférence Voxtral
+            if ENABLE_HOLD_MUSIC_DETECTION:
+                hold_music_result = detect_hold_music(local_path)
+                if hold_music_result["is_hold_music"]:
+                    log(f"[HANDLER] Hold music detected, skipping summary inference")
+                    return {
+                        "task": "summary",
+                        "text": "Aucune conversation détectée - musique d'attente uniquement.",
+                        "hold_music_detected": True,
+                        "hold_music_speech_ratio": hold_music_result.get("speech_ratio", 0.0),
+                        "latency_s": hold_music_result.get("detection_time", 0.0),
+                    }
+
             try:
                 temp_result = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, False)
                 if "error" in temp_result:
@@ -3311,6 +3488,20 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 return {"task": "summary", **out}
         else:
             log("[HANDLER] Starting simple transcription...")
+
+            # Détection musique d'attente AVANT toute inférence Voxtral
+            if ENABLE_HOLD_MUSIC_DETECTION:
+                hold_music_result = detect_hold_music(local_path)
+                if hold_music_result["is_hold_music"]:
+                    log(f"[HANDLER] Hold music detected, skipping transcription inference")
+                    return {
+                        "task": "transcribe",
+                        "text": "",
+                        "hold_music_detected": True,
+                        "hold_music_speech_ratio": hold_music_result.get("speech_ratio", 0.0),
+                        "latency_s": hold_music_result.get("detection_time", 0.0),
+                    }
+
             conv = _build_conv_transcribe_ultra_strict(local_path, language)
             out = run_voxtral_with_timeout(conv, max_new_tokens=min(max_new_tokens, 64), timeout=30)
             log("[HANDLER] Simple transcription completed")
@@ -3356,7 +3547,14 @@ try:
             load_diarizer()
 
         log("[INIT] Preload completed successfully")
-        
+
+    if ENABLE_HOLD_MUSIC_DETECTION:
+        log(f"[INIT] Hold music detection: ENABLED "
+            f"(hard={HOLD_MUSIC_SPEECH_RATIO_HARD}, soft={HOLD_MUSIC_SPEECH_RATIO_SOFT}, "
+            f"min_duration={HOLD_MUSIC_MIN_DURATION}s)")
+    else:
+        log("[INIT] Hold music detection: DISABLED")
+
 except Exception as e:
     log(f"[WARN] Preload failed - will load on first request: {e}")
     _processor = None
