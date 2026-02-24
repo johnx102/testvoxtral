@@ -1388,6 +1388,19 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
         log(f"[HOLD_MUSIC] Analysis: duration={duration:.1f}s, speech_ratio={speech_ratio:.4f}, "
             f"threshold={speech_threshold:.4f}, median_rms={median_rms:.4f}")
 
+        # Trouver le timestamp de début de parole (premier bloc continu de speech)
+        def _find_speech_start_sec() -> Optional[float]:
+            """Retourne le timestamp (en secondes) où la parole commence, avec une marge de 2s."""
+            # Chercher la première fenêtre de 0.5s avec au moins 30% de frames speech
+            window_frames = max(1, int(0.5 * sr / hop_length))
+            for i in range(0, total_frames - window_frames):
+                window = speech_mask[i:i + window_frames]
+                if np.mean(window) >= 0.3:
+                    # Début de parole trouvé - reculer de 2s pour marge
+                    start_sec = max(0.0, (i * hop_length / sr) - 2.0)
+                    return round(start_sec, 2)
+            return None
+
         # Vérification commune : parole concentrée à la fin (attente puis conversation)
         def _speech_at_end() -> bool:
             if speech_frames <= 0:
@@ -1396,15 +1409,18 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
             speech_in_last_quarter = int(np.sum(speech_mask[last_quarter_start:]))
             ratio_in_last_quarter = speech_in_last_quarter / speech_frames
             if ratio_in_last_quarter > 0.7:
-                log(f"[HOLD_MUSIC] Skip: speech concentrated at end ({ratio_in_last_quarter:.2f})")
+                log(f"[HOLD_MUSIC] Speech concentrated at end ({ratio_in_last_quarter:.2f})")
                 return True
             return False
 
         # Seuil dur : en dessous = musique d'attente certaine
         if speech_ratio < HOLD_MUSIC_SPEECH_RATIO_HARD:
             if _speech_at_end():
+                speech_start = _find_speech_start_sec()
                 result["reason"] = "speech_concentrated_at_end"
+                result["speech_start_sec"] = speech_start
                 result["detection_time"] = round(time.time() - t0, 3)
+                log(f"[HOLD_MUSIC] Not hold music, speech starts at {speech_start}s")
                 return result
 
             result["is_hold_music"] = True
@@ -1416,8 +1432,11 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
         # Seuil souple : ratio bas + durée longue = probable musique d'attente
         if speech_ratio < HOLD_MUSIC_SPEECH_RATIO_SOFT and duration > 60.0:
             if _speech_at_end():
+                speech_start = _find_speech_start_sec()
                 result["reason"] = "speech_concentrated_at_end"
+                result["speech_start_sec"] = speech_start
                 result["detection_time"] = round(time.time() - t0, 3)
+                log(f"[HOLD_MUSIC] Not hold music, speech starts at {speech_start}s")
                 return result
 
             result["is_hold_music"] = True
@@ -1426,6 +1445,17 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
             result["detection_time"] = round(time.time() - t0, 3)
             log(f"[HOLD_MUSIC] Detected: {result['reason']}")
             return result
+
+        # Même au-dessus des seuils : si le ratio est bas et la parole est à la fin,
+        # calculer speech_start_sec pour permettre le trim de la musique d'attente initiale
+        if speech_ratio < 0.20 and duration > 60.0 and _speech_at_end():
+            speech_start = _find_speech_start_sec()
+            if speech_start and speech_start > 10.0:
+                result["reason"] = "speech_after_hold_music"
+                result["speech_start_sec"] = speech_start
+                result["detection_time"] = round(time.time() - t0, 3)
+                log(f"[HOLD_MUSIC] Not hold music but long intro detected, speech starts at {speech_start}s")
+                return result
 
         result["reason"] = "normal_speech"
         result["detection_time"] = round(time.time() - t0, 3)
@@ -3410,6 +3440,24 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     out = build_hold_music_response(hold_music_result, with_summary)
                     return {"task": "transcribe_diarized", **out}
 
+                # Trimmer la musique d'attente initiale si parole concentrée à la fin
+                speech_start = hold_music_result.get("speech_start_sec")
+                if speech_start and speech_start > 10.0:
+                    try:
+                        audio = AudioSegment.from_file(local_path)
+                        trimmed = audio[int(speech_start * 1000):]
+                        trimmed_path = local_path.rsplit(".", 1)[0] + "_trimmed.wav"
+                        trimmed.export(trimmed_path, format="wav")
+                        log(f"[HANDLER] Trimmed {speech_start:.1f}s of hold music, "
+                            f"{len(audio)/1000:.1f}s → {len(trimmed)/1000:.1f}s")
+                        # Remplacer le chemin pour tout le pipeline
+                        if cleanup:
+                            os.remove(local_path)
+                        local_path = trimmed_path
+                        cleanup = True
+                    except Exception as e:
+                        log(f"[HANDLER] Trim failed, using original: {e}")
+
             # NOUVEAU : Détection précoce du type de contenu (si activée)
             if ENABLE_SINGLE_VOICE_DETECTION:
                 content_type = detect_single_voice_content(local_path, language)
@@ -3470,6 +3518,23 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         "latency_s": hold_music_result.get("detection_time", 0.0),
                     }
 
+                # Trimmer la musique d'attente initiale si parole concentrée à la fin
+                speech_start = hold_music_result.get("speech_start_sec")
+                if speech_start and speech_start > 10.0:
+                    try:
+                        audio = AudioSegment.from_file(local_path)
+                        trimmed = audio[int(speech_start * 1000):]
+                        trimmed_path = local_path.rsplit(".", 1)[0] + "_trimmed.wav"
+                        trimmed.export(trimmed_path, format="wav")
+                        log(f"[HANDLER] Trimmed {speech_start:.1f}s of hold music, "
+                            f"{len(audio)/1000:.1f}s → {len(trimmed)/1000:.1f}s")
+                        if cleanup:
+                            os.remove(local_path)
+                        local_path = trimmed_path
+                        cleanup = True
+                    except Exception as e:
+                        log(f"[HANDLER] Trim failed, using original: {e}")
+
             try:
                 temp_result = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, False)
                 if "error" in temp_result:
@@ -3511,6 +3576,23 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                         "hold_music_speech_ratio": hold_music_result.get("speech_ratio", 0.0),
                         "latency_s": hold_music_result.get("detection_time", 0.0),
                     }
+
+                # Trimmer la musique d'attente initiale si parole concentrée à la fin
+                speech_start = hold_music_result.get("speech_start_sec")
+                if speech_start and speech_start > 10.0:
+                    try:
+                        audio = AudioSegment.from_file(local_path)
+                        trimmed = audio[int(speech_start * 1000):]
+                        trimmed_path = local_path.rsplit(".", 1)[0] + "_trimmed.wav"
+                        trimmed.export(trimmed_path, format="wav")
+                        log(f"[HANDLER] Trimmed {speech_start:.1f}s of hold music, "
+                            f"{len(audio)/1000:.1f}s → {len(trimmed)/1000:.1f}s")
+                        if cleanup:
+                            os.remove(local_path)
+                        local_path = trimmed_path
+                        cleanup = True
+                    except Exception as e:
+                        log(f"[HANDLER] Trim failed, using original: {e}")
 
             conv = _build_conv_transcribe_ultra_strict(local_path, language)
             out = run_voxtral_with_timeout(conv, max_new_tokens=min(max_new_tokens, 64), timeout=30)
