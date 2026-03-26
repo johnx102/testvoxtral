@@ -191,17 +191,55 @@ def load_voxtral():
         raise
 
     # MÉMOIRE GPU OPTIMISÉE pour Small 24B
-    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
-    log(f"[INIT] Using dtype: {dtype}")
-    
+    # ── Quantization pendant le chargement via bitsandbytes (recommandé) ──────────────
+    # QUANT_MODE=bnb4  → INT4 bitsandbytes  : ~12-14 GB VRAM, tout sur GPU  ✅
+    # QUANT_MODE=bnb8  → INT8 bitsandbytes  : ~24 GB VRAM, légèrement plus précis
+    # QUANT_MODE=none  → bfloat16 original  : ~48 GB VRAM (nécessite A100)
+    #
+    # Avantage clé vs torchao : la quantization se fait PENDANT le from_pretrained,
+    # donc le modèle ne déborde jamais sur le CPU — tout reste sur GPU dès le départ.
+
     mdl_kwargs = {
-        "dtype": dtype,
         "device_map": "auto",
         "low_cpu_mem_usage": True,
         "trust_remote_code": True,
     }
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
+
+    if QUANT_MODE in ("bnb4", "torchao") and torch.cuda.is_available():
+        # torchao est un alias vers bnb4 (fallback robuste)
+        try:
+            from transformers import BitsAndBytesConfig
+            log("[INIT] Configuring bitsandbytes INT4 quantization...")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,   # double quant = -0.5 GB supplémentaire
+                bnb_4bit_quant_type="nf4",        # nf4 = meilleure qualité pour LLM
+            )
+            mdl_kwargs["quantization_config"] = bnb_config
+            log("[INIT] INT4 BnB config ready — model will load directly in 12-14 GB")
+        except ImportError:
+            log("[WARN] bitsandbytes not installed — falling back to bfloat16")
+            dtype = torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
+            mdl_kwargs["dtype"] = dtype
+    elif QUANT_MODE == "bnb8" and torch.cuda.is_available():
+        try:
+            from transformers import BitsAndBytesConfig
+            log("[INIT] Configuring bitsandbytes INT8 quantization...")
+            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+            mdl_kwargs["quantization_config"] = bnb_config
+            log("[INIT] INT8 BnB config ready — model will load in ~24 GB")
+        except ImportError:
+            log("[WARN] bitsandbytes not installed — falling back to bfloat16")
+            dtype = torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
+            mdl_kwargs["dtype"] = dtype
+    else:
+        # Mode bfloat16 original
+        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
+        mdl_kwargs["dtype"] = dtype
+        log(f"[INIT] Using dtype: {dtype} (no quantization)")
 
     try:
         log(f"[INIT] Loading model... (this may take several minutes) [QUANT_MODE={QUANT_MODE}]")
@@ -213,20 +251,6 @@ def load_voxtral():
     except Exception as e:
         log(f"[ERROR] Failed to load model: {e}")
         raise
-
-    # ── Quantization torchao INT4 (post-chargement, aucun modèle pré-quantizé requis) ──
-    # Réduit la VRAM de ~48 GB (bfloat16) à ~12-14 GB (INT4).
-    # Sur un modèle 24B, la perte de qualité sur la transcription/résumé est négligeable.
-    if QUANT_MODE == "torchao" and torch.cuda.is_available():
-        try:
-            from torchao.quantization import quantize_, int4_weight_only
-            log("[INIT] Applying torchao INT4 quantization (this may take ~1-2 min)...")
-            quantize_(_model, int4_weight_only())
-            log("[INIT] torchao INT4 done — VRAM usage should now be ~12-14 GB")
-        except ImportError:
-            log("[WARN] torchao not installed — falling back to bfloat16. Add 'torchao>=0.9.0' to requirements.txt")
-        except Exception as e:
-            log(f"[WARN] torchao quantization failed ({e}) — continuing in bfloat16")
 
     try:
         p = next(_model.parameters())
