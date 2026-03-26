@@ -57,7 +57,7 @@ einops>=0.6.0
 # RUNPOD
 # -----------------------------------------------------------------------------
 runpod>=1.6.0,<2.0.0
-torchao>=0.9.0
+torchao=0.9.0
 # -----------------------------------------------------------------------------
 # OPTIONNEL - WhisperX (décommenter si nécessaire)
 # Alternative à Voxtral pour éviter les bugs de répétition
