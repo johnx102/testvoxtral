@@ -995,8 +995,13 @@ def detect_and_fix_speaker_inversion(segments: List[Dict[str, Any]]) -> List[Dic
     llm_verify_and_fix_attributions(segments)
     return segments
 
-def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
-    log(f"[VOXTRAL_ID] Starting speaker identification: language={language}")
+def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool, call_direction: str = "unknown"):
+    """
+    call_direction : "inbound"  → client appelle, agent décroche en premier
+                     "outbound" → agent appelle, client décroche en premier
+                     "unknown"  → Voxtral décide sur le contenu sémantique uniquement
+    """
+    log(f"[VOXTRAL_ID] Starting speaker identification: language={language}, direction={call_direction}")
     ok, err, est_dur = _validate_audio(wav_path)
     if not ok:
         return {"error": err}
@@ -1016,49 +1021,62 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
 
     log(f"[VOXTRAL_ID] Audio: {est_dur:.1f}s → tokens={speaker_tokens}, timeout={infer_timeout}s")
 
-    # ── Prompt ───────────────────────────────────────────────────────────────
+    # ── Prompt adapté selon la direction de l'appel ──────────────────────────
+    # La règle "premier à parler = Agent" est fausse sur les appels sortants
+    # et aléatoire sur les entrants. On utilise uniquement le contenu sémantique,
+    # sauf quand la direction est connue (inbound/outbound).
+    if call_direction == "inbound":
+        direction_context = (
+            "CONTEXTE : Appel ENTRANT — le CLIENT a appelé le cabinet.\n"
+            "L'AGENT est celui qui gère le cabinet et a répondu à cet appel.\n"
+            "Le CLIENT est celui qui a appelé pour obtenir quelque chose.\n\n"
+        )
+    elif call_direction == "outbound":
+        direction_context = (
+            "CONTEXTE : Appel SORTANT — l'AGENT a appelé le client.\n"
+            "L'AGENT est celui qui travaille au cabinet et a passé cet appel.\n"
+            "Le CLIENT est la personne qui a été appelée.\n\n"
+        )
+    else:
+        direction_context = (
+            "CONTEXTE : Direction de l'appel inconnue.\n"
+            "Identifie Agent et Client UNIQUEMENT sur ce qu'ils disent, "
+            "pas sur l'ordre de parole.\n\n"
+        )
+
     instruction = (
         f"lang:{language or 'fr'} "
-        "Tu transcris un appel téléphonique professionnel entrant. "
+        "Tu transcris un appel téléphonique professionnel. "
         "Il y a exactement deux interlocuteurs : l'Agent et le Client.\n\n"
 
-        "RÈGLE N°1 — IDENTIFICATION DES RÔLES :\n"
-        "La toute première personne qui parle (qui décroche, dit 'bonjour', nomme le cabinet) "
-        "est TOUJOURS l'Agent. L'autre est le Client.\n\n"
+        + direction_context +
 
-        "AGENT = secrétariat / cabinet / service qui REÇOIT l'appel :\n"
-        "• Répond en premier : 'Bonjour, cabinet [nom]', 'Bonjour, [service]'\n"
-        "• Gère l'agenda : 'je vais regarder', 'j'ai de la place le...', 'je vous propose'\n"
-        "• Prend note : 'je note', 'c'est noté', 'votre nom ?', 'votre numéro ?'\n"
-        "• Formules pro : 'ne quittez pas', 'je vous mets en attente', 'de la part de qui'\n"
-        "• Confirme : 'entendu', 'parfait', 'c'est bien noté', 'à lundi donc'\n\n"
+        "COMMENT IDENTIFIER L'AGENT (secrétariat / cabinet / professionnel de santé) :\n"
+        "• Nomme le cabinet ou service : 'cabinet dentaire Dupont', 'docteur Martin', 'centre médical'\n"
+        "• Gère l'agenda : 'j'ai de la place le...', 'je vous propose le...', 'je note', 'c'est noté'\n"
+        "• Questions pro : 'c'est de la part de qui ?', 'votre date de naissance ?', 'votre numéro ?'\n"
+        "• Formules pro : 'ne quittez pas', 'je vais regarder', 'je vous rappelle', 'bonne journée'\n"
+        "• Confirme : 'entendu', 'c'est bien noté', 'à lundi donc', 'rendez-vous confirmé'\n\n"
 
-        "CLIENT = personne qui APPELLE pour obtenir quelque chose :\n"
-        "• Motif d'appel : 'je vous appelle pour', 'je voudrais', 'est-ce possible', 'j'aurais besoin'\n"
-        "• Demande RDV : 'prendre un rendez-vous', 'annuler', 'reporter', 'confirmer'\n"
-        "• Donne infos : son nom, date de naissance, numéro, adresse\n"
+        "COMMENT IDENTIFIER LE CLIENT (patient / appelant / particulier) :\n"
+        "• Expose un besoin : 'je vous appelle pour', 'je voudrais', 'j'aurais besoin', 'c'est possible ?'\n"
+        "• Demande ou modifie un RDV : 'prendre rendez-vous', 'annuler', 'reporter', 'confirmer'\n"
+        "• Donne ses infos personnelles : son nom, date de naissance, numéro de téléphone, adresse\n"
         "• Parle de proches : 'ma femme', 'mon mari', 'mon fils', 'ma fille', 'mon enfant'\n"
-        "• Répond aux questions : 'oui', 'non', 'c'est ça', 'exact', 'plutôt le matin'\n\n"
+        "• Décrit un problème médical : 'j'ai mal', 'ça fait X jours', 'j'ai un souci avec'\n\n"
 
-        "RÈGLE N°2 — FORMAT DE SORTIE :\n"
-        "Chaque prise de parole sur une NOUVELLE ligne, préfixée par Agent: ou Client:\n\n"
-        "Agent: Bonjour, cabinet dentaire, j'écoute.\n"
-        "Client: Bonjour, je voudrais prendre rendez-vous.\n"
-        "Agent: Bien sûr, c'est pour quel soin ?\n"
-        "Client: Un détartrage.\n"
-        "Agent: D'accord, vous êtes disponible quand ?\n\n"
+        "FORMAT OBLIGATOIRE — une ligne par prise de parole :\n"
+        "Agent: Bonjour, cabinet dentaire Dupont, j'écoute.\n"
+        "Client: Bonjour, je voudrais prendre rendez-vous pour un détartrage.\n"
+        "Agent: Bien sûr, vous êtes disponible quand ?\n"
+        "Client: La semaine prochaine si possible.\n\n"
 
-        "RÈGLE N°3 — QUALITÉ DE TRANSCRIPTION :\n"
-        "• Transcris MOT POUR MOT tout ce qui est dit, sans paraphraser\n"
+        "RÈGLES STRICTES :\n"
+        "• Identifie les rôles sur CE QUE LES GENS DISENT, pas sur l'ordre de parole\n"
         "• Une seule prise de parole par ligne — ne fusionne JAMAIS deux voix\n"
-        "• Si quelqu'un parle longtemps sans interruption → une seule ligne Agent: ou Client:\n"
-        "• Conserve les hésitations naturelles : 'euh', 'bah', 'alors', 'donc'\n\n"
-
-        "RÈGLE N°4 — CE QU'IL NE FAUT PAS FAIRE :\n"
-        "• N'écris JAMAIS [Musique] [Silence] [Attente] [Sonnerie] [Pause]\n"
-        "• N'invente RIEN — si tu n'entends pas clairement, transcris ce que tu peux\n"
-        "• Ne résume pas, ne paraphrase pas, ne corrige pas les fautes de langage\n"
-        "• Ne mets pas de numéros de ligne, de timestamps ni de commentaires"
+        "• Transcris MOT POUR MOT, sans paraphraser ni corriger\n"
+        "• Conserve les hésitations : 'euh', 'bah', 'alors', 'donc'\n"
+        "• N'écris JAMAIS [Musique] [Silence] [Attente] [Sonnerie] [Pause]"
     )
 
     conv = [{"role": "user", "content": [
@@ -1178,7 +1196,22 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     language     = inp.get("language") or None
     max_new_tokens = int(inp.get("max_new_tokens", MAX_NEW_TOKENS))
     with_summary   = bool(inp.get("with_summary", WITH_SUMMARY_DEFAULT))
-    log(f"[HANDLER] Task: {task}, language: {language}, max_tokens: {max_new_tokens}, summary: {with_summary}")
+
+    # ── Détection direction de l'appel ───────────────────────────────────────
+    # Priorité 1 : paramètre explicite dans le payload
+    # Priorité 2 : préfixe in-/out- dans le nom de fichier de l'URL
+    # Fallback   : unknown (Voxtral décide sur le contenu sémantique)
+    call_direction = (inp.get("call_direction") or "").lower().strip()
+    if call_direction not in ("inbound", "outbound"):
+        audio_url = inp.get("audio_url") or inp.get("file_path") or ""
+        filename  = audio_url.split("/")[-1].lower()
+        if filename.startswith("in-") or filename.startswith("in_"):
+            call_direction = "inbound"
+        elif filename.startswith("out-") or filename.startswith("out_"):
+            call_direction = "outbound"
+        else:
+            call_direction = "unknown"
+    log(f"[HANDLER] Task: {task}, language: {language}, direction: {call_direction}, max_tokens: {max_new_tokens}, summary: {with_summary}")
 
     local_path, cleanup = None, False
     try:
@@ -1231,7 +1264,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # ── Pipeline principal : Voxtral Speaker ID ───────────────────────────
         log("[HANDLER] Using Voxtral Speaker Identification mode")
-        out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary)
+        out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary, call_direction)
         if "error" in out:
             log(f"[HANDLER] Error: {out['error']}")
             return out
