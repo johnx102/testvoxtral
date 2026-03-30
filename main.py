@@ -99,6 +99,41 @@ _model     = None
 def _device_str() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
+def _normalize_audio(path: str) -> str:
+    """
+    Normalise l'audio pour Voxtral :
+    - Resample 8kHz → 16kHz (téléphonie Asterisk standard)
+    - Convertit en mono si stéréo
+    - Normalise le volume (évite les audios trop faibles)
+    Retourne le chemin du fichier normalisé (ou l'original si déjà OK).
+    """
+    try:
+        audio = AudioSegment.from_file(path)
+        needs_change = False
+
+        if audio.frame_rate < 16000:
+            audio = audio.set_frame_rate(16000)
+            needs_change = True
+        if audio.channels > 1:
+            audio = audio.set_channels(1)
+            needs_change = True
+
+        if not needs_change:
+            return path  # déjà bon, pas de conversion inutile
+
+        out_path = path.rsplit(".", 1)[0] + "_16k.wav"
+        audio.export(out_path, format="wav")
+        log(f"[AUDIO] Normalized: {audio.frame_rate}Hz mono → {out_path}")
+        # Supprimer l'original si c'est un fichier temporaire
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return out_path
+    except Exception as e:
+        log(f"[AUDIO] Normalization failed ({e}), using original")
+        return path
+
 def _download_to_tmp(url: str) -> str:
     resp = requests.get(url, timeout=120, stream=True)
     resp.raise_for_status()
@@ -107,14 +142,14 @@ def _download_to_tmp(url: str) -> str:
         for chunk in resp.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 f.write(chunk)
-    return path
+    return _normalize_audio(path)
 
 def _b64_to_tmp(b64: str) -> str:
     raw = base64.b64decode(b64)
     path = os.path.join(tempfile.gettempdir(), f"audio_{uuid.uuid4().hex}.wav")
     with open(path, "wb") as f:
         f.write(raw)
-    return path
+    return _normalize_audio(path)
 
 def _validate_audio(path: str) -> Tuple[bool, str, float]:
     """Valide le fichier audio avant toute inférence. Retourne (ok, error_msg, duration_s)."""
@@ -779,31 +814,53 @@ def transcribe_single_voice_content(wav_path: str, language: Optional[str], max_
     ok, err, est_dur = _validate_audio(wav_path)
     if not ok:
         return {"error": err}
-    conv     = [{"role": "user", "content": [
+    conv = [{"role": "user", "content": [
         {"type": "audio", "path": wav_path},
         {"type": "text", "text": f"lang:{language or 'fr'} [TRANSCRIBE] Écris exactement ce qui est dit, mot pour mot."}
     ]}]
-    out      = run_voxtral_with_timeout(conv, max_new_tokens=max_new_tokens, timeout=60)
+    out       = run_voxtral_with_timeout(conv, max_new_tokens=max_new_tokens, timeout=60)
     full_text = (out.get("text") or "").strip()
     if not full_text:
         return {"error": "Empty transcription for single voice content"}
-    segments = [{"speaker": "System", "start": 0.0, "end": est_dur, "text": full_text, "mood": None}]
-    full_transcript = f"System: {full_text}"
-    result = {"segments": segments, "transcript": full_transcript}
+
+    # ── Détection d'une vraie conversation dans le transcript ────────────────
+    # Cas typique : appel sortant → répondeur → puis la personne rappelle ou décroche
+    # Si le texte contient des échanges typiques d'une vraie conversation,
+    # on repasse en diarization complète au lieu de garder "System"
+    conversation_markers = [
+        "allô ?", "allo ?", "oui, bonjour", "bonjour,", "c'est noté",
+        "pas de souci", "à tout à l'heure", "au revoir", "je vous remercie",
+        "d'accord", "pas de problème", "merci beaucoup"
+    ]
+    text_lower   = full_text.lower()
+    marker_count = sum(1 for m in conversation_markers if m in text_lower)
+
+    # Si on détecte 3+ marqueurs de vraie conversation → diarization complète
+    if marker_count >= 3:
+        log(f"[SINGLE_VOICE] Detected real conversation within voicemail ({marker_count} markers) → switching to full diarization")
+        return None  # Signal au caller de basculer en mode diarization
+
+    # Vraie voix unique (annonce/IVR/répondeur sans réponse)
+    # On utilise "Agent" au lieu de "System" pour compatibilité interface
+    segments        = [{"speaker": "Agent", "start": 0.0, "end": est_dur, "text": full_text, "mood": None}]
+    full_transcript = f"Agent: {full_text}"
+    result          = {"segments": segments, "transcript": full_transcript}
+
     if with_summary:
         summary_conv = [{"role": "user", "content": [{"type": "text", "text":
-            f"lang:{language or 'fr'} Résume cette annonce automatique en 1-2 phrases claires.\n\nContenu: {full_text}"
+            f"lang:{language or 'fr'} Résume ce message vocal ou cette annonce en 1-2 phrases claires.\n\nContenu: {full_text}"
         }]}]
         try:
             sr = run_voxtral_with_timeout(summary_conv, max_new_tokens=SINGLE_VOICE_SUMMARY_TOKENS, timeout=20)
             result["summary"] = (sr.get("text") or "").strip()
         except Exception:
-            result["summary"] = f"Annonce automatique: {full_text[:100]}..."
+            result["summary"] = f"Message vocal: {full_text[:150]}..."
+
     if ENABLE_SENTIMENT:
         neutral = {"label_en": "neutral", "label_fr": "neutre", "confidence": 0.95,
                    "scores": {"negative": 0.0, "neutral": 0.95, "positive": 0.05}}
         result["mood_overall"]    = neutral
-        result["mood_by_speaker"] = {"System": neutral}
+        result["mood_by_speaker"] = {"Agent": neutral}
         result["mood_client"]     = neutral
     return result
 
@@ -1256,11 +1313,14 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         if ENABLE_SINGLE_VOICE_DETECTION:
             content_type = detect_single_voice_content(local_path, language)
             if content_type["type"] in ("announcement", "voicemail"):
-                log(f"[HANDLER] Detected {content_type['type']}, using single voice mode")
+                log(f"[HANDLER] Detected {content_type['type']}, trying single voice mode...")
                 out = transcribe_single_voice_content(local_path, language, max_new_tokens, with_summary)
-                if "error" in out:
-                    return out
-                return {"task": task, **out}
+                if out is None:
+                    # Vraie conversation détectée dans le répondeur → diarization complète
+                    log("[HANDLER] Real conversation found in voicemail → switching to full diarization")
+                elif "error" not in out:
+                    return {"task": task, **out}
+                # Si out est None ou erreur → on continue vers la diarization normale
 
         # ── Pipeline principal : Voxtral Speaker ID ───────────────────────────
         log("[HANDLER] Using Voxtral Speaker Identification mode")
