@@ -1,62 +1,55 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# =============================================================================
+# Voxtral Serverless Worker — RunPod
+# Pipeline : Transcription + Diarization + Résumé + Humeur
+# Mode     : Voxtral Speaker ID (1 seul appel, pas de PyAnnote)
+# Quant    : bitsandbytes INT4 (~12-14 GB VRAM)
+# =============================================================================
 
-import os, time, base64, tempfile, uuid, requests, json, traceback, re, gc
+import os, time, base64, tempfile, uuid, requests, traceback, re, gc
 from typing import Optional, List, Dict, Any, Tuple
 
 import torch
-print(f"[STARTUP] PyTorch {torch.__version__}")
 
 # =============================================================================
-# DIAGNOSTIC GPU/CUDA AU DÉMARRAGE - CRITIQUE POUR DEBUG
+# DIAGNOSTIC GPU/CUDA AU DÉMARRAGE
 # =============================================================================
 print("=" * 70)
-print("[STARTUP] PyTorch & CUDA Diagnostic")
-print(f"[STARTUP] torch version: {torch.__version__}")
+print(f"[STARTUP] PyTorch {torch.__version__}")
 print(f"[STARTUP] CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"[STARTUP] CUDA version: {torch.version.cuda}")
     print(f"[STARTUP] cuDNN version: {torch.backends.cudnn.version()}")
-    print(f"[STARTUP] GPU count: {torch.cuda.device_count()}")
     for i in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(i)
-        print(f"[STARTUP] GPU {i}: {props.name}")
-        print(f"[STARTUP]   - Compute capability: {props.major}.{props.minor} (sm_{props.major}{props.minor})")
-        print(f"[STARTUP]   - Total memory: {props.total_memory / 1e9:.1f} GB")
-    # Test rapide CUDA
+        print(f"[STARTUP] GPU {i}: {props.name} — {props.total_memory / 1e9:.1f} GB")
     try:
-        test_tensor = torch.zeros(1).cuda()
-        print(f"[STARTUP] CUDA test: OK (tensor on {test_tensor.device})")
-        del test_tensor
+        t = torch.zeros(1).cuda()
+        print(f"[STARTUP] CUDA test: OK ({t.device})")
+        del t
     except Exception as e:
-        print(f"[STARTUP] CUDA test: FAILED - {e}")
+        print(f"[STARTUP] CUDA test: FAILED — {e}")
 else:
     print("[STARTUP] WARNING: CUDA not available, running on CPU!")
 print("=" * 70)
-# =============================================================================
 
-from transformers import (
-    AutoProcessor, AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline,
-    pipeline as hf_pipeline
-)
+from transformers import AutoProcessor
 
-# Voxtral - Requires transformers >= 4.54.0 and mistral-common[audio] >= 1.8.1
 try:
-    from transformers import VoxtralForConditionalGeneration  # type: ignore
+    from transformers import VoxtralForConditionalGeneration
     _HAS_VOXTRAL_CLASS = True
 except Exception as e:
     print(f"[ERROR] VoxtralForConditionalGeneration not found: {e}")
-    print(f"[ERROR] Make sure you have: transformers>=4.54.0 and mistral-common[audio]>=1.8.1")
-    from transformers import AutoModel  # type: ignore
-    VoxtralForConditionalGeneration = AutoModel  # type: ignore
-    _HAS_VOXTRAL_CLASS = True  # Use AutoModel as fallback
+    from transformers import AutoModel
+    VoxtralForConditionalGeneration = AutoModel
+    _HAS_VOXTRAL_CLASS = True
 
 from pydub import AudioSegment
-from pyannote.audio import Pipeline
 import runpod
 
 # ---------------------------
-# Logging minimal
+# Logging
 # ---------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 def log(msg: str):
@@ -64,70 +57,45 @@ def log(msg: str):
         print(msg, flush=True)
 
 # ---------------------------
-# Env / Config - MODE HYBRIDE ULTRA-RAPIDE
+# Configuration
 # ---------------------------
-APP_VERSION = os.environ.get("APP_VERSION", "ultra-fast-hybrid-v1.0")
-
-MODEL_ID = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip()
-HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "664"))       
-MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "3600"))  # 1 heure max      
-DIAR_MODEL = os.environ.get("DIAR_MODEL", "pyannote/speaker-diarization-3.1").strip()
+APP_VERSION        = os.environ.get("APP_VERSION", "voxtral-clean-v3.0")
+MODEL_ID           = os.environ.get("MODEL_ID", "mistralai/Voxtral-Small-24B-2507").strip()
+HF_TOKEN           = os.environ.get("HF_TOKEN", "").strip()
+MAX_NEW_TOKENS     = int(os.environ.get("MAX_NEW_TOKENS", "664"))
+MAX_DURATION_S     = int(os.environ.get("MAX_DURATION_S", "3600"))
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
-# Sentiment - NOUVEAU : Analyse par Voxtral
-ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
+# Sentiment
+ENABLE_SENTIMENT   = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
 
-# Détection des annonces/IVR - NOUVEAU
-ENABLE_SINGLE_VOICE_DETECTION = os.environ.get("ENABLE_SINGLE_VOICE_DETECTION", "1") == "1"
+# Détection voix unique (annonces/IVR/messagerie)
+ENABLE_SINGLE_VOICE_DETECTION  = os.environ.get("ENABLE_SINGLE_VOICE_DETECTION", "1") == "1"
 SINGLE_VOICE_DETECTION_TIMEOUT = int(os.environ.get("SINGLE_VOICE_DETECTION_TIMEOUT", "30"))
-SINGLE_VOICE_SUMMARY_TOKENS = int(os.environ.get("SINGLE_VOICE_SUMMARY_TOKENS", "48"))
+SINGLE_VOICE_SUMMARY_TOKENS    = int(os.environ.get("SINGLE_VOICE_SUMMARY_TOKENS", "48"))
 
-# Détection musique d'attente (pré-inférence, via librosa)
-ENABLE_HOLD_MUSIC_DETECTION = os.environ.get("ENABLE_HOLD_MUSIC_DETECTION", "1") == "1"
-HOLD_MUSIC_SPEECH_RATIO_HARD = float(os.environ.get("HOLD_MUSIC_SPEECH_RATIO_HARD", "0.03"))
-HOLD_MUSIC_SPEECH_RATIO_SOFT = float(os.environ.get("HOLD_MUSIC_SPEECH_RATIO_SOFT", "0.08"))
-HOLD_MUSIC_MIN_DURATION = float(os.environ.get("HOLD_MUSIC_MIN_DURATION", "30.0"))
+# Détection musique d'attente
+ENABLE_HOLD_MUSIC_DETECTION    = os.environ.get("ENABLE_HOLD_MUSIC_DETECTION", "1") == "1"
+HOLD_MUSIC_SPEECH_RATIO_HARD   = float(os.environ.get("HOLD_MUSIC_SPEECH_RATIO_HARD", "0.03"))
+HOLD_MUSIC_SPEECH_RATIO_SOFT   = float(os.environ.get("HOLD_MUSIC_SPEECH_RATIO_SOFT", "0.08"))
+HOLD_MUSIC_MIN_DURATION        = float(os.environ.get("HOLD_MUSIC_MIN_DURATION", "30.0"))
 
-# Diarization - MODES AVANCÉS
-MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "2"))
-EXACT_TWO = os.environ.get("EXACT_TWO", "1") == "1"
-MIN_SEG_DUR = float(os.environ.get("MIN_SEG_DUR", "5.0"))
-MIN_SPEAKER_TIME = float(os.environ.get("MIN_SPEAKER_TIME", "8.0"))
-MERGE_CONSECUTIVE = os.environ.get("MERGE_CONSECUTIVE", "1") == "1"
-HYBRID_MODE = os.environ.get("HYBRID_MODE", "1") == "1"
-AGGRESSIVE_MERGE = os.environ.get("AGGRESSIVE_MERGE", "1") == "1"
-VOXTRAL_SPEAKER_ID = os.environ.get("VOXTRAL_SPEAKER_ID", "1") == "1"  # NOUVEAU : Speaker ID par Voxtral
-PYANNOTE_AUTO = os.environ.get("PYANNOTE_AUTO", "0") == "1"  # NOUVEAU : PyAnnote auto pur
-DETECT_GLOBAL_SWAP = os.environ.get("DETECT_GLOBAL_SWAP", "0") == "1"  # NOUVEAU : Détection inversion globale Agent/Client
-
-# Transcription & résumé
-STRICT_TRANSCRIPTION = os.environ.get("STRICT_TRANSCRIPTION", "1") == "1"
-SMART_SUMMARY = os.environ.get("SMART_SUMMARY", "1") == "1"  
-EXTRACTIVE_SUMMARY = os.environ.get("EXTRACTIVE_SUMMARY", "0") == "1"
-
-# Libellés des rôles (après mapping)
+# Rôles speakers
 ROLE_LABELS = [r.strip() for r in os.environ.get("ROLE_LABELS", "Agent,Client").split(",") if r.strip()]
 
-# ---------------------------
-# Quantization torchao INT4
-# ---------------------------
-# "torchao" : INT4 PyTorch natif — pas de modèle pré-quantizé requis,
-#             réduit la VRAM de ~48 GB à ~12-14 GB, +30-40 % de vitesse
-# "none"    : comportement original bfloat16 (requiert A100 80 GB)
+# Relecture LLM des attributions (désactivé par défaut — Voxtral se trompe parfois)
+DETECT_GLOBAL_SWAP = os.environ.get("DETECT_GLOBAL_SWAP", "0") == "1"
+
+# Quantization : "torchao" = bitsandbytes INT4 (12-14 GB VRAM), "none" = bfloat16 (48 GB)
 QUANT_MODE = os.environ.get("QUANT_MODE", "torchao").lower()
 
 # Globals
 _processor = None
-_model = None
-_diarizer = None
-_sentiment_clf = None
-_sentiment_zero_shot = None
-_alignment_model = None
-_alignment_tokenizer = None
-# ---------------------------
-# Helpers généraux
-# ---------------------------
+_model     = None
+
+# =============================================================================
+# HELPERS
+# =============================================================================
 def _device_str() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -148,129 +116,111 @@ def _b64_to_tmp(b64: str) -> str:
         f.write(raw)
     return path
 
+def _validate_audio(path: str) -> Tuple[bool, str, float]:
+    """Valide le fichier audio avant toute inférence. Retourne (ok, error_msg, duration_s)."""
+    try:
+        import soundfile as sf
+        info = sf.info(path)
+        duration = info.frames / float(info.samplerate or 1)
+        if duration < 0.5:
+            return False, f"Audio trop court ({duration:.2f}s)", duration
+        if duration > MAX_DURATION_S:
+            return False, f"Audio trop long ({duration:.1f}s > {MAX_DURATION_S}s)", duration
+        return True, "", duration
+    except Exception as e:
+        return False, f"Format audio non reconnu: {e}", 0.0
+
 def check_gpu_memory():
-    """Vérifier la mémoire GPU disponible"""
     if torch.cuda.is_available():
-        total = torch.cuda.get_device_properties(0).total_memory / 1e9  # GB
-        allocated = torch.cuda.memory_allocated(0) / 1e9
-        cached = torch.cuda.memory_reserved(0) / 1e9
-        free = total - cached
-        
-        log(f"[GPU] Total: {total:.1f}GB | Allocated: {allocated:.1f}GB | Cached: {cached:.1f}GB | Free: {free:.1f}GB")
-        
-        # En mode torchao INT4, Voxtral-24B tient en ~12-14 GB
-        min_vram = 12 if QUANT_MODE == "torchao" else 45
+        total     = torch.cuda.get_device_properties(0).total_memory / 1e9
+        cached    = torch.cuda.memory_reserved(0) / 1e9
+        free      = total - cached
+        min_vram  = 12 if QUANT_MODE != "none" else 45
+        log(f"[GPU] Total: {total:.1f}GB | Cached: {cached:.1f}GB | Free: {free:.1f}GB")
         if total < min_vram:
-            log(f"[ERROR] GPU has only {total:.1f}GB - minimum {min_vram}GB required (QUANT_MODE={QUANT_MODE})")
+            log(f"[ERROR] GPU {total:.1f}GB < minimum {min_vram}GB (QUANT_MODE={QUANT_MODE})")
             return False
-        elif free < 5:
-            log(f"[WARN] Only {free:.1f}GB free - might cause OOM")
-            
+        if free < 5:
+            log(f"[WARN] Only {free:.1f}GB free — OOM risk")
         return True
     return False
 
-# ---------------------------
-# Voxtral - OPTIMISÉ POUR SMALL
-# ---------------------------
+def _gpu_clear():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+# =============================================================================
+# CHARGEMENT VOXTRAL — bitsandbytes INT4
+# =============================================================================
 def load_voxtral():
     global _processor, _model
     if _processor is not None and _model is not None:
         return _processor, _model
 
-    log(f"[INIT] Loading Voxtral: {MODEL_ID}")
+    log(f"[INIT] Loading Voxtral: {MODEL_ID} [QUANT_MODE={QUANT_MODE}]")
 
-    try:
-        proc_kwargs = {"trust_remote_code": True}
-        if HF_TOKEN:
-            proc_kwargs["token"] = HF_TOKEN
-        log("[INIT] Loading processor...")
-        _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
-        log("[INIT] Processor loaded successfully")
-    except Exception as e:
-        log(f"[ERROR] Failed to load processor: {e}")
-        raise
+    proc_kwargs = {"trust_remote_code": True}
+    if HF_TOKEN:
+        proc_kwargs["token"] = HF_TOKEN
+    log("[INIT] Loading processor...")
+    _processor = AutoProcessor.from_pretrained(MODEL_ID, **proc_kwargs)
+    log("[INIT] Processor loaded")
 
-    # MÉMOIRE GPU OPTIMISÉE pour Small 24B
-    # ── Quantization pendant le chargement via bitsandbytes (recommandé) ──────────────
-    # QUANT_MODE=bnb4  → INT4 bitsandbytes  : ~12-14 GB VRAM, tout sur GPU  ✅
-    # QUANT_MODE=bnb8  → INT8 bitsandbytes  : ~24 GB VRAM, légèrement plus précis
-    # QUANT_MODE=none  → bfloat16 original  : ~48 GB VRAM (nécessite A100)
-    #
-    # Avantage clé vs torchao : la quantization se fait PENDANT le from_pretrained,
-    # donc le modèle ne déborde jamais sur le CPU — tout reste sur GPU dès le départ.
-
-    mdl_kwargs = {
-        "device_map": "auto",
-        "low_cpu_mem_usage": True,
-        "trust_remote_code": True,
-    }
+    mdl_kwargs = {"device_map": "auto", "low_cpu_mem_usage": True, "trust_remote_code": True}
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
 
-    if QUANT_MODE in ("bnb4", "torchao") and torch.cuda.is_available():
-        # torchao est un alias vers bnb4 (fallback robuste)
+    if QUANT_MODE in ("torchao", "bnb4") and torch.cuda.is_available():
         try:
             from transformers import BitsAndBytesConfig
-            log("[INIT] Configuring bitsandbytes INT4 quantization...")
-            bnb_config = BitsAndBytesConfig(
+            log("[INIT] Configuring bitsandbytes INT4...")
+            mdl_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True,   # double quant = -0.5 GB supplémentaire
-                bnb_4bit_quant_type="nf4",        # nf4 = meilleure qualité pour LLM
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
             )
-            mdl_kwargs["quantization_config"] = bnb_config
-            log("[INIT] INT4 BnB config ready — model will load directly in 12-14 GB")
+            log("[INIT] INT4 BnB config ready — model will load in 12-14 GB")
         except ImportError:
             log("[WARN] bitsandbytes not installed — falling back to bfloat16")
-            dtype = torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
-            mdl_kwargs["dtype"] = dtype
+            mdl_kwargs["dtype"] = torch.bfloat16
     elif QUANT_MODE == "bnb8" and torch.cuda.is_available():
         try:
             from transformers import BitsAndBytesConfig
-            log("[INIT] Configuring bitsandbytes INT8 quantization...")
-            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-            mdl_kwargs["quantization_config"] = bnb_config
+            mdl_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
             log("[INIT] INT8 BnB config ready — model will load in ~24 GB")
         except ImportError:
-            log("[WARN] bitsandbytes not installed — falling back to bfloat16")
-            dtype = torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
-            mdl_kwargs["dtype"] = dtype
+            mdl_kwargs["dtype"] = torch.bfloat16
     else:
-        # Mode bfloat16 original
         dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
         mdl_kwargs["dtype"] = dtype
         log(f"[INIT] Using dtype: {dtype} (no quantization)")
 
-    try:
-        log(f"[INIT] Loading model... (this may take several minutes) [QUANT_MODE={QUANT_MODE}]")
-        if _HAS_VOXTRAL_CLASS:
-            _model = VoxtralForConditionalGeneration.from_pretrained(MODEL_ID, **mdl_kwargs)
-        else:
-            raise RuntimeError("Transformers sans VoxtralForConditionalGeneration. Utiliser transformers@main/nightly.")
-        log("[INIT] Model loaded successfully")
-    except Exception as e:
-        log(f"[ERROR] Failed to load model: {e}")
-        raise
+    log(f"[INIT] Loading model... (this may take several minutes) [QUANT_MODE={QUANT_MODE}]")
+    _model = VoxtralForConditionalGeneration.from_pretrained(MODEL_ID, **mdl_kwargs)
+    log("[INIT] Model loaded successfully")
 
     try:
         p = next(_model.parameters())
         log(f"[INIT] Voxtral device={p.device}, dtype={p.dtype}")
-        
-        gpu_params = sum(1 for p in _model.parameters() if p.device.type == 'cuda')
+        gpu_params   = sum(1 for p in _model.parameters() if p.device.type == "cuda")
         total_params = sum(1 for p in _model.parameters())
-        gpu_ratio = gpu_params / total_params if total_params > 0 else 0
-        log(f"[INIT] GPU params ratio: {gpu_ratio:.2f} ({gpu_params}/{total_params})")
-        
-        if gpu_ratio < 0.8:
-            log(f"[WARN] Only {gpu_ratio:.1%} of model on GPU - expect slow performance")
-            
+        ratio = gpu_params / total_params if total_params > 0 else 0
+        log(f"[INIT] GPU params ratio: {ratio:.2f} ({gpu_params}/{total_params})")
+        if ratio < 0.95:
+            log(f"[WARN] Only {ratio:.1%} of model on GPU — expect slow performance")
     except Exception as e:
         log(f"[WARN] Could not check model device: {e}")
 
     log("[INIT] Voxtral ready.")
     return _processor, _model
 
-def _move_to_device_no_cast(batch, device: str):
+# =============================================================================
+# INFÉRENCE VOXTRAL
+# =============================================================================
+def _move_to_device(batch, device: str):
     if hasattr(batch, "to"):
         return batch.to(device)
     if isinstance(batch, dict):
@@ -279,11 +229,11 @@ def _move_to_device_no_cast(batch, device: str):
                 batch[k] = v.to(device)
     return batch
 
-def _input_len_from_batch(inputs) -> int:
+def _input_len(inputs) -> int:
     try:
-        if isinstance(inputs, dict) and "input_ids" in inputs and isinstance(inputs["input_ids"], torch.Tensor):
+        if isinstance(inputs, dict) and "input_ids" in inputs:
             return inputs["input_ids"].shape[1]
-        elif hasattr(inputs, "input_ids") and isinstance(inputs.input_ids, torch.Tensor):
+        if hasattr(inputs, "input_ids"):
             return inputs.input_ids.shape[1]
     except Exception:
         pass
@@ -291,333 +241,48 @@ def _input_len_from_batch(inputs) -> int:
 
 def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict[str, Any]:
     processor, model = load_voxtral()
-
     try:
         inputs = processor.apply_chat_template(conversation, add_generation_prompt=True)
     except (TypeError, ValueError):
         inputs = processor.apply_chat_template(conversation)
 
-    device = _device_str()
-    inputs = _move_to_device_no_cast(inputs, device)
-
-    # Pour les longues générations (>3000 tokens), utiliser une petite température
-    # pour éviter les boucles de répétition avec do_sample=False
+    inputs = _move_to_device(inputs, _device_str())
     use_sampling = max_new_tokens > 3000
-
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         do_sample=use_sampling,
-        temperature=0.1 if use_sampling else None,  # Très faible température pour rester déterministe
+        temperature=0.1 if use_sampling else None,
         top_p=0.95 if use_sampling else None,
     )
-
     t0 = time.time()
     outputs = model.generate(**inputs, **gen_kwargs)
     dt = round(time.time() - t0, 3)
-
-    inp_len = _input_len_from_batch(inputs)
+    inp_len = _input_len(inputs)
     decoded = processor.batch_decode(outputs[:, inp_len:], skip_special_tokens=True)
     result_text = decoded[0] if decoded else ""
-
-    # Nettoyage mémoire GPU après inférence
-    del outputs
-    del inputs
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()  # IMPORTANT: attendre fin des opérations async avant libération
-        torch.cuda.empty_cache()
-        log("[VOXTRAL] GPU memory cleared")
-
+    del outputs, inputs
+    _gpu_clear()
+    log("[VOXTRAL] GPU memory cleared")
     return {"text": result_text, "latency_s": dt}
 
 def run_voxtral_with_timeout(conversation: List[Dict[str, Any]], max_new_tokens: int, timeout: int = 45) -> Dict[str, Any]:
-    """Wrapper simplifié sans signaux Unix"""
     try:
         log(f"[VOXTRAL] Starting inference (max_tokens={max_new_tokens})")
-        start_time = time.time()
         result = run_voxtral(conversation, max_new_tokens)
-        duration = time.time() - start_time
-        log(f"[VOXTRAL] Completed in {duration:.2f}s")
+        log(f"[VOXTRAL] Completed in {result['latency_s']:.2f}s")
         return result
     except Exception as e:
         log(f"[ERROR] Voxtral inference failed: {e}")
-        # Nettoyage mémoire CRITIQUE en cas d'erreur (surtout OOM)
         try:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                log("[VOXTRAL] GPU memory cleared after error")
+            _gpu_clear()
+            log("[VOXTRAL] GPU memory cleared after error")
         except Exception:
             pass
         return {"text": "", "latency_s": 0}
 
-def _build_conv_transcribe_ultra_strict(local_path: str, language: Optional[str]) -> List[Dict[str, Any]]:
-    """Version ultra-stricte pour éviter les hallucinations"""
-    return [{
-        "role": "user",
-        "content": [
-            {"type": "audio", "path": local_path},
-            {"type": "text", "text": "lang:fr [TRANSCRIBE] Écris exactement ce qui est dit, mot pour mot, en français uniquement."}
-        ],
-    }]
-
-def clean_transcription_result(text: str, duration_s: float) -> str:
-    """Nettoie le résultat de transcription pour éliminer les aberrations"""
-    if not text:
-        return ""
-    
-    text = text.strip()
-    
-    # Filtre : Segments suspects (hallucinations communes de Voxtral)
-    suspicious_phrases = [
-        "so, you're making", "in fact, i have", "tell me the price", "thank you very much",
-        "i think it's", "after that, it can", "and sometimes it even", "what is your age",
-        "a telephone number"
-    ]
-    
-    text_lower = text.lower()
-    for phrase in suspicious_phrases:
-        if phrase in text_lower and duration_s < 3.0:
-            log(f"[FILTER] Suspicious phrase detected: '{text}' (duration: {duration_s:.1f}s)")
-            return ""
-    
-    # Filtre : Mots anglais suspects dans conversation française
-    english_words = ["for", "this", "week", "yes", "of", "course", "telephone", "number", "what", "age", "please", "right", "side"]
-    words = text.lower().split()
-    english_ratio = sum(1 for word in words if word in english_words) / max(len(words), 1)
-    
-    if english_ratio > 0.4 and duration_s < 4.0:
-        log(f"[FILTER] Too much English detected: '{text}' (ratio: {english_ratio:.1%})")
-        return ""
-    
-    # Filtre : Segments trop longs pour la durée audio (hallucination)
-    words_count = len(text.split())
-    max_expected_words = int(duration_s * 4)
-    
-    if words_count > max_expected_words * 1.5:
-        log(f"[FILTER] Too many words for duration: {words_count} words in {duration_s:.1f}s")
-        return " ".join(text.split()[:max_expected_words])
-    
-    return text
-
-# ---------------------------
-# Forced Alignment - Word-level timestamps (WhisperX-style)
-# ---------------------------
-_alignment_model = None
-_alignment_tokenizer = None
-
-def load_alignment_model():
-    """
-    Charge le modèle Wav2Vec2 pour forced alignment.
-    Utilisé pour obtenir des timestamps précis au niveau des mots.
-    """
-    global _alignment_model, _alignment_tokenizer
-    if _alignment_model is not None and _alignment_tokenizer is not None:
-        return _alignment_model, _alignment_tokenizer
-
-    # Modèle français optimisé pour l'alignment
-    alignment_model_id = "facebook/wav2vec2-large-xlsr-53-french"
-    log(f"[ALIGN] Loading alignment model: {alignment_model_id}")
-
-    try:
-        import torchaudio
-        from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
-
-        device = _device_str()
-        _alignment_tokenizer = Wav2Vec2Processor.from_pretrained(alignment_model_id)
-
-        # Force safetensors loading to avoid torch.load security warning
-        _alignment_model = Wav2Vec2ForCTC.from_pretrained(
-            alignment_model_id,
-            use_safetensors=True
-        ).to(device)
-        _alignment_model.eval()
-
-        log(f"[ALIGN] Alignment model loaded on {device}")
-        return _alignment_model, _alignment_tokenizer
-    except Exception as e:
-        log(f"[ALIGN] WARNING: Failed to load alignment model: {e}")
-        log(f"[ALIGN] Will fall back to segment-level timestamps")
-        return None, None
-
-def align_words_to_audio(text: str, audio_path: str) -> List[Dict[str, Any]]:
-    """
-    Aligne le texte sur l'audio pour obtenir des timestamps au niveau des mots.
-    Inspiré de WhisperX.
-
-    Returns:
-        Liste de dicts avec {word, start, end}
-    """
-    try:
-        import torchaudio
-        model, tokenizer = load_alignment_model()
-
-        if model is None or tokenizer is None:
-            log("[ALIGN] Skipping word alignment - model not available")
-            return []
-
-        # Charger l'audio
-        speech, sample_rate = torchaudio.load(audio_path)
-
-        # Resample si nécessaire (Wav2Vec2 attend 16kHz)
-        if sample_rate != 16000:
-            resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-            speech = resampler(speech)
-            sample_rate = 16000
-
-        # Mono
-        if speech.shape[0] > 1:
-            speech = torch.mean(speech, dim=0, keepdim=True)
-
-        device = _device_str()
-        speech = speech.to(device)
-
-        # Tokenization
-        inputs = tokenizer(speech.squeeze().cpu().numpy(), sampling_rate=16000, return_tensors="pt", padding=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        # Inférence
-        with torch.no_grad():
-            logits = model(**inputs).logits
-
-        # Décodage avec timestamps
-        predicted_ids = torch.argmax(logits, dim=-1)
-        transcription = tokenizer.batch_decode(predicted_ids)[0]
-
-        # Extraction des timestamps au niveau des caractères
-        # Note: Implémentation simplifiée - WhisperX utilise CTC segmentation plus sophistiqué
-        duration = speech.shape[1] / sample_rate
-        words = text.split()
-        word_timestamps = []
-
-        if len(words) > 0:
-            # Distribution uniforme comme approximation
-            # TODO: Implémenter CTC segmentation propre si nécessaire
-            time_per_word = duration / len(words)
-            for i, word in enumerate(words):
-                word_timestamps.append({
-                    "word": word,
-                    "start": i * time_per_word,
-                    "end": (i + 1) * time_per_word
-                })
-
-        log(f"[ALIGN] Aligned {len(word_timestamps)} words")
-        return word_timestamps
-
-    except Exception as e:
-        log(f"[ALIGN] ERROR during alignment: {e}")
-        return []
-
-def assign_speakers_to_words_iou(
-    word_timestamps: List[Dict[str, Any]],
-    pyannote_segments: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """
-    Assigne les speakers aux mots en utilisant l'algorithme IoU de WhisperX.
-
-    Args:
-        word_timestamps: Liste de {word, start, end}
-        pyannote_segments: Liste de {speaker, start, end}
-
-    Returns:
-        Liste de {word, start, end, speaker}
-    """
-    import pandas as pd
-    import numpy as np
-
-    if not word_timestamps or not pyannote_segments:
-        return word_timestamps
-
-    log(f"[IOU] Assigning speakers to {len(word_timestamps)} words using {len(pyannote_segments)} PyAnnote segments")
-
-    # Convertir pyannote_segments en DataFrame
-    diarize_df = pd.DataFrame(pyannote_segments)
-
-    # Pour chaque mot, trouver le speaker avec la plus grande intersection
-    for word in word_timestamps:
-        if 'start' not in word or 'end' not in word:
-            continue
-
-        # Calculer l'intersection avec tous les segments PyAnnote
-        diarize_df['intersection'] = np.minimum(diarize_df['end'], word['end']) - np.maximum(diarize_df['start'], word['start'])
-
-        # Filtrer les intersections positives
-        dia_tmp = diarize_df[diarize_df['intersection'] > 0]
-
-        if len(dia_tmp) > 0:
-            # Grouper par speaker et sommer les intersections
-            # Le speaker avec la plus grande intersection gagne
-            speaker = dia_tmp.groupby("speaker")["intersection"].sum().sort_values(ascending=False).index[0]
-            word["speaker"] = speaker
-        else:
-            # Pas d'intersection - assigner au speaker le plus proche temporellement
-            word["speaker"] = None
-
-    assigned_count = sum(1 for w in word_timestamps if w.get("speaker"))
-    log(f"[IOU] Assigned speakers to {assigned_count}/{len(word_timestamps)} words")
-
-    return word_timestamps
-
-# ---------------------------
-# Diarization
-# ---------------------------
-def load_diarizer():
-    global _diarizer
-    if _diarizer is not None:
-        return _diarizer
-    log(f"[INIT] Loading diarization: {DIAR_MODEL}")
-    kwargs = {}
-    if HF_TOKEN:
-        kwargs["use_auth_token"] = HF_TOKEN
-    _diarizer = Pipeline.from_pretrained(DIAR_MODEL, **kwargs)
-    try:
-        if torch.cuda.is_available():
-            try:
-                _diarizer.to(torch.device("cuda"))
-            except TypeError:
-                _diarizer.to("cuda")
-            log("[INIT] Diarizer moved to CUDA.")
-        else:
-            log("[INIT] CUDA not available; diarizer on CPU.")
-    except Exception as e:
-        log(f"[WARN] Could not move diarizer to CUDA: {e}. Keeping on CPU.")
-    return _diarizer
-
-# ---------------------------
-# Sentiment
-# ---------------------------
-def load_sentiment():
-    global _sentiment_clf, _sentiment_zero_shot
-    if not ENABLE_SENTIMENT:
-        return None
-
-    device_idx = SENTIMENT_DEVICE  # -1 => CPU
-    if SENTIMENT_TYPE == "zero-shot":
-        if _sentiment_zero_shot is not None:
-            return _sentiment_zero_shot
-        log(f"[INIT] Loading zero-shot sentiment on device {device_idx}: {SENTIMENT_MODEL}")
-        _sentiment_zero_shot = hf_pipeline(
-            "zero-shot-classification",
-            model=SENTIMENT_MODEL,
-            tokenizer=SENTIMENT_MODEL,
-            device=device_idx,
-            model_kwargs={"use_safetensors": True}
-        )
-        log("[INIT] Zero-shot sentiment ready.")
-        return _sentiment_zero_shot
-    else:
-        if _sentiment_clf is not None:
-            return _sentiment_clf
-        log(f"[INIT] Loading classifier sentiment on device {device_idx}: {SENTIMENT_MODEL}")
-        tok = AutoTokenizer.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
-        mdl = AutoModelForSequenceClassification.from_pretrained(SENTIMENT_MODEL, use_safetensors=True)
-        _sentiment_clf = TextClassificationPipeline(
-            model=mdl, tokenizer=tok, device=device_idx, return_all_scores=True, truncation=True
-        )
-        log("[INIT] Classifier sentiment ready.")
-        return _sentiment_clf
-
+# =============================================================================
+# SENTIMENT
+# =============================================================================
 def _label_fr(en_label: str) -> str:
     m = {"negative": "mauvais", "neutral": "neutre", "positive": "bon"}
     key = en_label.lower()
@@ -630,387 +295,160 @@ def _label_fr(en_label: str) -> str:
     return m.get(key, en_label)
 
 def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
-    """
-    Analyse de sentiment équilibrée pour conversations téléphoniques
-    """
     if not text.strip():
         return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
-    
-    text_lower = text.lower()
-    
-    # MOTS VRAIMENT NÉGATIFS (besoin de contexte fort)
-    strong_negative = [
-        "pas content du tout", "vraiment pas content", "pas contente du tout",
-        "très mécontent", "très déçu", "complètement déçu",
-        "annulé à cause", "annuler parce que", "se foutre la honte",
-        "inadmissible", "inacceptable", "catastrophe", "scandaleux",
-        # Colère explicite
-        "en colère", "énervé", "furieux", "exaspéré",
-        "ras-le-bol", "j'en ai marre", "c'est honteux",
-        "n'importe quoi", "vous vous moquez", "c'est une blague",
-        "c'est du foutage", "limite", "sérieux là",
-        "c'est abusé", "vous abusez", "c'est grave"
-    ]
 
-    # MOTS MOYENNEMENT NÉGATIFS (besoin d'accumulation)
+    text_lower = text.lower()
+
+    strong_negative = [
+        "pas content du tout", "vraiment pas content", "très mécontent", "très déçu",
+        "annulé à cause", "inadmissible", "inacceptable", "catastrophe", "scandaleux",
+        "en colère", "énervé", "furieux", "exaspéré", "ras-le-bol", "j'en ai marre",
+        "c'est honteux", "n'importe quoi", "vous vous moquez", "c'est une blague",
+        "c'est du foutage", "c'est abusé", "vous abusez", "c'est grave"
+    ]
     mild_negative = [
-        "pas content", "pas satisfait", "déçu", "problème",
-        "difficile", "compliqué", "pas possible",
-        # Frustration/Impatience
-        "encore", "toujours pas", "ça fait longtemps",
-        "combien de fois", "à chaque fois", "ça suffit",
-        "patienter", "retard", "toujours le même",
-        "ça traîne", "trop long", "pas normal"
+        "pas content", "pas satisfait", "déçu", "problème", "difficile", "compliqué",
+        "encore", "toujours pas", "ça fait longtemps", "combien de fois", "à chaque fois",
+        "ça suffit", "patienter", "retard", "toujours le même", "ça traîne", "trop long"
     ]
-    
-    # INDICATEURS POSITIFS (seuil plus bas)
     positive_indicators = [
-        "merci", "parfait", "très bien", "super", "excellent",
-        "c'est bon", "d'accord", "ça marche", "pas de problème",
-        "bonne journée", "au revoir", "confirmé", "réglé",
-        "je vous remercie", "merci beaucoup", "c'est gentil",
-        "avec plaisir", "volontiers", "pas de souci"
+        "merci", "parfait", "très bien", "super", "excellent", "c'est bon", "d'accord",
+        "ça marche", "pas de problème", "bonne journée", "confirmé", "réglé",
+        "je vous remercie", "merci beaucoup", "c'est gentil", "avec plaisir", "volontiers"
     ]
-    
-    # PHRASES QUI ANNULENT LE NÉGATIF
-    neutral_phrases = [
-        "c'est bon alors", "ah d'accord", "pas de problème",
-        "c'est réglé", "c'est confirmé", "ça marche"
-    ]
-    
-    # Comptage
-    strong_neg_count = sum(1 for phrase in strong_negative if phrase in text_lower)
-    mild_neg_count = sum(1 for word in mild_negative if word in text_lower)
-    positive_count = sum(1 for word in positive_indicators if word in text_lower)
-    neutral_found = any(phrase in text_lower for phrase in neutral_phrases)
-    
-    # LOGIQUE DE DÉCISION AJUSTÉE
-    
-    # 1. Fort négatif = négatif
+    neutral_phrases = ["c'est bon alors", "ah d'accord", "pas de problème", "c'est réglé", "ça marche"]
+
+    strong_neg_count = sum(1 for p in strong_negative if p in text_lower)
+    mild_neg_count   = sum(1 for w in mild_negative if w in text_lower)
+    positive_count   = sum(1 for w in positive_indicators if w in text_lower)
+    neutral_found    = any(p in text_lower for p in neutral_phrases)
+
     if strong_neg_count >= 1:
-        log(f"[SENTIMENT] Strong negative: {strong_neg_count} phrases")
-        return {
-            "label_en": "negative",
-            "label_fr": "mauvais",
-            "confidence": 0.90,
-            "scores": {"negative": 0.90, "neutral": 0.08, "positive": 0.02}
-        }
-    
-    # 2. Beaucoup de positifs = positif (SEUIL PLUS CONSERVATEUR)
+        return {"label_en": "negative", "label_fr": "mauvais", "confidence": 0.90,
+                "scores": {"negative": 0.90, "neutral": 0.08, "positive": 0.02}}
     if positive_count >= 3 and mild_neg_count == 0:
-        log(f"[SENTIMENT] Clear positive: {positive_count} indicators")
-        return {
-            "label_en": "positive",
-            "label_fr": "bon",
-            "confidence": 0.85,
-            "scores": {"negative": 0.05, "neutral": 0.10, "positive": 0.85}
-        }
-    
-    # 3. Phrases neutres qui annulent le négatif
+        return {"label_en": "positive", "label_fr": "bon", "confidence": 0.85,
+                "scores": {"negative": 0.05, "neutral": 0.10, "positive": 0.85}}
     if neutral_found and mild_neg_count <= 1:
-        log(f"[SENTIMENT] Neutral phrases override")
-        return {
-            "label_en": "neutral",
-            "label_fr": "neutre",
-            "confidence": 0.80,
-            "scores": {"negative": 0.10, "neutral": 0.80, "positive": 0.10}
-        }
-    
-    # 4. Accumulation de négatifs moyens
+        return {"label_en": "neutral", "label_fr": "neutre", "confidence": 0.80,
+                "scores": {"negative": 0.10, "neutral": 0.80, "positive": 0.10}}
     if mild_neg_count >= 3:
-        log(f"[SENTIMENT] Multiple mild negatives: {mild_neg_count}")
-        return {
-            "label_en": "negative",
-            "label_fr": "mauvais",
-            "confidence": 0.75,
-            "scores": {"negative": 0.75, "neutral": 0.20, "positive": 0.05}
-        }
-    
-    # 5. Appel court et poli = probablement positif
+        return {"label_en": "negative", "label_fr": "mauvais", "confidence": 0.75,
+                "scores": {"negative": 0.75, "neutral": 0.20, "positive": 0.05}}
+
     word_count = len(text.split())
     if word_count < 100 and positive_count >= 1 and mild_neg_count == 0:
-        log(f"[SENTIMENT] Short polite call: positive")
-        return {
-            "label_en": "positive",
-            "label_fr": "bon",
-            "confidence": 0.70,
-            "scores": {"negative": 0.10, "neutral": 0.20, "positive": 0.70}
-        }
-    
-    # 6. Voxtral pour les cas ambigus
+        return {"label_en": "positive", "label_fr": "bon", "confidence": 0.70,
+                "scores": {"negative": 0.10, "neutral": 0.20, "positive": 0.70}}
+
+    # Voxtral pour les cas ambigus
     instruction = (
         "Analyse le sentiment de cette conversation téléphonique professionnelle.\n"
         "Réponds par UN SEUL MOT : satisfaisant, neutre, ou insatisfaisant\n\n"
-        "Critères :\n"
-        "- satisfaisant : client content, remerciements, problème résolu, confirmation positive\n"
-        "- insatisfaisant : client mécontent, frustré, problème non résolu\n"
-        "- neutre : simple échange d'information\n\n"
         "NOTE : La plupart des appels courts et polis sont satisfaisants.\n\n"
         f"Conversation : {text[:1500]}"
     )
-    
-    conversation = [{
-        "role": "user",
-        "content": [{"type": "text", "text": instruction}]
-    }]
-    
+    conv = [{"role": "user", "content": [{"type": "text", "text": instruction}]}]
     try:
-        result = run_voxtral_with_timeout(conversation, max_new_tokens=16, timeout=60)
+        result   = run_voxtral_with_timeout(conv, max_new_tokens=16, timeout=60)
         response = (result.get("text") or "").strip().lower()
-        
         log(f"[SENTIMENT] Voxtral: '{response}' (pos:{positive_count} neg:{mild_neg_count})")
-        
         if "insatisfaisant" in response:
-            # Override si BEAUCOUP de positifs (seuil augmenté)
             if positive_count >= 4:
-                return {
-                    "label_en": "neutral",
-                    "label_fr": "neutre",
-                    "confidence": 0.65,
-                    "scores": {"negative": 0.25, "neutral": 0.65, "positive": 0.10}
-                }
-            return {
-                "label_en": "negative",
-                "label_fr": "mauvais",
-                "confidence": 0.75,
-                "scores": {"negative": 0.75, "neutral": 0.20, "positive": 0.05}
-            }
-        elif "satisfaisant" in response and "insatisfaisant" not in response:
-            return {
-                "label_en": "positive",
-                "label_fr": "bon",
-                "confidence": 0.80,
-                "scores": {"negative": 0.05, "neutral": 0.15, "positive": 0.80}
-            }
+                return {"label_en": "neutral", "label_fr": "neutre", "confidence": 0.65,
+                        "scores": {"negative": 0.25, "neutral": 0.65, "positive": 0.10}}
+            return {"label_en": "negative", "label_fr": "mauvais", "confidence": 0.75,
+                    "scores": {"negative": 0.75, "neutral": 0.20, "positive": 0.05}}
+        elif "satisfaisant" in response:
+            return {"label_en": "positive", "label_fr": "bon", "confidence": 0.80,
+                    "scores": {"negative": 0.05, "neutral": 0.15, "positive": 0.80}}
         else:
-            # Neutre avec tendance positive si présence de mots positifs
             if positive_count >= 1:
-                return {
-                    "label_en": "positive",
-                    "label_fr": "bon",
-                    "confidence": 0.65,
-                    "scores": {"negative": 0.10, "neutral": 0.25, "positive": 0.65}
-                }
-            return {
-                "label_en": "neutral",
-                "label_fr": "neutre",
-                "confidence": 0.75,
-                "scores": {"negative": 0.15, "neutral": 0.75, "positive": 0.10}
-            }
-            
+                return {"label_en": "positive", "label_fr": "bon", "confidence": 0.65,
+                        "scores": {"negative": 0.10, "neutral": 0.25, "positive": 0.65}}
+            return {"label_en": "neutral", "label_fr": "neutre", "confidence": 0.75,
+                    "scores": {"negative": 0.15, "neutral": 0.75, "positive": 0.10}}
     except Exception as e:
         log(f"[SENTIMENT] Error: {e}")
-        # Par défaut neutre/positif pour les appels courts
         if word_count < 100 and positive_count > 0:
-            return {
-                "label_en": "positive",
-                "label_fr": "bon",
-                "confidence": 0.60,
-                "scores": {"negative": 0.10, "neutral": 0.30, "positive": 0.60}
-            }
-        return {
-            "label_en": "neutral",
-            "label_fr": "neutre",
-            "confidence": 0.60,
-            "scores": {"negative": 0.20, "neutral": 0.60, "positive": 0.20}
-        }
-
-
-def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
-    """
-    Détecte et supprime les boucles de répétition dans le texte généré par Voxtral.
-
-    Cas typiques:
-    - Mot répété avec espaces: "hello hello hello..."
-    - Pattern collé: "michel.michel.michel..." (sans espaces)
-    - Phrases complètes: "je vais voir ça je vais voir ça je vais voir ça"
-    """
-    if not text or len(text) < 20:
-        return text
-
-    # Cas 1: Détection de patterns courts répétés (ex: "michel.michel.michel...")
-    # Chercher un pattern de 3-20 caractères répété consécutivement
-    for pattern_len in range(3, 21):  # Patterns de 3 à 20 chars max
-        if len(text) < pattern_len * max_repetitions:
-            continue
-
-        # Extraire le pattern potentiel depuis la fin du texte
-        # (la répétition est souvent à la fin)
-        pattern = text[-pattern_len:]
-
-        # Compter combien de fois ce pattern se répète à la fin
-        repetitions = 0
-        pos = len(text)
-        while pos >= pattern_len:
-            if text[pos - pattern_len:pos] == pattern:
-                repetitions += 1
-                pos -= pattern_len
-            else:
-                break
-
-        if repetitions > max_repetitions:
-            # Garder le contenu avant la boucle + 1-2 occurrences du pattern (contenu légitime)
-            truncate_pos = pos + pattern_len * 2  # Garder 2 occurrences
-            truncate_pos = min(truncate_pos, len(text))  # Ne pas dépasser
-            log(f"[CLEANUP] Detected pattern loop: '{pattern[:15]}...' repeated {repetitions} times, truncating from {len(text)} to {truncate_pos} chars")
-            return text[:truncate_pos]
-
-    # Cas 2: Mots séparés par espaces
-    words = text.split()
-    if len(words) < 10:
-        return text
-
-    cleaned_words = []
-    repetition_count = 1
-    last_word = None
-
-    for word in words:
-        if word == last_word:
-            repetition_count += 1
-            if repetition_count > max_repetitions:
-                log(f"[CLEANUP] Detected word loop: '{word}' repeated {repetition_count} times, truncating")
-                break
-        else:
-            repetition_count = 1
-            last_word = word
-        cleaned_words.append(word)
-
-    cleaned_text = " ".join(cleaned_words)
-
-    if len(cleaned_text) < len(text) * 0.8:
-        log(f"[CLEANUP] Removed repetitive content: {len(text)} -> {len(cleaned_text)} chars")
-
-    return cleaned_text
-
+            return {"label_en": "positive", "label_fr": "bon", "confidence": 0.60,
+                    "scores": {"negative": 0.10, "neutral": 0.30, "positive": 0.60}}
+        return {"label_en": "neutral", "label_fr": "neutre", "confidence": 0.60,
+                "scores": {"negative": 0.20, "neutral": 0.60, "positive": 0.20}}
 
 def validate_sentiment_coherence(text: str, sentiment: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Valide et corrige le sentiment si incohérent avec le contenu
-    """
     if not sentiment or not text:
         return sentiment
-    
-    # Phrases qui indiquent TOUJOURS un problème
     strong_negative_phrases = [
-        "pas content", "pas contente",
-        "annulé", "annuler à cause",
-        "se foutre la honte",
-        "pas satisfait", "pas satisfaite",
-        "je veux parler", "parler avec le responsable",
-        "ce n'est pas normal",
-        "c'est inadmissible",
-        # Mécontentement explicite
-        "ça ne va pas du tout", "c'est la dernière fois",
-        "je change de", "je vais voir ailleurs",
-        "un concurrent", "chez un concurrent",
-        "je vais me plaindre", "porter plainte",
-        "service client nul", "nul", "zéro",
-        "catastrophique", "lamentable",
-        # Menaces/Escalade
-        "avocat", "mon avocat",
-        "résilier", "résiliation",
-        "remboursement immédiat", "je veux un remboursement",
-        # Expressions de colère
-        "j'en ai assez", "j'en peux plus",
-        "c'est toujours pareil", "à chaque fois c'est pareil",
-        "vous êtes nuls", "incompétent"
+        "pas content", "pas contente", "annulé", "pas satisfait", "ce n'est pas normal",
+        "inadmissible", "ça ne va pas du tout", "je vais voir ailleurs", "je vais me plaindre",
+        "porter plainte", "résilier", "j'en ai assez", "vous êtes nuls", "incompétent"
     ]
-    
-    text_lower = text.lower()
-    has_strong_negative = any(phrase in text_lower for phrase in strong_negative_phrases)
-    
-    # Si on trouve une phrase fortement négative mais sentiment non négatif
-    if has_strong_negative and sentiment.get("label_fr") != "mauvais":
-        log(f"[SENTIMENT_VALIDATION] Overriding sentiment to negative due to strong negative phrases")
-        return {
-            "label_en": "negative",
-            "label_fr": "mauvais", 
-            "confidence": 0.95,
-            "scores": {"negative": 0.95, "neutral": 0.04, "positive": 0.01}
-        }
-    
+    if any(p in text.lower() for p in strong_negative_phrases) and sentiment.get("label_fr") != "mauvais":
+        log("[SENTIMENT_VALIDATION] Overriding sentiment to negative")
+        return {"label_en": "negative", "label_fr": "mauvais", "confidence": 0.95,
+                "scores": {"negative": 0.95, "neutral": 0.04, "positive": 0.01}}
     return sentiment
-    
+
 def classify_sentiment(text: str) -> Dict[str, Any]:
-    """
-    Interface de sentiment - utilise Voxtral avec validation
-    """
     if not ENABLE_SENTIMENT or not text.strip():
         return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
-    
-    # Analyse Voxtral
-    sentiment = classify_sentiment_with_voxtral(text)
-    
-    # Validation et correction si nécessaire
-    sentiment = validate_sentiment_coherence(text, sentiment)
-    
-    return sentiment
+    return validate_sentiment_coherence(text, classify_sentiment_with_voxtral(text))
 
 def analyze_sentiment_by_speaker(segments: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Analyse le sentiment pour chaque speaker séparément.
-    FOCUS: Le client est généralement le premier speaker ou celui qui parle le moins.
-    """
     if not ENABLE_SENTIMENT or not segments:
         return {}
-
-    # Grouper les paroles par speaker
-    speaker_texts = {}
-    speaker_durations = {}
-
+    speaker_texts: Dict[str, List[str]] = {}
     for seg in segments:
         speaker = seg.get("speaker")
-        text = seg.get("text", "").strip()
+        text    = seg.get("text", "").strip()
         if not speaker or not text:
             continue
-
-        if speaker not in speaker_texts:
-            speaker_texts[speaker] = []
-            speaker_durations[speaker] = 0.0
-
-        speaker_texts[speaker].append(text)
-        speaker_durations[speaker] += (seg.get("end", 0) - seg.get("start", 0))
-
-    # Analyser le sentiment pour chaque speaker
-    speaker_sentiments = {}
+        speaker_texts.setdefault(speaker, []).append(text)
+    sentiments = {}
     for speaker, texts in speaker_texts.items():
-        combined_text = " ".join(texts)
-        sentiment = classify_sentiment(combined_text)
-        speaker_sentiments[speaker] = sentiment
-        log(f"[SENTIMENT_BY_SPEAKER] {speaker}: {sentiment.get('label_fr')} (confidence: {sentiment.get('confidence', 0):.2f})")
-
-    return speaker_sentiments
-
+        combined = " ".join(texts)
+        s = classify_sentiment(combined)
+        sentiments[speaker] = s
+        log(f"[SENTIMENT_BY_SPEAKER] {speaker}: {s.get('label_fr')} (confidence: {s.get('confidence', 0):.2f})")
+    return sentiments
 
 def get_client_sentiment(speaker_sentiments: Dict[str, Dict[str, Any]], segments: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Identifie le sentiment du CLIENT (pas de l'agent).
-    Heuristique: Le client est généralement le premier speaker ou celui qui parle le moins.
-    """
+    """Priorité 1 : label 'Client' direct. Priorité 2 : ROLE_LABELS[1]. Priorité 3 : fallback durée."""
     if not speaker_sentiments:
         return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
 
-    # Compter le temps de parole par speaker
-    speaker_durations = {}
-    for seg in segments:
-        speaker = seg.get("speaker")
-        if speaker:
-            duration = seg.get("end", 0) - seg.get("start", 0)
-            speaker_durations[speaker] = speaker_durations.get(speaker, 0.0) + duration
+    if "Client" in speaker_sentiments:
+        log("[CLIENT_DETECTION] Client identifié: Client (label direct)")
+        return speaker_sentiments["Client"]
 
-    # Le client parle généralement MOINS que l'agent
+    if len(ROLE_LABELS) >= 2 and ROLE_LABELS[1] in speaker_sentiments:
+        label = ROLE_LABELS[1]
+        log(f"[CLIENT_DETECTION] Client identifié: {label} (ROLE_LABELS[1])")
+        return speaker_sentiments[label]
+
+    # Fallback : speaker qui parle le plus (hors Agent)
+    speaker_durations: Dict[str, float] = {}
+    for seg in segments:
+        sp = seg.get("speaker")
+        if sp:
+            speaker_durations[sp] = speaker_durations.get(sp, 0.0) + (seg.get("end", 0) - seg.get("start", 0))
     if speaker_durations:
-        client_speaker = min(speaker_durations.items(), key=lambda x: x[1])[0]
-        log(f"[CLIENT_DETECTION] Client identifié: {client_speaker} (temps de parole: {speaker_durations[client_speaker]:.1f}s)")
+        agent_label = ROLE_LABELS[0] if ROLE_LABELS else "Agent"
+        candidates  = {k: v for k, v in speaker_durations.items() if k not in (agent_label, "Agent")}
+        if candidates:
+            client_speaker = max(candidates, key=lambda k: candidates[k])
+        else:
+            sorted_sp = sorted(speaker_durations, key=lambda k: speaker_durations[k], reverse=True)
+            client_speaker = sorted_sp[1] if len(sorted_sp) > 1 else sorted_sp[0]
+        log(f"[CLIENT_DETECTION] Client identifié par durée: {client_speaker} ({speaker_durations[client_speaker]:.1f}s)")
         return speaker_sentiments.get(client_speaker, {"label_en": None, "label_fr": None, "confidence": None, "scores": None})
 
-    # Fallback: premier speaker
-    first_speaker = segments[0].get("speaker") if segments else None
-    if first_speaker and first_speaker in speaker_sentiments:
-        return speaker_sentiments[first_speaker]
-
+    first = segments[0].get("speaker") if segments else None
+    if first and first in speaker_sentiments:
+        return speaker_sentiments[first]
     return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
-
 
 def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, Any]:
     total = {"negative": 0.0, "neutral": 0.0, "positive": 0.0}
@@ -1018,453 +456,205 @@ def aggregate_mood(weighted: List[Tuple[Dict[str, Any], float]]) -> Dict[str, An
     for s, w in weighted:
         if not s or not s.get("scores"):
             continue
-        for k in total.keys():
+        for k in total:
             total[k] += s["scores"].get(k, 0.0) * w
         total_w += w
     if total_w <= 0:
         return {"label_en": None, "label_fr": None, "confidence": None, "scores": None}
     ssum = sum(total.values())
-    norm = {k: (v/ssum if ssum > 0 else 0.0) for k, v in total.items()}
-    label_en = max(norm.items(), key=lambda kv: kv[1])[0]
+    norm = {k: (v / ssum if ssum > 0 else 0.0) for k, v in total.items()}
+    label_en = max(norm, key=lambda k: norm[k])
     return {"label_en": label_en, "label_fr": _label_fr(label_en), "confidence": norm[label_en], "scores": norm}
 
-# ---------------------------
-# RÉSUMÉS OPTIMISÉS
-# ---------------------------
+# =============================================================================
+# RÉSUMÉ
+# =============================================================================
 def calculate_summary_tokens(duration_seconds: float, transcript_length: int) -> int:
-    """Calcule le nombre de tokens optimal pour le résumé selon la durée."""
-    # Base: 72 tokens pour conversations courtes (<2 min)
-    # Augmente progressivement pour conversations plus longues
-    if duration_seconds <= 120:
-        base_tokens = 72
-    elif duration_seconds <= 300:  # 2-5 min
-        base_tokens = 96
-    elif duration_seconds <= 600:  # 5-10 min
-        base_tokens = 128
-    elif duration_seconds <= 900:  # 10-15 min
-        base_tokens = 160
-    else:  # >15 min
-        base_tokens = 200
-
-    # Ajustement selon la longueur du transcript (beaucoup de contenu = besoin de plus de tokens)
-    if transcript_length > 10000:
-        base_tokens = max(base_tokens, 160)
-    if transcript_length > 15000:
-        base_tokens = max(base_tokens, 200)
-
-    return min(base_tokens, 256)  # Cap à 256 tokens max
-
+    if duration_seconds <= 120:   base_tokens = 72
+    elif duration_seconds <= 300: base_tokens = 96
+    elif duration_seconds <= 600: base_tokens = 128
+    elif duration_seconds <= 900: base_tokens = 160
+    else:                         base_tokens = 200
+    if transcript_length > 10000: base_tokens = max(base_tokens, 160)
+    if transcript_length > 15000: base_tokens = max(base_tokens, 200)
+    return min(base_tokens, 256)
 
 def generate_natural_summary(full_transcript: str, language: Optional[str] = None, duration_seconds: float = 0) -> str:
-    """Génère un résumé naturel et utile sans structure artificielle."""
     if not full_transcript.strip():
         return "Conversation vide."
-
-    # Calculer le nombre de tokens adapté à la durée
     summary_tokens = calculate_summary_tokens(duration_seconds, len(full_transcript))
-    log(f"[SUMMARY] Using {summary_tokens} tokens for summary (duration={duration_seconds:.1f}s, transcript={len(full_transcript)} chars)")
-
+    log(f"[SUMMARY] Using {summary_tokens} tokens (duration={duration_seconds:.1f}s, transcript={len(full_transcript)} chars)")
     lang_prefix = f"lang:{language} " if language else ""
     instruction = (
         f"{lang_prefix}Résume cette conversation en 1-2 phrases simples et claires. "
         "Dis juste l'essentiel : qui appelle pourquoi, et ce qui va se passer. "
         "Sois direct et naturel, sans format particulier. Ne cite pas le texte, résume-le."
     )
-
-    conversation = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": f"{instruction}\n\nConversation:\n{full_transcript}"}
-        ]
-    }]
-
+    conv = [{"role": "user", "content": [{"type": "text", "text": f"{instruction}\n\nConversation:\n{full_transcript}"}]}]
     try:
-        result = run_voxtral_with_timeout(conversation, max_new_tokens=summary_tokens, timeout=30)
-        summary = (result.get("text") or "").strip()
-        
-        summary = clean_generated_summary(summary)
-        
+        result  = run_voxtral_with_timeout(conv, max_new_tokens=summary_tokens, timeout=30)
+        summary = clean_generated_summary((result.get("text") or "").strip())
         if not summary or len(summary) < 10:
-            log("[WARN] Generated summary too short, using extractive fallback")
             return create_extractive_summary(full_transcript)
-        
         return summary
-        
     except Exception as e:
-        log(f"[ERROR] Natural summary generation failed: {e}")
+        log(f"[ERROR] Summary generation failed: {e}")
         return create_extractive_summary(full_transcript)
 
 def clean_generated_summary(summary: str) -> str:
-    """Nettoie et valide les résumés générés par Voxtral."""
     if not summary:
         return ""
-    
-    unwanted_starts = [
-        "voici un résumé", "résumé de la conversation", "cette conversation",
-        "dans cette conversation", "le résumé", "il s'agit"
-    ]
-    
+    unwanted_starts = ["voici un résumé", "résumé de la conversation", "cette conversation",
+                       "dans cette conversation", "le résumé", "il s'agit"]
     summary_lower = summary.lower().strip()
     for start in unwanted_starts:
         if summary_lower.startswith(start):
-            sentences = re.split(r'[.!?]+', summary)
-            for sentence in sentences[1:]:
+            for sentence in re.split(r'[.!?]+', summary)[1:]:
                 cleaned = sentence.strip()
                 if len(cleaned) > 15 and not any(cleaned.lower().startswith(u) for u in unwanted_starts):
                     summary = cleaned
                     break
-    
-    patterns_to_remove = [
-        r'décision[/:].*?étape[s]?\s*:', 
-        r'prochaine[s]?\s*étape[s]?\s*:',
-        r'action[s]?\s*à\s*prendre\s*:',
-        r'conclusion\s*:',
-        r'format\s*attendu\s*:'
-    ]
-    
-    for pattern in patterns_to_remove:
+    for pattern in [r'décision[/:].*?étape[s]?\s*:', r'prochaine[s]?\s*étape[s]?\s*:',
+                    r'action[s]?\s*à\s*prendre\s*:', r'conclusion\s*:', r'format\s*attendu\s*:']:
         summary = re.sub(pattern, '', summary, flags=re.IGNORECASE).strip()
-    
     summary = re.sub(r'\.{2,}', '.', summary)
     summary = re.sub(r'\s+', ' ', summary).strip()
-    
-    artificial_indicators = [
-        "format attendu", "décision/prochaine étape", "action à prendre",
-        "structure suivante", "points suivants"
-    ]
-    
-    if any(indicator in summary.lower() for indicator in artificial_indicators):
+    if any(i in summary.lower() for i in ["format attendu", "décision/prochaine étape", "points suivants"]):
         return ""
-    
     return summary
 
 def create_extractive_summary(transcript: str) -> str:
-    """Résumé extractif amélioré basé sur l'analyse du contenu."""
     if not transcript:
         return "Conversation indisponible."
-    
-    lines = [l.strip() for l in transcript.split('\n') if l.strip() and ':' in l]
-    
+    lines  = [l.strip() for l in transcript.split('\n') if l.strip() and ':' in l]
     if not lines:
         return "Conversation très courte."
-    
-    summary_parts = []
-    
-    # Identifie le motif de l'appel (client)
+    parts  = []
     client_lines = [l for l in lines if l.lower().startswith('client:')]
     for line in client_lines:
         text = line.replace('Client:', '').strip().lower()
-        
         if any(kw in text for kw in ['rendez-vous', 'rdv', 'prendre', 'avancer', 'reporter']):
-            summary_parts.append("Appel pour un rendez-vous")
-            break
+            parts.append("Appel pour un rendez-vous"); break
         elif any(kw in text for kw in ['information', 'renseignement', 'savoir']):
-            summary_parts.append("Demande d'information")
-            break
+            parts.append("Demande d'information"); break
         elif any(kw in text for kw in ['problème', 'souci', 'bug']):
-            summary_parts.append("Signalement d'un problème")
-            break
-    
-    # Identifie la réponse de l'agent
+            parts.append("Signalement d'un problème"); break
     agent_lines = [l for l in lines if l.lower().startswith('agent:')]
     for line in agent_lines:
         text = line.replace('Agent:', '').strip().lower()
-        
         if any(kw in text for kw in ['je vais', 'on va', 'nous allons']):
-            action = line.replace('Agent:', '').strip()
-            if len(action) > 10:
-                summary_parts.append(f"L'agent va {action.lower()}")
-                break
+            parts.append(f"L'agent va {line.replace('Agent:', '').strip().lower()}"); break
         elif any(kw in text for kw in ['pas possible', 'impossible', 'désolé']):
-            summary_parts.append("L'agent ne peut pas satisfaire la demande")
-            break
-        elif any(kw in text for kw in ['disponible', 'libre', 'possible']):
-            summary_parts.append("Créneau trouvé")
-            break
-    
-    if len(summary_parts) < 2:
-        substantive_lines = []
-        for line in lines:
+            parts.append("L'agent ne peut pas satisfaire la demande"); break
+    if not parts:
+        for line in lines[:2]:
             text = line.split(':', 1)[1].strip() if ':' in line else line
-            if (len(text) > 15 and 
-                not any(pol in text.lower() for pol in ['bonjour', 'au revoir', 'merci', 'bonne journée'])):
-                substantive_lines.append(text)
-        
-        for text in substantive_lines[:2]:
-            if len(summary_parts) < 3:
-                summary_parts.append(text)
-    
-    if not summary_parts:
-        return "Conversation brève sans motif identifié."
-    
-    return ". ".join(summary_parts) + "."
+            if len(text) > 15 and not any(pol in text.lower() for pol in ['bonjour', 'au revoir', 'merci']):
+                parts.append(text)
+    return ". ".join(parts) + "." if parts else "Conversation brève sans motif identifié."
 
 def select_best_summary_approach(transcript: str, duration_seconds: float = 0) -> str:
-    """Sélectionne la meilleure approche de résumé selon le contenu."""
-    lines = transcript.split('\n')
+    lines       = transcript.split('\n')
     total_words = len(transcript.split())
-
-    # Compter les segments avec speaker (lignes contenant ":")
     speaker_lines = [l for l in lines if ':' in l and l.strip()]
-
-    # Détection des annonces/IVR
     if len(lines) == 1 and "System:" in transcript:
-        # C'est probablement une annonce
         content = transcript.replace("System:", "").strip()
-        if len(content) > 20:
-            return f"Annonce automatique: {content[:100]}{'...' if len(content) > 100 else ''}"
-        else:
-            return f"Message système: {content}"
-
+        return f"Annonce automatique: {content[:100]}{'...' if len(content) > 100 else ''}"
     if total_words < 20:
         return "Conversation très brève."
-
-    # Utiliser le résumé génératif si conversation substantielle (3+ échanges ou 30+ mots)
     if total_words > 30 and len(speaker_lines) >= 3:
-        generative_summary = generate_natural_summary(transcript, duration_seconds=duration_seconds)
-
-        if (generative_summary and
-            len(generative_summary) > 15 and
-            not any(bad in generative_summary.lower() for bad in ['format', 'structure', 'décision/'])):
-            return generative_summary
-
+        g = generate_natural_summary(transcript, duration_seconds=duration_seconds)
+        if g and len(g) > 15 and not any(bad in g.lower() for bad in ['format', 'structure', 'décision/']):
+            return g
     return create_extractive_summary(transcript)
 
-# ---------------------------
-# Post-traitements segments
-# ---------------------------
+# =============================================================================
+# UTILITAIRES SEGMENTS
+# =============================================================================
 def _enforce_max_two_speakers(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     speakers = list({s["speaker"] for s in segments})
     if len(speakers) <= 2:
         return segments
-
     dur = {}
     cent = {}
     for s in segments:
-        d = float(s["end"]) - float(s["start"])
+        d   = float(s["end"]) - float(s["start"])
         spk = s["speaker"]
         mid = (float(s["start"]) + float(s["end"])) / 2.0
-        dur[spk] = dur.get(spk, 0.0) + d
-        sm, ds = cent.get(spk, (0.0, 0.0))
+        dur[spk]  = dur.get(spk, 0.0) + d
+        sm, ds    = cent.get(spk, (0.0, 0.0))
         cent[spk] = (sm + mid * d, ds + d)
-
-    top2 = sorted(dur.keys(), key=lambda k: dur[k], reverse=True)[:2]
-    centroids = {}
-    for spk in top2:
-        sm, ds = cent[spk]
-        centroids[spk] = (sm / ds) if ds > 0 else 0.0
-
+    top2 = sorted(dur, key=lambda k: dur[k], reverse=True)[:2]
+    centroids = {spk: (cent[spk][0] / cent[spk][1]) for spk in top2 if cent[spk][1] > 0}
     def nearest(mid):
-        best, bestd = None, 1e18
-        for spk, c in centroids.items():
-            dd = abs(mid - c)
-            if dd < bestd:
-                best, bestd = spk, dd
-        return best
-
+        return min(centroids, key=lambda spk: abs(mid - centroids[spk]))
     for s in segments:
         if s["speaker"] not in top2:
-            mid = (float(s["start"]) + float(s["end"])) / 2.0
-            s["speaker"] = nearest(mid)
-
+            s["speaker"] = nearest((float(s["start"]) + float(s["end"])) / 2.0)
     return segments
 
 def _map_roles(segments: List[Dict[str, Any]]):
     seen = []
     for s in segments:
-        spk = s["speaker"]
-        if spk not in seen:
-            seen.append(spk)
-    mapping = {}
-    for i, spk in enumerate(seen):
-        if i < len(ROLE_LABELS):
-            mapping[spk] = ROLE_LABELS[i]
+        if s["speaker"] not in seen:
+            seen.append(s["speaker"])
+    mapping = {spk: ROLE_LABELS[i] for i, spk in enumerate(seen) if i < len(ROLE_LABELS)}
     for s in segments:
         s["speaker"] = mapping.get(s["speaker"], s["speaker"])
 
-def merge_consecutive_segments(segments: List[Dict[str, Any]], max_gap: float = 2.0) -> List[Dict[str, Any]]:
-    """
-    Fusionne les segments consécutifs du même speaker avec un gap faible.
-    Version moins agressive que ultra_aggressive_merge.
-    """
-    if not segments:
-        return segments
-
-    merged = []
-    current = segments[0].copy()
-
-    log(f"[MERGE] Starting with {len(segments)} segments")
-
-    for next_seg in segments[1:]:
-        same_speaker = current["speaker"] == next_seg["speaker"]
-        gap = float(next_seg["start"]) - float(current["end"])
-
-        # Fusion conservative : seulement même speaker ET gap faible
-        if same_speaker and gap <= max_gap:
-            # Fusionner
-            current["end"] = next_seg["end"]
-            current_text = current.get("text", "").strip()
-            next_text = next_seg.get("text", "").strip()
-            if current_text and next_text:
-                current["text"] = f"{current_text} {next_text}"
-            elif next_text:
-                current["text"] = next_text
-        else:
-            # Ne peut pas fusionner
-            merged.append(current)
-            current = next_seg.copy()
-
-    merged.append(current)
-
-    log(f"[MERGE] Result: {len(segments)} → {len(merged)} segments")
-    return merged
-
-def optimize_diarization_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Optimise les segments de diarization avec fusion ultra-agressive."""
-    log(f"[OPTIMIZE] Input: {len(segments)} segments")
-
-    # Filtrer les segments trop courts
-    filtered = []
-    for seg in segments:
-        duration = float(seg["end"]) - float(seg["start"])
-        if duration >= MIN_SEG_DUR:
-            filtered.append(seg)
-        else:
-            log(f"[OPTIMIZE] Filtered short segment: {duration:.1f}s < {MIN_SEG_DUR}s")
-
-    log(f"[OPTIMIZE] After filtering: {len(filtered)} segments")
-
-    # Fusion ULTRA-AGRESSIVE
-    if AGGRESSIVE_MERGE and filtered:
-        filtered = ultra_aggressive_merge(filtered, max_gap=3.0)
-    elif MERGE_CONSECUTIVE and filtered:
-        filtered = merge_consecutive_segments(filtered, max_gap=2.0)
-    
-    # Supprimer les speakers avec trop peu de temps total
-    if MIN_SPEAKER_TIME > 0:
-        speaker_times = {}
-        for seg in filtered:
-            speaker = seg["speaker"]
-            duration = float(seg["end"]) - float(seg["start"])
-            speaker_times[speaker] = speaker_times.get(speaker, 0) + duration
-        
-        valid_speakers = {s for s, t in speaker_times.items() if t >= MIN_SPEAKER_TIME}
-        if valid_speakers:
-            before_count = len(filtered)
-            filtered = [seg for seg in filtered if seg["speaker"] in valid_speakers]
-            log(f"[OPTIMIZE] Kept speakers: {valid_speakers}")
-            log(f"[OPTIMIZE] After speaker filtering: {before_count} → {len(filtered)} segments")
-    
-    log(f"[OPTIMIZE] Final: {len(segments)} → {len(filtered)} segments")
-    return filtered
-
-# ---------------------------
-# DÉTECTION MUSIQUE D'ATTENTE (pré-inférence, librosa)
-# ---------------------------
-
+# =============================================================================
+# DÉTECTION MUSIQUE D'ATTENTE
+# =============================================================================
 def detect_hold_music(audio_path: str) -> Dict[str, Any]:
-    """
-    Détecte si un fichier audio est de la musique d'attente en analysant
-    le ratio de frames contenant de la parole via l'énergie RMS.
-    Utilise soundfile (lecture native sans resampling) + numpy pur.
-    Temps d'exécution typique : < 0.5s.
-    """
     import soundfile as sf
     import numpy as np
-
-    t0 = time.time()
-    result = {
-        "is_hold_music": False,
-        "speech_ratio": 1.0,
-        "duration": 0.0,
-        "reason": "",
-        "detection_time": 0.0,
-    }
-
+    t0     = time.time()
+    result = {"is_hold_music": False, "speech_ratio": 1.0, "duration": 0.0, "reason": "", "detection_time": 0.0}
     try:
-        # Lecture rapide à la fréquence native (pas de resampling)
         y, sr = sf.read(audio_path, dtype="float32")
-
-        # Convertir en mono si stéréo
         if y.ndim > 1:
             y = np.mean(y, axis=1)
-
         duration = len(y) / sr
         result["duration"] = round(duration, 2)
-
-        # Fichiers trop courts : pas de détection
         if duration < HOLD_MUSIC_MIN_DURATION:
-            result["reason"] = f"too_short ({duration:.1f}s < {HOLD_MUSIC_MIN_DURATION}s)"
+            result["reason"] = f"too_short ({duration:.1f}s)"
             result["detection_time"] = round(time.time() - t0, 3)
-            log(f"[HOLD_MUSIC] Skip: {result['reason']}")
             return result
-
-        # Énergie RMS par frame (30 ms frames, 10 ms hop) - numpy pur
         frame_length = int(0.030 * sr)
-        hop_length = int(0.010 * sr)
-        n_frames = 1 + (len(y) - frame_length) // hop_length
-        rms = np.empty(n_frames, dtype=np.float32)
-        for i in range(n_frames):
-            start = i * hop_length
-            frame = y[start:start + frame_length]
-            rms[i] = np.sqrt(np.mean(frame * frame))
-
-        # Normaliser par le pic d'amplitude
+        hop_length   = int(0.010 * sr)
+        n_frames     = 1 + (len(y) - frame_length) // hop_length
+        rms = np.array([np.sqrt(np.mean(y[i*hop_length:i*hop_length+frame_length]**2)) for i in range(n_frames)], dtype=np.float32)
         peak = np.max(np.abs(y))
         if peak < 1e-6:
-            result["is_hold_music"] = True
-            result["speech_ratio"] = 0.0
-            result["reason"] = "silent_audio"
+            result.update({"is_hold_music": True, "speech_ratio": 0.0, "reason": "silent_audio"})
             result["detection_time"] = round(time.time() - t0, 3)
-            log(f"[HOLD_MUSIC] Detected: silent audio ({duration:.1f}s)")
             return result
-
-        rms_norm = rms / peak
-
-        # Seuil dynamique : médiane + 1.5 * écart-type
-        median_rms = float(np.median(rms_norm))
-        std_rms = float(np.std(rms_norm))
-        speech_threshold = median_rms + 1.5 * std_rms
-
-        # Ratio de frames "parole" (énergie > seuil)
-        speech_mask = rms_norm > speech_threshold
-        speech_frames = int(np.sum(speech_mask))
-        total_frames = len(rms_norm)
-        speech_ratio = speech_frames / total_frames if total_frames > 0 else 1.0
-        result["speech_ratio"] = round(float(speech_ratio), 4)
-
-        # --- Analyse par blocs : découper en chunks de 5s et classer speech/music ---
-        chunk_sec = 5.0
+        rms_norm        = rms / peak
+        speech_threshold = float(np.median(rms_norm)) + 1.5 * float(np.std(rms_norm))
+        speech_mask      = rms_norm > speech_threshold
+        speech_ratio     = float(np.sum(speech_mask)) / len(rms_norm)
+        result["speech_ratio"] = round(speech_ratio, 4)
+        chunk_sec    = 5.0
         chunk_frames = max(1, int(chunk_sec * sr / hop_length))
-        n_chunks = max(1, total_frames // chunk_frames)
-        chunk_is_speech = []
-        for ci in range(n_chunks):
-            cstart = ci * chunk_frames
-            cend = min(cstart + chunk_frames, total_frames)
-            density = float(np.mean(speech_mask[cstart:cend]))
-            chunk_is_speech.append(density >= 0.05)
-
-        # Construire les blocs de parole contigus (avec marge de 2s)
+        n_chunks     = max(1, len(rms_norm) // chunk_frames)
+        chunk_is_speech = [float(np.mean(speech_mask[ci*chunk_frames:min((ci+1)*chunk_frames, len(rms_norm))])) >= 0.05
+                           for ci in range(n_chunks)]
         speech_blocks = []
         in_block = False
-        block_start_idx = 0
+        block_start = 0
         for ci, is_sp in enumerate(chunk_is_speech):
             if is_sp and not in_block:
-                block_start_idx = ci
-                in_block = True
+                block_start = ci; in_block = True
             elif not is_sp and in_block:
-                s = max(0.0, block_start_idx * chunk_sec - 2.0)
+                s = max(0.0, block_start * chunk_sec - 2.0)
                 e = min(duration, ci * chunk_sec + 2.0)
                 if e - s >= 3.0:
                     speech_blocks.append((round(s, 2), round(e, 2)))
                 in_block = False
         if in_block:
-            s = max(0.0, block_start_idx * chunk_sec - 2.0)
-            e = duration
-            if e - s >= 3.0:
-                speech_blocks.append((round(s, 2), round(e, 2)))
-
-        # Fusionner les blocs proches (gap < 10s)
+            s = max(0.0, block_start * chunk_sec - 2.0)
+            if duration - s >= 3.0:
+                speech_blocks.append((round(s, 2), round(duration, 2)))
         if len(speech_blocks) > 1:
             merged = [list(speech_blocks[0])]
             for sb in speech_blocks[1:]:
@@ -1473,2266 +663,618 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
                 else:
                     merged.append(list(sb))
             speech_blocks = [(round(s, 2), round(e, 2)) for s, e in merged]
-
         has_speech_start = any(s < duration * 0.30 for s, _ in speech_blocks)
-        has_speech_end = any(e > duration * 0.70 for _, e in speech_blocks)
+        has_speech_end   = any(e > duration * 0.70 for _, e in speech_blocks)
         total_speech_sec = sum(e - s for s, e in speech_blocks)
-        total_gap_sec = duration - total_speech_sec
-
+        total_gap_sec    = duration - total_speech_sec
         log(f"[HOLD_MUSIC] Analysis: duration={duration:.1f}s, speech_ratio={speech_ratio:.4f}, "
-            f"blocks={speech_blocks}, speech_start={has_speech_start}, speech_end={has_speech_end}, "
-            f"speech_sec={total_speech_sec:.1f}s, gap_sec={total_gap_sec:.1f}s")
-
-        # --- Règle 1 : parole au début ET à la fin → JAMAIS musique d'attente ---
+            f"blocks={speech_blocks}, speech_sec={total_speech_sec:.1f}s, gap_sec={total_gap_sec:.1f}s")
         if has_speech_start and has_speech_end:
             result["reason"] = "conversation_with_gaps"
-            if total_gap_sec > 30 and len(speech_blocks) >= 1:
+            if total_gap_sec > 30 and speech_blocks:
                 result["speech_blocks"] = speech_blocks
             result["detection_time"] = round(time.time() - t0, 3)
-            log(f"[HOLD_MUSIC] Conversation with gaps, {len(speech_blocks)} block(s), "
-                f"trimmable={total_gap_sec:.0f}s")
             return result
-
-        # --- Règle 2 : parole quelque part → pas musique d'attente, trimmer ---
         if has_speech_start or has_speech_end:
             result["reason"] = "partial_speech"
             if total_gap_sec > 15:
                 result["speech_blocks"] = speech_blocks
             result["detection_time"] = round(time.time() - t0, 3)
-            log(f"[HOLD_MUSIC] Partial speech detected, blocks={speech_blocks}")
             return result
-
-        # --- Règle 3 : aucun bloc de parole détecté + ratio très bas → musique d'attente ---
         if speech_ratio < HOLD_MUSIC_SPEECH_RATIO_HARD:
-            result["is_hold_music"] = True
-            result["reason"] = f"hard_threshold (ratio={speech_ratio:.4f}, no speech blocks)"
+            result.update({"is_hold_music": True, "reason": f"hard_threshold (ratio={speech_ratio:.4f})"})
             result["detection_time"] = round(time.time() - t0, 3)
-            log(f"[HOLD_MUSIC] Detected: {result['reason']} ({duration:.1f}s)")
             return result
-
         if speech_ratio < HOLD_MUSIC_SPEECH_RATIO_SOFT and duration > 60.0:
-            result["is_hold_music"] = True
-            result["reason"] = (f"soft_threshold (ratio={speech_ratio:.4f}, no speech blocks, "
-                                f"duration={duration:.1f}s)")
+            result.update({"is_hold_music": True, "reason": f"soft_threshold (ratio={speech_ratio:.4f})"})
             result["detection_time"] = round(time.time() - t0, 3)
-            log(f"[HOLD_MUSIC] Detected: {result['reason']}")
             return result
-
-        # --- Pas de musique d'attente, mais vérifier s'il y a des gaps à trimmer ---
         if total_gap_sec > 30 and speech_blocks:
             result["reason"] = "normal_with_trimmable_gaps"
             result["speech_blocks"] = speech_blocks
-            result["detection_time"] = round(time.time() - t0, 3)
-            log(f"[HOLD_MUSIC] Normal speech with {total_gap_sec:.0f}s trimmable gaps")
-            return result
-
-        result["reason"] = "normal_speech"
+        else:
+            result["reason"] = "normal_speech"
         result["detection_time"] = round(time.time() - t0, 3)
-        log(f"[HOLD_MUSIC] Normal: ratio={speech_ratio:.4f} ({duration:.1f}s) [{result['detection_time']:.3f}s]")
         return result
-
     except Exception as e:
-        log(f"[HOLD_MUSIC] Error during detection: {e} - skipping")
+        log(f"[HOLD_MUSIC] Error: {e} — skipping")
         result["reason"] = f"error: {e}"
         result["detection_time"] = round(time.time() - t0, 3)
         return result
 
-
 def build_hold_music_response(hold_music_result: Dict[str, Any], with_summary: bool) -> Dict[str, Any]:
-    """
-    Construit une réponse structurée identique au format existant
-    pour un fichier détecté comme musique d'attente.
-    """
     out: Dict[str, Any] = {
-        "segments": [],
-        "transcript": "",
-        "language": "fr",
+        "segments": [], "transcript": "", "language": "fr",
         "audio_duration": hold_music_result.get("duration", 0.0),
         "hold_music_detected": True,
         "hold_music_speech_ratio": hold_music_result.get("speech_ratio", 0.0),
         "hold_music_reason": hold_music_result.get("reason", ""),
         "hold_music_detection_time": hold_music_result.get("detection_time", 0.0),
-        "mood_overall": "neutral",
-        "mood_by_speaker": {},
+        "mood_overall": "neutral", "mood_by_speaker": {},
     }
-
     if with_summary:
         out["summary"] = "Aucune conversation détectée - musique d'attente uniquement."
-
     return out
 
-
 def trim_audio_to_speech_blocks(local_path: str, hold_music_result: Dict[str, Any], cleanup: bool) -> Tuple[str, bool]:
-    """
-    Extrait les blocs de parole et supprime les sections de musique d'attente.
-    Retourne (nouveau_chemin, nouveau_cleanup).
-    """
     speech_blocks = hold_music_result.get("speech_blocks")
     if not speech_blocks:
         return local_path, cleanup
-
     try:
-        audio = AudioSegment.from_file(local_path)
+        audio        = AudioSegment.from_file(local_path)
         original_sec = len(audio) / 1000.0
-
-        # Extraire et concaténer les blocs de parole
-        parts = []
-        for s, e in speech_blocks:
-            start_ms = int(s * 1000)
-            end_ms = int(e * 1000)
-            parts.append(audio[start_ms:end_ms])
-
+        parts = [audio[int(s * 1000):int(e * 1000)] for s, e in speech_blocks]
         if not parts:
             return local_path, cleanup
-
-        trimmed = parts[0]
+        trimmed     = parts[0]
         for part in parts[1:]:
             trimmed += part
-
         trimmed_sec = len(trimmed) / 1000.0
         removed_sec = original_sec - trimmed_sec
-
-        # Ne trimmer que si on gagne au moins 15 secondes
         if removed_sec < 15:
             log(f"[TRIM] Only {removed_sec:.0f}s to remove, keeping original")
             return local_path, cleanup
-
         trimmed_path = local_path.rsplit(".", 1)[0] + "_trimmed.wav"
         trimmed.export(trimmed_path, format="wav")
-        log(f"[TRIM] Extracted {len(speech_blocks)} speech block(s): "
-            f"{original_sec:.1f}s → {trimmed_sec:.1f}s (removed {removed_sec:.0f}s of music)")
-
+        log(f"[TRIM] {original_sec:.1f}s → {trimmed_sec:.1f}s (removed {removed_sec:.0f}s of music)")
         if cleanup:
             os.remove(local_path)
         return trimmed_path, True
-
     except Exception as e:
-        log(f"[TRIM] Failed, using original: {e}")
+        log(f"[TRIM] Failed: {e}")
         return local_path, cleanup
 
-
-# ---------------------------
-# DÉTECTION ET TRAITEMENT DES ANNONCES/IVR
-# ---------------------------
-
+# =============================================================================
+# DÉTECTION VOIX UNIQUE (annonces / IVR / messagerie)
+# =============================================================================
 def detect_single_voice_content(wav_path: str, language: Optional[str]) -> Dict[str, Any]:
-    """
-    Détecte si l'enregistrement contient une annonce/IVR (une seule voix)
-    et génère un résumé adapté.
-    """
     log("[SINGLE_VOICE] Detecting single voice content...")
-    
-    # Instruction spécialisée pour détecter le type de contenu
     instruction = (
         f"lang:{language or 'fr'} "
         "Analyse ce contenu audio et détermine s'il s'agit de :\n"
-        "1) Une conversation entre deux personnes (Agent + Client)\n"
-        "2) Une annonce automatique/IVR (une seule voix)\n"
-        "3) Un message vocal laissé par un client\n\n"
-        "Si c'est une annonce/IVR, résume le contenu en 1-2 phrases.\n"
-        "Si c'est une conversation, réponds 'CONVERSATION'.\n"
-        "Si c'est un message vocal, réponds 'MESSAGE_VOCAL'."
+        "1) Une conversation entre deux personnes → réponds 'CONVERSATION'\n"
+        "2) Une annonce automatique/IVR → résume le contenu en 1-2 phrases\n"
+        "3) Un message vocal → réponds 'MESSAGE_VOCAL'"
     )
-    
-    conversation = [{
-        "role": "user",
-        "content": [
-            {"type": "audio", "path": wav_path},
-            {"type": "text", "text": instruction}
-        ]
-    }]
-    
+    conv = [{"role": "user", "content": [
+        {"type": "audio", "path": wav_path},
+        {"type": "text", "text": instruction}
+    ]}]
     try:
-        result = run_voxtral_with_timeout(conversation, max_new_tokens=64, timeout=SINGLE_VOICE_DETECTION_TIMEOUT)
+        result   = run_voxtral_with_timeout(conv, max_new_tokens=64, timeout=SINGLE_VOICE_DETECTION_TIMEOUT)
         response = (result.get("text") or "").strip().lower()
-        
         log(f"[SINGLE_VOICE] Detection result: '{response}'")
-        
         if "conversation" in response:
             return {"type": "conversation", "summary": None}
         elif "message_vocal" in response:
             return {"type": "voicemail", "summary": response}
         else:
-            # Probablement une annonce/IVR
             return {"type": "announcement", "summary": response}
-            
     except Exception as e:
         log(f"[SINGLE_VOICE] Detection failed: {e}")
         return {"type": "unknown", "summary": None}
 
 def transcribe_single_voice_content(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
-    """
-    Mode spécialisé pour les enregistrements à une seule voix (annonces/IVR).
-    """
     log("[SINGLE_VOICE] Processing single voice content...")
-    
-    # Durée max
-    try:
-        import soundfile as sf
-        info = sf.info(wav_path)
-        est_dur = info.frames / float(info.samplerate or 1)
-        log(f"[SINGLE_VOICE] Audio duration: {est_dur:.1f}s")
-        if est_dur > MAX_DURATION_S:
-            return {"error": f"Audio too long ({est_dur:.1f}s). Increase MAX_DURATION_S or send shorter file."}
-    except Exception as e:
-        log(f"[SINGLE_VOICE] Could not check duration: {e}")
-        est_dur = 180.0  # Durée par défaut
-    
-    # Transcription simple sans diarization
-    conv_simple = _build_conv_transcribe_ultra_strict(wav_path, language or "fr")
-    out_simple = run_voxtral_with_timeout(conv_simple, max_new_tokens=max_new_tokens, timeout=60)
-    full_text = (out_simple.get("text") or "").strip()
-    
+    ok, err, est_dur = _validate_audio(wav_path)
+    if not ok:
+        return {"error": err}
+    conv     = [{"role": "user", "content": [
+        {"type": "audio", "path": wav_path},
+        {"type": "text", "text": f"lang:{language or 'fr'} [TRANSCRIBE] Écris exactement ce qui est dit, mot pour mot."}
+    ]}]
+    out      = run_voxtral_with_timeout(conv, max_new_tokens=max_new_tokens, timeout=60)
+    full_text = (out.get("text") or "").strip()
     if not full_text:
         return {"error": "Empty transcription for single voice content"}
-    
-    # Créer un segment unique
-    segments = [{
-        "speaker": "System",
-        "start": 0.0,
-        "end": est_dur,
-        "text": full_text,
-        "mood": None
-    }]
-    
+    segments = [{"speaker": "System", "start": 0.0, "end": est_dur, "text": full_text, "mood": None}]
     full_transcript = f"System: {full_text}"
     result = {"segments": segments, "transcript": full_transcript}
-    
-    # Résumé spécialisé pour les annonces
     if with_summary:
-        log("[SINGLE_VOICE] Generating announcement summary...")
-        summary_instruction = (
-            f"lang:{language or 'fr'} "
-            "Résume cette annonce automatique en 1-2 phrases claires. "
-            "Indique le type d'annonce (accueil, information, etc.) et le message principal."
-        )
-        
-        summary_conv = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": f"{summary_instruction}\n\nContenu: {full_text}"}
-            ]
-        }]
-        
+        summary_conv = [{"role": "user", "content": [{"type": "text", "text":
+            f"lang:{language or 'fr'} Résume cette annonce automatique en 1-2 phrases claires.\n\nContenu: {full_text}"
+        }]}]
         try:
-            summary_result = run_voxtral_with_timeout(summary_conv, max_new_tokens=SINGLE_VOICE_SUMMARY_TOKENS, timeout=20)
-            result["summary"] = (summary_result.get("text") or "").strip()
-        except Exception as e:
-            log(f"[SINGLE_VOICE] Summary generation failed: {e}")
+            sr = run_voxtral_with_timeout(summary_conv, max_new_tokens=SINGLE_VOICE_SUMMARY_TOKENS, timeout=20)
+            result["summary"] = (sr.get("text") or "").strip()
+        except Exception:
             result["summary"] = f"Annonce automatique: {full_text[:100]}..."
-    
-    # Sentiment neutre pour les annonces
     if ENABLE_SENTIMENT:
-        result["mood_overall"] = {
-            "label_en": "neutral",
-            "label_fr": "neutre",
-            "confidence": 0.95,
-            "scores": {"negative": 0.0, "neutral": 0.95, "positive": 0.05}
-        }
-        result["mood_by_speaker"] = {"System": result["mood_overall"]}
-    
-    log("[SINGLE_VOICE] Single voice processing completed")
+        neutral = {"label_en": "neutral", "label_fr": "neutre", "confidence": 0.95,
+                   "scores": {"negative": 0.0, "neutral": 0.95, "positive": 0.05}}
+        result["mood_overall"]    = neutral
+        result["mood_by_speaker"] = {"System": neutral}
+        result["mood_client"]     = neutral
     return result
 
-# ---------------------------
-# MODES DE DIARIZATION AVANCÉS
-# ---------------------------
-
-def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
-    """
-    MODE VOXTRAL SPEAKER ID : 
-    Demande directement à Voxtral d'identifier les speakers par le contexte conversationnel
-    """
-    log(f"[VOXTRAL_ID] Starting Voxtral-based speaker identification: language={language}")
-    
-    # Durée max
-    try:
-        log("[VOXTRAL_ID] Checking audio duration...")
-        import soundfile as sf
-        info = sf.info(wav_path)
-        est_dur = info.frames / float(info.samplerate or 1)
-        log(f"[VOXTRAL_ID] Audio duration: {est_dur:.1f}s")
-        if est_dur > MAX_DURATION_S:
-            return {"error": f"Audio too long ({est_dur:.1f}s). Increase MAX_DURATION_S or send shorter file."}
-    except Exception as e:
-        log(f"[VOXTRAL_ID] Could not check duration: {e}")
-
-    # INSTRUCTION SPÉCIALISÉE POUR IDENTIFICATION DES SPEAKERS
-    instruction = (
-        f"lang:{language or 'fr'} "
-        "Écoute TOUT l'audio jusqu'à la fin, même s'il y a de la musique d'attente ou du silence au début. "
-        "SAUTE la musique, les annonces d'attente, les silences et les tonalités - ne génère RIEN pour ces parties. "
-        "Transcris UNIQUEMENT les conversations humaines.\n\n"
-        "FORMAT OBLIGATOIRE - chaque prise de parole sur une nouvelle ligne:\n"
-        "Agent: [phrase de l'agent]\n"
-        "Client: [phrase du client]\n"
-        "Agent: [phrase suivante de l'agent]\n"
-        "etc.\n\n"
-        "IMPORTANT: Alterne Agent/Client à chaque changement de locuteur. "
-        "Indications:\n"
-        "- Agent = celui qui répond, dit 'bonjour', 'cabinet', 'je vais voir', 'on vous rappelle'\n"
-        "- Client = celui qui appelle, dit 'je voudrais', 'ma femme', 'est-ce que je peux'\n\n"
-        "Ne mentionne JAMAIS [Musique], [Silence] ou [Attente]."
-    )
-    
-    # TRANSCRIPTION AVEC IDENTIFICATION DES SPEAKERS EN UNE PASSE
-    log("[VOXTRAL_ID] Starting transcription with speaker identification...")
-    conv_speaker_id = [{
-        "role": "user",
-        "content": [
-            {"type": "audio", "path": wav_path},
-            {"type": "text", "text": instruction}
-        ]
-    }]
-    
-    # Ajuster les tokens selon la durée (augmenté pour éviter les troncatures)
-    # Retirer le min() pour ne pas limiter par MAX_NEW_TOKENS global
-    speaker_tokens = int(est_dur * 15)  # ~15 tokens par seconde pour éviter les troncatures
-    out_speaker_id = run_voxtral_with_timeout(conv_speaker_id, max_new_tokens=speaker_tokens, timeout=120)
-    speaker_transcript = (out_speaker_id.get("text") or "").strip()
-
-    if not speaker_transcript:
-        log("[VOXTRAL_ID] Empty speaker identification result, falling back to hybrid mode")
-        return diarize_then_transcribe_hybrid(wav_path, language, max_new_tokens, with_summary)
-
-    # Nettoyer les boucles de répétition (bug Voxtral)
-    original_len = len(speaker_transcript)
-    speaker_transcript = remove_repetitive_loops(speaker_transcript, max_repetitions=5)
-
-    # Vérification de cohérence : ratio chars/seconde anormalement élevé ?
-    chars_per_sec = len(speaker_transcript) / max(est_dur, 1)
-    if chars_per_sec > 50:  # Normal = 15-30 chars/sec pour du français parlé
-        log(f"[VOXTRAL_ID] WARNING: Suspicious chars/sec ratio: {chars_per_sec:.1f} (expected ~15-30). Possible repetition bug.")
-
-    if original_len != len(speaker_transcript):
-        log(f"[VOXTRAL_ID] Cleaned repetitive loops: {original_len} -> {len(speaker_transcript)} chars")
-
-    log(f"[VOXTRAL_ID] Speaker identification completed: {len(speaker_transcript)} chars in {out_speaker_id.get('latency_s', 0):.1f}s")
-    log(f"[VOXTRAL_ID] Raw transcript (first 500 chars): {speaker_transcript[:500]}")
-
-    # Nettoyer les tags musique/silence du transcript
-    import re
-    speaker_transcript = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]\s*', '', speaker_transcript, flags=re.IGNORECASE)
-    speaker_transcript = speaker_transcript.strip()
-
-    if len(speaker_transcript) < 10:
-        log(f"[VOXTRAL_ID] Transcript too short after cleanup ({len(speaker_transcript)} chars), returning empty result")
-        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée (musique/silence uniquement)."}
-
-    # PARSING DU RÉSULTAT AVEC SPEAKERS IDENTIFIÉS
-    log("[VOXTRAL_ID] Parsing speaker-identified transcript...")
-    segments = parse_speaker_identified_transcript(speaker_transcript, est_dur)
-
-    if not segments:
-        # Premier essai échoué - Voxtral n'a pas séparé les speakers
-        # On réessaie avec un prompt plus forcé
-        log("[VOXTRAL_ID] No speaker format found, retrying with forced diarization prompt...")
-
-        forced_instruction = (
-            f"lang:{language or 'fr'} "
-            "Tu DOIS séparer les speakers. Voici le transcript brut, reformate-le:\n\n"
-            f"{speaker_transcript}\n\n"
-            "REFORMATE en séparant OBLIGATOIREMENT Agent et Client. Format:\n"
-            "Agent: [sa phrase]\n"
-            "Client: [sa phrase]\n"
-            "Agent: [sa phrase]\n"
-            "etc.\n\n"
-            "L'Agent est celui qui répond/travaille. Le Client est celui qui appelle/demande."
-        )
-
-        conv_retry = [{
-            "role": "user",
-            "content": [{"type": "text", "text": forced_instruction}]
-        }]
-
-        retry_tokens = min(max_new_tokens, int(len(speaker_transcript) * 1.5))
-        out_retry = run_voxtral_with_timeout(conv_retry, max_new_tokens=retry_tokens, timeout=60)
-        retry_transcript = (out_retry.get("text") or "").strip()
-
-        if retry_transcript:
-            log(f"[VOXTRAL_ID] Retry transcript: {len(retry_transcript)} chars")
-            log(f"[VOXTRAL_ID] Retry raw (first 300 chars): {retry_transcript[:300]}")
-            segments = parse_speaker_identified_transcript(retry_transcript, est_dur)
-
-        # Si toujours pas de segments, on garde le transcript brut
-        if not segments:
-            log("[VOXTRAL_ID] Retry failed, using raw transcript as single segment")
-            segments = [{
-                "speaker": "Agent",
-                "start": 0.0,
-                "end": est_dur,
-                "text": speaker_transcript.strip()
-            }]
-
-    log(f"[VOXTRAL_ID] Parsed {len(segments)} segments from speaker-identified transcript")
-
-    # POST-TRAITEMENT STANDARD
-    segments = _enforce_max_two_speakers(segments)
-    _map_roles(segments)  # D'abord mapper SPEAKER_XX → Agent/Client
-    segments = detect_and_fix_speaker_inversion(segments)  # Puis corriger les erreurs évidentes
-    
-    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
-    result = {"segments": segments, "transcript": full_transcript}
-    
-    # Résumé (utilise la durée audio pour adapter le nombre de tokens)
-    if with_summary:
-        log("[VOXTRAL_ID] Generating summary...")
-        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=est_dur)
-    
-    # Sentiment par speaker (analyse améliorée)
-    if ENABLE_SENTIMENT:
-        log("[VOXTRAL_ID] Computing sentiment analysis by speaker...")
-
-        # Analyse le sentiment pour chaque speaker séparément
-        speaker_sentiments = analyze_sentiment_by_speaker(segments)
-
-        if speaker_sentiments:
-            # Attribuer le sentiment spécifique à chaque segment
-            for seg in segments:
-                speaker = seg.get("speaker")
-                if speaker and speaker in speaker_sentiments:
-                    seg["mood"] = speaker_sentiments[speaker]
-
-            # Mood overall (moyenne pondérée de tous les speakers)
-            weighted_moods = []
-            for seg in segments:
-                if seg.get("text") and seg.get("mood"):
-                    duration = float(seg["end"]) - float(seg["start"])
-                    weighted_moods.append((seg["mood"], duration))
-            result["mood_overall"] = aggregate_mood(weighted_moods) if weighted_moods else None
-
-            # Mood par speaker (déjà calculé)
-            result["mood_by_speaker"] = speaker_sentiments
-
-            # NOUVEAU: Sentiment du client identifié
-            client_mood = get_client_sentiment(speaker_sentiments, segments)
-            result["mood_client"] = client_mood
-
-            # Protection maximale contre None
-            confidence_raw = client_mood.get('confidence')
-            if confidence_raw is None:
-                confidence = 0.0
-                log(f"[VOXTRAL_ID] WARNING: Client sentiment confidence is None, using 0.0")
+# =============================================================================
+# PIPELINE PRINCIPAL — VOXTRAL SPEAKER ID
+# =============================================================================
+def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
+    if not text or len(text) < 20:
+        return text
+    for pattern_len in range(3, 21):
+        if len(text) < pattern_len * max_repetitions:
+            continue
+        pattern    = text[-pattern_len:]
+        repetitions = 0
+        pos         = len(text)
+        while pos >= pattern_len:
+            if text[pos - pattern_len:pos] == pattern:
+                repetitions += 1; pos -= pattern_len
             else:
-                confidence = float(confidence_raw)
-
-            label_fr = client_mood.get('label_fr') or 'inconnu'
-            log(f"[VOXTRAL_ID] Client sentiment: {label_fr} (confidence: {confidence:.2f})")
-
-    log("[VOXTRAL_ID] Voxtral speaker identification completed successfully")
-    return result
+                break
+        if repetitions > max_repetitions:
+            truncate_pos = pos + pattern_len * 2
+            log(f"[CLEANUP] Pattern loop '{pattern[:15]}...' ×{repetitions}, truncating")
+            return text[:min(truncate_pos, len(text))]
+    words = text.split()
+    if len(words) < 10:
+        return text
+    cleaned = []
+    rep_count = 1
+    last_word = None
+    for word in words:
+        if word == last_word:
+            rep_count += 1
+            if rep_count > max_repetitions:
+                break
+        else:
+            rep_count = 1; last_word = word
+        cleaned.append(word)
+    return " ".join(cleaned)
 
 def merge_micro_segments(segments: List[Dict[str, Any]], max_duration: float = 2.0, max_gap: float = 1.0) -> List[Dict[str, Any]]:
-    """
-    Fusionne les micro-segments consécutifs du même speaker.
-    Utile pour éviter les lignes multiples quand quelqu'un épelle des chiffres ou lettres.
-
-    Args:
-        segments: Liste des segments à fusionner
-        max_duration: Durée max d'un segment pour être considéré comme "micro" (secondes)
-        max_gap: Gap max entre deux segments pour les fusionner (secondes)
-
-    Returns:
-        Liste des segments fusionnés
-    """
     if not segments:
         return segments
-
-    log(f"[MERGE_MICRO] Input: {len(segments)} segments")
-
     merged = []
     i = 0
-
     while i < len(segments):
         current = segments[i].copy()
-
-        # Fusionner les segments consécutifs du même speaker s'ils sont très courts
         while i + 1 < len(segments):
-            next_seg = segments[i + 1]
-            duration_current = current["end"] - current["start"]
-            duration_next = next_seg["end"] - next_seg["start"]
-            gap = next_seg["start"] - current["end"]
-
-            # Fusionner si:
-            # - Même speaker
-            # - Au moins un des deux segments est court (< max_duration)
-            # - Le gap entre eux est petit (< max_gap)
-            if (current["speaker"] == next_seg["speaker"] and
-                (duration_current < max_duration or duration_next < max_duration) and
-                gap < max_gap):
-
-                # Fusionner le texte
-                current["text"] = current["text"] + " " + next_seg["text"]
-                current["end"] = next_seg["end"]
-
-                log(f"[MERGE_MICRO] Merged: '{current['text'][:50]}...' ({duration_current:.1f}s + {duration_next:.1f}s)")
-
+            nxt = segments[i + 1]
+            if (current["speaker"] == nxt["speaker"] and
+                (current["end"] - current["start"] < max_duration or nxt["end"] - nxt["start"] < max_duration) and
+                nxt["start"] - current["end"] < max_gap):
+                current["text"] = current["text"] + " " + nxt["text"]
+                current["end"]  = nxt["end"]
                 i += 1
             else:
                 break
-
         merged.append(current)
         i += 1
-
-    log(f"[MERGE_MICRO] Output: {len(merged)} segments (reduced by {len(segments) - len(merged)})")
+    log(f"[MERGE_MICRO] {len(segments)} → {len(merged)} segments")
     return merged
 
 def parse_speaker_identified_transcript(transcript: str, total_duration: float) -> List[Dict[str, Any]]:
-    """
-    Parse le transcript avec speakers identifiés par Voxtral
-    Supporte deux formats:
-    1. Multi-lignes: chaque ligne = "Speaker: text"
-    2. Inline: tout sur une ligne avec "Agent: ... Client: ... Agent: ..."
-    """
     if not transcript:
         return []
-
-    segments = []
+    segments     = []
     current_time = 0.0
-
-    # D'abord essayer de parser ligne par ligne
-    lines = transcript.split('\n')
-    log(f"[PARSE] Processing {len(lines)} lines from speaker transcript")
-
-    valid_lines = []
-
-    # Si une seule ligne, utiliser le parsing inline
+    lines        = transcript.split('\n')
+    valid_lines  = []
     if len(lines) == 1 or (len(lines) == 2 and not lines[1].strip()):
-        # Parsing inline: chercher tous les "Agent:" et "Client:"
-        text = lines[0].strip()
-
-        # Regex pour trouver tous les patterns "Agent:" ou "Client:" suivis de texte
-        import re
-        pattern = r'(Agent|Client):\s*([^:]+?)(?=\s*(?:Agent:|Client:|$))'
+        text    = lines[0].strip()
+        # Accepte Agent/Client mais aussi Secrétaire/Patient/Médecin/Docteur/Praticien/Appelant
+        pattern = r'(Agent|Client|Secrétaire|Secretaire|Patient|Médecin|Medecin|Docteur|Praticien|Appelant|AGENT|CLIENT):\s*([^:]+?)(?=\s*(?:Agent:|Client:|Secrétaire:|Secretaire:|Patient:|Médecin:|Medecin:|Docteur:|Praticien:|Appelant:|AGENT:|CLIENT:|$))'
         matches = re.findall(pattern, text, re.IGNORECASE)
-
         log(f"[PARSE] Inline mode: found {len(matches)} speaker segments")
-
-        # Mapper vers SPEAKER_00/SPEAKER_01 pour uniformiser
-        speaker_mapping = {}
+        speaker_mapping: Dict[str, str] = {}
         speaker_counter = 0
-
+        # Normaliser les variantes vers Agent/Client
+        agent_variants  = {"agent", "secrétaire", "secretaire", "médecin", "medecin", "docteur", "praticien"}
+        client_variants = {"client", "patient", "appelant"}
         for speaker_raw, text_part in matches:
-            speaker_normalized = speaker_raw.capitalize()
-
-            if speaker_normalized not in speaker_mapping:
-                speaker_mapping[speaker_normalized] = f"SPEAKER_{speaker_counter:02d}"
-                speaker_counter += 1
-
-            speaker = speaker_mapping[speaker_normalized]
-            text_part = text_part.strip()
-
-            if text_part:
-                # Nettoyer les répétitions
-                text_part = remove_repetitive_loops(text_part, max_repetitions=3)
-                if text_part:
-                    valid_lines.append((speaker, text_part))
+            sn_lower = speaker_raw.lower().strip()
+            if sn_lower in agent_variants:
+                sn = "Agent"
+            elif sn_lower in client_variants:
+                sn = "Client"
+            else:
+                sn = speaker_raw.capitalize()
+            if sn not in speaker_mapping:
+                speaker_mapping[sn] = f"SPEAKER_{speaker_counter:02d}"; speaker_counter += 1
+            tp = remove_repetitive_loops(text_part.strip(), max_repetitions=3)
+            if tp:
+                valid_lines.append((speaker_mapping[sn], tp))
     else:
-        # Parsing multi-lignes (mode original)
         speaker_mapping = {}
         speaker_counter = 0
-
         for line in lines:
             line = line.strip()
-            if not line:
+            if not line or ':' not in line:
                 continue
-
-            # Chercher les patterns Speaker: text
-            if ':' in line:
-                parts = line.split(':', 1)
-                if len(parts) == 2:
-                    speaker_part = parts[0].strip()
-                    text_part = parts[1].strip()
-
-                    # Normaliser les noms de speakers vers Agent/Client
-                    if any(word in speaker_part.lower() for word in ['agent', 'professionnel', 'cabinet', 'secrétaire']):
-                        speaker_normalized = "Agent"
-                    elif any(word in speaker_part.lower() for word in ['client', 'appelant', 'patient']):
-                        speaker_normalized = "Client"
-                    elif speaker_part.lower() in ['agent', 'client']:
-                        speaker_normalized = speaker_part.capitalize()
-                    else:
-                        # Speaker non identifié, essayer de deviner par le contenu
-                        if any(word in text_part.lower() for word in ['cabinet', 'bonjour', 'je vais voir', 'on vous rappelle']):
-                            speaker_normalized = "Agent"
-                        elif any(word in text_part.lower() for word in ['je voudrais', 'ma femme', 'est-ce que je peux']):
-                            speaker_normalized = "Client"
-                        else:
-                            speaker_normalized = "Agent"  # Défaut
-
-                    # Mapper vers SPEAKER_XX pour que _map_roles fonctionne
-                    if speaker_normalized not in speaker_mapping:
-                        speaker_mapping[speaker_normalized] = f"SPEAKER_{speaker_counter:02d}"
-                        speaker_counter += 1
-
-                    speaker = speaker_mapping[speaker_normalized]
-
-                    if text_part:  # Seulement si il y a du texte
-                        # Nettoyer les répétitions dans chaque segment aussi
-                        text_part = remove_repetitive_loops(text_part, max_repetitions=3)
-                        if text_part:  # Vérifier qu'il reste du texte après nettoyage
-                            valid_lines.append((speaker, text_part))
-    
+            parts = line.split(':', 1)
+            if len(parts) != 2:
+                continue
+            speaker_part = parts[0].strip()
+            text_part    = parts[1].strip()
+            if any(w in speaker_part.lower() for w in ['agent', 'professionnel', 'cabinet', 'secrétaire']):
+                sn = "Agent"
+            elif any(w in speaker_part.lower() for w in ['client', 'appelant', 'patient']):
+                sn = "Client"
+            elif speaker_part.lower() in ['agent', 'client']:
+                sn = speaker_part.capitalize()
+            else:
+                if any(w in text_part.lower() for w in ['cabinet', 'je vais voir', 'on vous rappelle']):
+                    sn = "Agent"
+                elif any(w in text_part.lower() for w in ['je voudrais', 'est-ce que je peux']):
+                    sn = "Client"
+                else:
+                    sn = "Agent"
+            if sn not in speaker_mapping:
+                speaker_mapping[sn] = f"SPEAKER_{speaker_counter:02d}"; speaker_counter += 1
+            tp = remove_repetitive_loops(text_part, max_repetitions=3)
+            if tp:
+                valid_lines.append((speaker_mapping[sn], tp))
     if not valid_lines:
-        log("[PARSE] No valid speaker lines found")
         return []
-    
-    # Créer les segments avec timestamps approximatifs
     total_words = sum(len(text.split()) for _, text in valid_lines)
-
     for i, (speaker, text) in enumerate(valid_lines):
-        # Calculer la durée basée sur le nombre de mots
-        word_count = len(text.split())
+        word_count       = len(text.split())
         segment_duration = (word_count / total_words) * total_duration if total_words > 0 else total_duration / len(valid_lines)
-
-        start_time = current_time
-        end_time = min(current_time + segment_duration, total_duration)
-
-        segments.append({
-            "speaker": speaker,
-            "start": start_time,
-            "end": end_time,
-            "text": text,
-            "mood": None
-        })
-
+        start_time       = current_time
+        end_time         = min(current_time + segment_duration, total_duration)
+        segments.append({"speaker": speaker, "start": start_time, "end": end_time, "text": text, "mood": None})
         current_time = end_time
-
         log(f"[PARSE] Segment {i+1}: {speaker} ({start_time:.1f}s-{end_time:.1f}s) '{text[:30]}...'")
-
-    # Fusionner les micro-segments consécutifs du même speaker
-    segments = merge_micro_segments(segments, max_duration=2.0, max_gap=1.0)
-
-    return segments
-
-def apply_pyannote_per_segment_transcription(wav_path: str, raw_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool):
-    """
-    PYANNOTE AUTO V2: Transcrit chaque segment PyAnnote individuellement
-    Plus lent mais beaucoup plus précis car chaque segment a son propre texte
-    """
-    import soundfile as sf
-    import numpy as np
-    from pydub import AudioSegment
-    import tempfile
-
-    log(f"[PYANNOTE_V2] Starting per-segment transcription for {len(raw_segments)} segments")
-
-    # Charger l'audio complet
-    audio_data, sample_rate = sf.read(wav_path)
-
-    # Post-traitement: enforce max 2 speakers, map roles, fix inversions
-    raw_segments = _enforce_max_two_speakers(raw_segments)
-    _map_roles(raw_segments)  # D'abord mapper SPEAKER_XX → Agent/Client
-    raw_segments = detect_and_fix_speaker_inversion(raw_segments)  # Puis corriger les erreurs évidentes
-
-    # Fusionner les segments très courts du même speaker
-    merged_segments = []
-    i = 0
-    while i < len(raw_segments):
-        current = raw_segments[i].copy()
-
-        # Fusionner les segments consécutifs du même speaker s'ils sont courts
-        while i + 1 < len(raw_segments):
-            next_seg = raw_segments[i + 1]
-            duration_current = current["end"] - current["start"]
-            duration_next = next_seg["end"] - next_seg["start"]
-            gap = next_seg["start"] - current["end"]
-
-            # Fusionner si même speaker ET (segment court OU gap très petit)
-            if (current["speaker"] == next_seg["speaker"] and
-                ((duration_current < 2.0 or duration_next < 2.0) and gap < 1.0)):
-                current["end"] = next_seg["end"]
-                i += 1
-            else:
-                break
-
-        merged_segments.append(current)
-        i += 1
-
-    log(f"[PYANNOTE_V2] After merging short segments: {len(merged_segments)} segments")
-
-    # Transcrire chaque segment individuellement
-    transcribed_segments = []
-
-    for idx, seg in enumerate(merged_segments):
-        start_time = seg["start"]
-        end_time = seg["end"]
-        speaker = seg["speaker"]
-        duration = end_time - start_time
-
-        # Ignorer les segments trop courts (< 0.3s)
-        if duration < 0.3:
-            log(f"[PYANNOTE_V2] Skipping very short segment {idx+1}/{len(merged_segments)}: {duration:.1f}s")
-            continue
-
-        # Extraire le segment audio
-        start_sample = int(start_time * sample_rate)
-        end_sample = int(end_time * sample_rate)
-        segment_audio = audio_data[start_sample:end_sample]
-
-        # Sauvegarder temporairement
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-            tmp_path = tmp_file.name
-            sf.write(tmp_path, segment_audio, sample_rate)
-
-        try:
-            # Transcrire ce segment uniquement
-            log(f"[PYANNOTE_V2] Transcribing segment {idx+1}/{len(merged_segments)}: {speaker} ({duration:.1f}s)")
-
-            # Construction de la conversation pour Voxtral
-            instruction = "Transcribe."
-            if language:
-                instruction = f"Transcribe in {language}."
-
-            conv = [{
-                "role": "user",
-                "content": [
-                    {"type": "audio", "path": tmp_path},
-                    {"type": "text", "text": instruction}
-                ]
-            }]
-
-            # Adapter max_new_tokens à la durée du segment (environ 3 mots par seconde)
-            segment_max_tokens = min(int(duration * 5), 200)  # Max 200 tokens par segment
-
-            result = run_voxtral_with_timeout(conv, max_new_tokens=segment_max_tokens, timeout=30)
-            text = result.get("text", "").strip()
-
-            if text:
-                transcribed_segments.append({
-                    "speaker": speaker,
-                    "start": start_time,
-                    "end": end_time,
-                    "text": text,
-                    "mood": None
-                })
-                log(f"[PYANNOTE_V2]   → '{text[:50]}...'")
-            else:
-                log(f"[PYANNOTE_V2]   → (empty transcription)")
-
-        except Exception as e:
-            log(f"[PYANNOTE_V2] Error transcribing segment {idx+1}: {e}")
-            # Ajouter un segment vide en cas d'erreur
-            transcribed_segments.append({
-                "speaker": speaker,
-                "start": start_time,
-                "end": end_time,
-                "text": "",
-                "mood": None
-            })
-        finally:
-            # Nettoyer le fichier temporaire
-            try:
-                os.remove(tmp_path)
-            except:
-                pass
-
-    log(f"[PYANNOTE_V2] Transcription completed: {len(transcribed_segments)} segments with text")
-
-    # Construire le transcript complet
-    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in transcribed_segments if s.get("text"))
-
-    result = {
-        "segments": transcribed_segments,
-        "transcript": full_transcript
-    }
-
-    # Résumé si demandé
-    if with_summary:
-        audio_duration = max((s.get("end", 0) for s in transcribed_segments), default=0)
-        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
-
-    # Analyse de sentiment si activé
-    if ENABLE_SENTIMENT:
-        log("[PYANNOTE_V2] Computing sentiment analysis by speaker...")
-        speaker_sentiments = analyze_sentiment_by_speaker(transcribed_segments)
-
-        if speaker_sentiments:
-            # Attribuer le sentiment à chaque segment
-            for seg in transcribed_segments:
-                speaker = seg.get("speaker")
-                if speaker and speaker in speaker_sentiments:
-                    seg["mood"] = speaker_sentiments[speaker]
-
-            # Mood overall
-            weighted_moods = []
-            for seg in transcribed_segments:
-                if seg.get("text") and seg.get("mood"):
-                    duration = float(seg["end"]) - float(seg["start"])
-                    weighted_moods.append((seg["mood"], duration))
-            result["mood_overall"] = aggregate_mood(weighted_moods) if weighted_moods else None
-
-            result["mood_by_speaker"] = speaker_sentiments
-
-            # Sentiment du client
-            client_mood = get_client_sentiment(speaker_sentiments, transcribed_segments)
-            result["mood_client"] = client_mood
-
-            confidence_raw = client_mood.get('confidence')
-            if confidence_raw is None:
-                confidence = 0.0
-                log(f"[PYANNOTE_V2] WARNING: Client sentiment confidence is None, using 0.0")
-            else:
-                confidence = float(confidence_raw)
-
-            label_fr = client_mood.get('label_fr') or 'inconnu'
-            log(f"[PYANNOTE_V2] Client sentiment: {label_fr} (confidence: {confidence:.2f})")
-
-    return result
-
-def diarize_with_pyannote_auto(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
-    """
-    MODE PYANNOTE AUTO PUR : 
-    Laisse PyAnnote décider automatiquement du nombre de speakers
-    """
-    log(f"[PYANNOTE_AUTO] Starting PyAnnote automatic speaker detection")
-    
-    # Durée max
-    try:
-        import soundfile as sf
-        info = sf.info(wav_path)
-        est_dur = info.frames / float(info.samplerate or 1)
-        if est_dur > MAX_DURATION_S:
-            return {"error": f"Audio too long ({est_dur:.1f}s)."}
-    except Exception as e:
-        log(f"[PYANNOTE_AUTO] Could not check duration: {e}")
-
-    # DIARIZATION AVEC NOMBRE DE SPEAKERS FORCÉ
-    log("[PYANNOTE_AUTO] Running automatic diarization...")
-    dia = load_diarizer()
-
-    # FORCER num_speakers pour éviter la détection de la musique d'attente
-    diarization_kwargs = {}
-    if EXACT_TWO or MAX_SPEAKERS == 2:
-        diarization_kwargs["num_speakers"] = 2
-        log(f"[PYANNOTE_AUTO] Forcing exactly 2 speakers (EXACT_TWO={EXACT_TWO}, MAX_SPEAKERS={MAX_SPEAKERS})")
-
-    diarization = dia(wav_path, **diarization_kwargs)
-    
-    # Collecter tous les segments
-    raw_segments = []
-    speakers_found = set()
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        segment = {
-            "speaker": speaker,
-            "start": float(turn.start),
-            "end": float(turn.end)
-        }
-        raw_segments.append(segment)
-        speakers_found.add(speaker)
-    
-    log(f"[PYANNOTE_AUTO] Auto-detected {len(speakers_found)} speakers: {speakers_found}")
-    log(f"[PYANNOTE_AUTO] Generated {len(raw_segments)} raw segments")
-    
-    # Si trop de speakers détectés, fusionner les moins importants
-    if len(speakers_found) > 3:
-        log(f"[PYANNOTE_AUTO] Too many speakers detected ({len(speakers_found)}), merging...")
-        # Garder seulement les 2 speakers avec le plus de temps de parole
-        speaker_times = {}
-        for seg in raw_segments:
-            duration = seg["end"] - seg["start"]
-            speaker_times[seg["speaker"]] = speaker_times.get(seg["speaker"], 0) + duration
-        
-        top_speakers = sorted(speaker_times.items(), key=lambda x: x[1], reverse=True)[:2]
-        main_speakers = [s[0] for s in top_speakers]
-        
-        log(f"[PYANNOTE_AUTO] Keeping main speakers: {main_speakers}")
-        
-        # Réassigner les speakers mineurs vers les principaux
-        for seg in raw_segments:
-            if seg["speaker"] not in main_speakers:
-                # Trouver le speaker principal le plus proche temporellement
-                seg_mid = (seg["start"] + seg["end"]) / 2
-                best_speaker = main_speakers[0]  # Défaut
-                
-                for main_seg in raw_segments:
-                    if main_seg["speaker"] in main_speakers:
-                        main_mid = (main_seg["start"] + main_seg["end"]) / 2
-                        if abs(main_mid - seg_mid) < 5.0:  # Dans les 5 secondes
-                            best_speaker = main_seg["speaker"]
-                            break
-                
-                seg["speaker"] = best_speaker
-    
-    # CHOIX: Transcription segment par segment (plus lent mais plus précis)
-    # Ou mode hybride classique (plus rapide mais moins précis)
-    USE_PER_SEGMENT_TRANSCRIPTION = os.environ.get("PYANNOTE_PER_SEGMENT", "0") == "1"
-
-    if USE_PER_SEGMENT_TRANSCRIPTION:
-        log("[PYANNOTE_AUTO] Using per-segment transcription (slower but more accurate)")
-        return apply_pyannote_per_segment_transcription(wav_path, raw_segments, language, max_new_tokens, with_summary)
-    else:
-        # Nouveau mode ALIGNED: WhisperX-style avec forced alignment + IoU mapping
-        log("[PYANNOTE_AUTO] Using WhisperX-style alignment: Voxtral transcription + Wav2Vec2 alignment + PyAnnote diarization")
-        return apply_pyannote_aligned(wav_path, raw_segments, language, max_new_tokens, with_summary)
-
-def apply_improved_hybrid_mode(wav_path: str, pyannote_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool):
-    """
-    MODE HYBRID AMÉLIORÉ:
-    1. Utilise Voxtral SPEAKER_ID pour transcrire avec identification des speakers
-    2. Utilise les timestamps PyAnnote pour corriger/valider l'attribution
-    3. Combine le meilleur des deux approches
-    """
-    log("[HYBRID_V2] Starting improved hybrid mode")
-    log("[HYBRID_V2] Step 1: Voxtral speaker identification")
-
-    # Étape 1: Transcrire avec Voxtral SPEAKER_ID
-    # Utiliser la MÊME instruction que VOXTRAL_SPEAKER_ID (qui fonctionne bien)
-    instruction = (
-        f"lang:{language or 'fr'} "
-        "Transcris cette conversation téléphonique en identifiant clairement qui parle. "
-        "Format requis:\n"
-        "Agent: [ce que dit l'agent/professionnel]\n"
-        "Client: [ce que dit le client/appelant]\n\n"
-        "Indications pour identifier les speakers:\n"
-        "- Agent = celui qui répond, dit 'bonjour', 'cabinet', 'je vais voir', 'on vous rappelle'\n"
-        "- Client = celui qui appelle, dit 'je voudrais', 'ma femme', 'est-ce que je peux'\n\n"
-        "Transcris mot à mot et sépare clairement chaque prise de parole."
-    )
-
-    conv = [{
-        "role": "user",
-        "content": [
-            {"type": "audio", "path": wav_path},
-            {"type": "text", "text": instruction}
-        ]
-    }]
-
-    voxtral_result = run_voxtral_with_timeout(conv, max_new_tokens=max_new_tokens, timeout=120)
-    transcript = voxtral_result.get("text", "").strip()
-
-    if not transcript:
-        log("[HYBRID_V2] Empty Voxtral transcription")
-        return {"error": "Empty transcription", "segments": [], "transcript": ""}
-
-    # Étape 2: Parser la transcription Voxtral
-    log("[HYBRID_V2] Step 2: Parsing Voxtral speaker-identified segments")
-    voxtral_segments = parse_speaker_identified_transcript(transcript, total_duration=0)
-
-    if not voxtral_segments:
-        log("[HYBRID_V2] Failed to parse speaker segments, using raw transcript")
-        return {"error": "Parsing failed", "segments": [], "transcript": transcript}
-
-    log(f"[HYBRID_V2] Voxtral identified {len(voxtral_segments)} segments")
-
-    # Étape 3: Fusionner les segments Voxtral (texte) avec PyAnnote (timestamps)
-    log("[HYBRID_V2] Step 3: Merging Voxtral text with PyAnnote timestamps")
-
-    # Préparer les segments PyAnnote
-    pyannote_segments = _enforce_max_two_speakers(pyannote_segments)
-    _map_roles(pyannote_segments)  # D'abord mapper SPEAKER_XX → Agent/Client
-    pyannote_segments = detect_and_fix_speaker_inversion(pyannote_segments)  # Puis corriger les erreurs évidentes
-
-    # Fusionner les segments PyAnnote consécutifs du même speaker pour obtenir les "tours de parole"
-    pyannote_turns = []
-    if pyannote_segments:
-        current_turn = {
-            "speaker": pyannote_segments[0]["speaker"],
-            "start": pyannote_segments[0]["start"],
-            "end": pyannote_segments[0]["end"]
-        }
-
-        for i in range(1, len(pyannote_segments)):
-            seg = pyannote_segments[i]
-            if seg["speaker"] == current_turn["speaker"]:
-                # Même speaker, étendre le tour
-                current_turn["end"] = seg["end"]
-            else:
-                # Nouveau speaker, sauver le tour actuel
-                pyannote_turns.append(current_turn)
-                current_turn = {
-                    "speaker": seg["speaker"],
-                    "start": seg["start"],
-                    "end": seg["end"]
-                }
-
-        # Ajouter le dernier tour
-        pyannote_turns.append(current_turn)
-
-    log(f"[HYBRID_V2] Voxtral: {len(voxtral_segments)} text segments")
-    log(f"[HYBRID_V2] PyAnnote: {len(pyannote_turns)} speaking turns")
-
-    # Mapper chaque segment Voxtral à un tour PyAnnote basé sur le speaker et l'ordre
-    corrected_segments = []
-    voxtral_idx_by_speaker = {"Agent": 0, "Client": 0}
-
-    for turn in pyannote_turns:
-        speaker = turn["speaker"]
-
-        # Trouver le prochain segment Voxtral pour ce speaker
-        text = ""
-        voxtral_idx = voxtral_idx_by_speaker.get(speaker, 0)
-
-        # Chercher le prochain segment Voxtral de ce speaker
-        while voxtral_idx < len(voxtral_segments):
-            v_seg = voxtral_segments[voxtral_idx]
-            if v_seg["speaker"] == speaker:
-                text = v_seg["text"]
-                voxtral_idx_by_speaker[speaker] = voxtral_idx + 1
-                break
-            voxtral_idx += 1
-
-        # Créer le segment fusionné
-        corrected_segments.append({
-            "speaker": speaker,
-            "start": turn["start"],  # Timestamp PyAnnote
-            "end": turn["end"],      # Timestamp PyAnnote
-            "text": text,            # Texte Voxtral
-            "mood": None
-        })
-
-    # Statistiques
-    for speaker in ["Agent", "Client"]:
-        used = voxtral_idx_by_speaker.get(speaker, 0)
-        total = sum(1 for seg in voxtral_segments if seg["speaker"] == speaker)
-        log(f"[HYBRID_V2] {speaker}: used {used}/{total} Voxtral texts")
-
-    log(f"[HYBRID_V2] Created {len(corrected_segments)} corrected segments")
-
-    # Construire le résultat
-    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in corrected_segments if s.get("text"))
-
-    result = {
-        "segments": corrected_segments,
-        "transcript": full_transcript
-    }
-
-    # Résumé
-    if with_summary:
-        audio_duration = max((s.get("end", 0) for s in corrected_segments), default=0)
-        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
-
-    # Analyse de sentiment
-    if ENABLE_SENTIMENT:
-        log("[HYBRID_V2] Computing sentiment analysis by speaker...")
-        speaker_sentiments = analyze_sentiment_by_speaker(corrected_segments)
-
-        if speaker_sentiments:
-            for seg in corrected_segments:
-                speaker = seg.get("speaker")
-                if speaker and speaker in speaker_sentiments:
-                    seg["mood"] = speaker_sentiments[speaker]
-
-            weighted_moods = []
-            for seg in corrected_segments:
-                if seg.get("text") and seg.get("mood"):
-                    duration = float(seg["end"]) - float(seg["start"])
-                    weighted_moods.append((seg["mood"], duration))
-            result["mood_overall"] = aggregate_mood(weighted_moods) if weighted_moods else None
-
-            result["mood_by_speaker"] = speaker_sentiments
-
-            client_mood = get_client_sentiment(speaker_sentiments, corrected_segments)
-            result["mood_client"] = client_mood
-
-            confidence_raw = client_mood.get('confidence')
-            if confidence_raw is None:
-                confidence = 0.0
-                log(f"[HYBRID_V2] WARNING: Client sentiment confidence is None, using 0.0")
-            else:
-                confidence = float(confidence_raw)
-
-            label_fr = client_mood.get('label_fr') or 'inconnu'
-            log(f"[HYBRID_V2] Client sentiment: {label_fr} (confidence: {confidence:.2f})")
-
-    return result
-
-def apply_pyannote_aligned(wav_path: str, pyannote_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool):
-    """
-    MODE PYANNOTE_ALIGNED (WhisperX-style):
-    1. Voxtral transcrit l'audio (texte complet, pas de speaker ID)
-    2. Forced alignment pour obtenir word-level timestamps
-    3. PyAnnote détecte les speakers avec timestamps précis
-    4. IoU mapping pour assigner speakers aux mots
-    5. Regrouper les mots en segments par speaker
-    """
-    log("[PYANNOTE_ALIGNED] Starting WhisperX-style alignment mode")
-    log("[PYANNOTE_ALIGNED] Step 1: Voxtral transcription (no speaker ID)")
-
-    # Étape 1: Transcrire avec Voxtral SANS speaker ID
-    instruction = f"lang:{language or 'fr'} Transcris cette conversation téléphonique mot à mot."
-
-    conv = [{
-        "role": "user",
-        "content": [
-            {"type": "audio", "path": wav_path},
-            {"type": "text", "text": instruction}
-        ]
-    }]
-
-    voxtral_result = run_voxtral_with_timeout(conv, max_new_tokens=max_new_tokens, timeout=120)
-    transcript = voxtral_result.get("text", "").strip()
-
-    if not transcript:
-        log("[PYANNOTE_ALIGNED] Empty Voxtral transcription")
-        return {"error": "Empty transcription", "segments": [], "transcript": ""}
-
-    log(f"[PYANNOTE_ALIGNED] Voxtral transcript: {len(transcript)} characters")
-
-    # Étape 2: Forced alignment pour word-level timestamps
-    log("[PYANNOTE_ALIGNED] Step 2: Forced alignment for word-level timestamps")
-    word_timestamps = align_words_to_audio(transcript, wav_path)
-
-    if not word_timestamps:
-        log("[PYANNOTE_ALIGNED] WARNING: Alignment failed, falling back to VOXTRAL_SPEAKER_ID")
-        # Fallback vers le mode classique
-        return diarize_with_voxtral_speaker_id(wav_path, language, max_new_tokens, with_summary)
-
-    log(f"[PYANNOTE_ALIGNED] Aligned {len(word_timestamps)} words")
-
-    # Étape 3: Préparer les segments PyAnnote
-    log("[PYANNOTE_ALIGNED] Step 3: Preparing PyAnnote speaker segments")
-    pyannote_segments = _enforce_max_two_speakers(pyannote_segments)
-    _map_roles(pyannote_segments)  # D'abord mapper SPEAKER_XX → Agent/Client
-    pyannote_segments = detect_and_fix_speaker_inversion(pyannote_segments)  # Puis corriger les erreurs évidentes
-
-    log(f"[PYANNOTE_ALIGNED] PyAnnote: {len(pyannote_segments)} speaker segments")
-
-    # Étape 4: IoU mapping - Assigner speakers aux mots
-    log("[PYANNOTE_ALIGNED] Step 4: IoU-based speaker assignment")
-    words_with_speakers = assign_speakers_to_words_iou(word_timestamps, pyannote_segments)
-
-    # Étape 5: Regrouper les mots en segments par speaker
-    log("[PYANNOTE_ALIGNED] Step 5: Grouping words into speaker segments")
-    segments = []
-    current_segment = None
-
-    for word in words_with_speakers:
-        speaker = word.get("speaker")
-        if not speaker:
-            continue
-
-        if current_segment is None or current_segment["speaker"] != speaker:
-            # Nouveau segment
-            if current_segment is not None:
-                segments.append(current_segment)
-
-            current_segment = {
-                "speaker": speaker,
-                "start": word["start"],
-                "end": word["end"],
-                "text": word["word"],
-                "mood": None
-            }
-        else:
-            # Étendre le segment actuel
-            current_segment["end"] = word["end"]
-            current_segment["text"] += " " + word["word"]
-
-    # Ajouter le dernier segment
-    if current_segment is not None:
-        segments.append(current_segment)
-
-    log(f"[PYANNOTE_ALIGNED] Created {len(segments)} speaker segments")
-
-    # Construire le résultat
-    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
-
-    result = {
-        "segments": segments,
-        "transcript": full_transcript
-    }
-
-    # Résumé
-    if with_summary:
-        audio_duration = max((s.get("end", 0) for s in segments), default=0)
-        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
-
-    # Analyse de sentiment
-    if ENABLE_SENTIMENT:
-        log("[PYANNOTE_ALIGNED] Computing sentiment analysis by speaker...")
-        speaker_sentiments = analyze_sentiment_by_speaker(segments)
-
-        if speaker_sentiments:
-            for seg in segments:
-                speaker = seg.get("speaker")
-                if speaker and speaker in speaker_sentiments:
-                    seg["mood"] = speaker_sentiments[speaker]
-
-            weighted_moods = []
-            for seg in segments:
-                if seg.get("text") and seg.get("mood"):
-                    duration = float(seg["end"]) - float(seg["start"])
-                    weighted_moods.append((seg["mood"], duration))
-            result["mood_overall"] = aggregate_mood(weighted_moods) if weighted_moods else None
-
-            result["mood_by_speaker"] = speaker_sentiments
-
-            client_mood = get_client_sentiment(speaker_sentiments, segments)
-            result["mood_client"] = client_mood
-
-            confidence_raw = client_mood.get('confidence')
-            if confidence_raw is None:
-                confidence = 0.0
-                log(f"[PYANNOTE_ALIGNED] WARNING: Client sentiment confidence is None, using 0.0")
-            else:
-                confidence = float(confidence_raw)
-
-            label_fr = client_mood.get('label_fr') or 'inconnu'
-            log(f"[PYANNOTE_ALIGNED] Client sentiment: {label_fr} (confidence: {confidence:.2f})")
-
-    return result
-
-def ultra_aggressive_merge(segments: List[Dict[str, Any]], max_gap: float = 3.0) -> List[Dict[str, Any]]:
-    """
-    Fusion ultra-agressive pour créer de gros blocs cohérents et réduire les erreurs.
-    """
-    if not segments:
-        return segments
-    
-    merged = []
-    current = segments[0].copy()
-    
-    log(f"[ULTRA_MERGE] Starting with {len(segments)} segments")
-    
-    for next_seg in segments[1:]:
-        same_speaker = current["speaker"] == next_seg["speaker"]
-        gap = float(next_seg["start"]) - float(current["end"])
-        
-        # Fusion plus agressive : même speaker OU gap très petit
-        should_merge = (same_speaker and gap <= max_gap) or (gap <= 0.5)
-        
-        if should_merge:
-            # Fusionner
-            current["end"] = next_seg["end"]
-            
-            if same_speaker:
-                current_text = current.get("text", "").strip()
-                next_text = next_seg.get("text", "").strip()
-                if current_text and next_text:
-                    current["text"] = f"{current_text} {next_text}"
-                elif next_text:
-                    current["text"] = next_text
-            else:
-                log(f"[ULTRA_MERGE] Merging different speakers due to tiny gap: {gap:.2f}s")
-                current_dur = float(current["end"]) - float(current["start"])  
-                next_dur = float(next_seg["end"]) - float(next_seg["start"])
-                if next_dur > current_dur:
-                    current["speaker"] = next_seg["speaker"]
-        else:
-            merged.append(current)
-            current = next_seg.copy()
-    
-    merged.append(current)
-    
-    log(f"[ULTRA_MERGE] Result: {len(segments)} → {len(merged)} segments")
-    return merged
-def apply_hybrid_workflow_with_segments(wav_path: str, diar_segments: List[Dict], language: Optional[str], max_new_tokens: int, with_summary: bool, skip_ultra_merge: bool = False):
-    """Applique le workflow hybride avec des segments de diarization fournis"""
-    # Transcription globale
-    conv_global = _build_conv_transcribe_ultra_strict(wav_path, language or "fr")
-    out_global = run_voxtral_with_timeout(conv_global, max_new_tokens=max_new_tokens, timeout=60)
-    full_text = (out_global.get("text") or "").strip()
-
-    if not full_text:
-        return {"error": "Empty global transcription"}
-
-    # Optimisation des segments (skip pour PYANNOTE_AUTO si demandé)
-    if skip_ultra_merge:
-        log("[HYBRID] Skipping ultra_merge for better PyAnnote accuracy")
-        optimized_segments = diar_segments  # Garder les segments PyAnnote bruts
-    else:
-        optimized_segments = optimize_diarization_segments(diar_segments)
-    
-    # Attribution du texte (réutilise la logique existante)
-    sentences = smart_sentence_split(full_text)
-    segments = []
-    
-    if optimized_segments:
-        total_seg_duration = sum(seg["end"] - seg["start"] for seg in optimized_segments)
-        sentence_index = 0
-        
-        for seg in optimized_segments:
-            seg_duration = seg["end"] - seg["start"]
-            sentence_proportion = seg_duration / total_seg_duration if total_seg_duration > 0 else 1.0/len(optimized_segments)
-            sentences_for_segment = max(1, int(len(sentences) * sentence_proportion))
-            sentences_for_segment = min(sentences_for_segment, len(sentences) - sentence_index)
-            
-            if sentences_for_segment > 0:
-                seg_sentences = sentences[sentence_index:sentence_index + sentences_for_segment]
-                seg_text = " ".join(seg_sentences).strip()
-                sentence_index += sentences_for_segment
-            else:
-                seg_text = ""
-            
-            segments.append({
-                "speaker": seg["speaker"],
-                "start": seg["start"],
-                "end": seg["end"],
-                "text": seg_text,
-                "mood": None
-            })
-    
-    # Post-traitement standard
-    segments = _enforce_max_two_speakers(segments)
-    _map_roles(segments)  # D'abord mapper SPEAKER_XX → Agent/Client
-    segments = detect_and_fix_speaker_inversion(segments)  # Puis corriger les erreurs évidentes
-
-    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
-    result = {"segments": segments, "transcript": full_transcript}
-
-    if with_summary:
-        audio_duration = max((s.get("end", 0) for s in segments), default=0)
-        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
-
-    if ENABLE_SENTIMENT:
-        log("[PYANNOTE] Computing sentiment analysis by speaker...")
-
-        # Analyse le sentiment pour chaque speaker séparément
-        speaker_sentiments = analyze_sentiment_by_speaker(segments)
-
-        if speaker_sentiments:
-            # Attribuer le sentiment spécifique à chaque segment
-            for seg in segments:
-                speaker = seg.get("speaker")
-                if speaker and speaker in speaker_sentiments:
-                    seg["mood"] = speaker_sentiments[speaker]
-
-            # Mood overall (moyenne pondérée de tous les speakers)
-            weighted_moods = []
-            for seg in segments:
-                if seg.get("text") and seg.get("mood"):
-                    duration = float(seg["end"]) - float(seg["start"])
-                    weighted_moods.append((seg["mood"], duration))
-            result["mood_overall"] = aggregate_mood(weighted_moods) if weighted_moods else None
-
-            # Mood par speaker (déjà calculé)
-            result["mood_by_speaker"] = speaker_sentiments
-
-            # NOUVEAU: Sentiment du client identifié
-            client_mood = get_client_sentiment(speaker_sentiments, segments)
-            result["mood_client"] = client_mood
-
-            if LOG_LEVEL == "DEBUG":
-                log(f"[PYANNOTE] DEBUG: client_mood = {client_mood}")
-                log(f"[PYANNOTE] DEBUG: speaker_sentiments keys = {list(speaker_sentiments.keys())}")
-
-            # Protection maximale contre None
-            confidence_raw = client_mood.get('confidence')
-            if confidence_raw is None:
-                confidence = 0.0
-                log(f"[PYANNOTE] WARNING: Client sentiment confidence is None, using 0.0")
-            else:
-                confidence = float(confidence_raw)
-
-            label_fr = client_mood.get('label_fr') or 'inconnu'
-            log(f"[PYANNOTE] Client sentiment: {label_fr} (confidence: {confidence:.2f})")
-    
-    return result
-
-# ---------------------------
-# Post-traitements segments
-# ---------------------------
-def intelligent_dialogue_correction(text: str, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Post-correction intelligente du dialogue basée sur les patterns de conversation.
-    """
-    if not segments or len(segments) < 2:
-        return segments
-    
-    log("[CORRECTION] Starting intelligent dialogue correction...")
-    
-    # Analyse du texte global pour identifier les tours de parole réels
-    full_text = " ".join(seg.get("text", "") for seg in segments).strip()
-    
-    # Patterns qui indiquent un changement de locuteur
-    speaker_change_patterns = [
-        r'\b(oui|non|d\'accord|très bien|parfait|c\'est ça|exactement)\b\s+',
-        r'\b(bonjour|bonsoir|au revoir|merci|à bientôt)\b',
-        r'\b(alors|bon|eh bien|donc|en fait)\b\s+',
-        r'[.!?]\s+(oui|non|d\'accord|très bien)',
-    ]
-    
-    # Tenter de redécouper le texte de manière plus intelligente
-    sentences = smart_sentence_split(full_text)
-    
-    # Si on a trop de segments pour peu de phrases, c'est probablement sur-segmenté
-    if len(segments) > len(sentences) * 1.5:
-        log(f"[CORRECTION] Over-segmentation detected: {len(segments)} segments for {len(sentences)} sentences")
-        
-        # Mode de récupération : créer de gros blocs alternés
-        corrected_segments = []
-        sentences_per_segment = max(2, len(sentences) // 4)  # 4 segments max
-        
-        current_speaker = segments[0]["speaker"]
-        sentence_idx = 0
-        segment_idx = 0
-        
-        while sentence_idx < len(sentences):
-            # Calculer la durée proportionnelle
-            proportion = sentences_per_segment / len(sentences)
-            start_time = segment_idx * (segments[-1]["end"] / 4)
-            end_time = min((segment_idx + 1) * (segments[-1]["end"] / 4), segments[-1]["end"])
-            
-            # Prendre les phrases pour ce segment
-            seg_sentences = sentences[sentence_idx:sentence_idx + sentences_per_segment]
-            seg_text = " ".join(seg_sentences)
-            
-            corrected_segments.append({
-                "speaker": current_speaker,
-                "start": start_time,
-                "end": end_time,
-                "text": seg_text,
-                "mood": None
-            })
-            
-            # Alterner les speakers
-            if current_speaker == "Agent":
-                current_speaker = "Client"
-            else:
-                current_speaker = "Agent"
-                
-            sentence_idx += sentences_per_segment
-            segment_idx += 1
-        
-        log(f"[CORRECTION] Created {len(corrected_segments)} corrected segments")
-        return corrected_segments
-    
-    return segments
-
-def smart_sentence_split(text: str) -> List[str]:
-    """
-    Découpe intelligent du texte en phrases respectant le dialogue naturel.
-    """
-    if not text:
-        return []
-    
-    # Marqueurs de fin de phrase étendus pour les dialogues
-    sentence_endings = re.compile(r'[.!?]+\s+')
-    
-    # Cas spéciaux pour les dialogues téléphoniques
-    # Ajouter des breaks sur certains mots de transition
-    transition_words = ['oui', 'non', 'd\'accord', 'très bien', 'parfait', 'bonjour', 'au revoir', 'allô']
-    
-    sentences = []
-    
-    # Découpage basique sur la ponctuation
-    basic_sentences = sentence_endings.split(text)
-    
-    for sentence in basic_sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-            
-        # Si la phrase est très longue, essayer de la couper sur les transitions
-        if len(sentence.split()) > 15:
-            words = sentence.split()
-            current_phrase = []
-            
-            for i, word in enumerate(words):
-                current_phrase.append(word)
-                
-                # Couper si on trouve un mot de transition et qu'on a déjà quelques mots
-                if (word.lower().rstrip('.,!?') in transition_words and 
-                    len(current_phrase) > 3 and 
-                    i < len(words) - 1):
-                    
-                    sentences.append(" ".join(current_phrase))
-                    current_phrase = []
-                    
-            # Ajouter ce qui reste
-            if current_phrase:
-                sentences.append(" ".join(current_phrase))
-        else:
-            sentences.append(sentence)
-    
-    # Nettoyer et filtrer les phrases vides
-    cleaned_sentences = []
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if sentence and len(sentence) > 2:
-            cleaned_sentences.append(sentence)
-    
-    return cleaned_sentences
-
-def post_correct_speaker_attribution(text: str, speaker: str, has_previous_speaker: bool) -> str:
-    """
-    Post-correction de l'attribution basée sur les patterns de dialogue.
-    """
-    if not text:
-        return text
-    
-    text_lower = text.lower().strip()
-    
-    # Patterns qui indiquent probablement le CLIENT (celui qui appelle)
-    client_patterns = [
-        'bonjour madame', 'bonjour monsieur', 'je me permettais', 'je voulais', 'je voudrais',
-        'ma femme', 'mon mari', 'pour ma', 'pour mon', 'est-ce que', 'pourriez-vous',
-        'serait-il possible', 'j\'aimerais', 'nous avons besoin', 'dans la matinée'
-    ]
-    
-    # Patterns qui indiquent probablement l'AGENT (professionnel qui reçoit)
-    agent_patterns = [
-        'cabinet', 'bonjour', 'je vais vous proposer', 'le plus tôt que je puisse',
-        'par contre', 'malheureusement', 'c\'est que les', 'nous n\'avons',
-        'je peux vous dire', 'alors', 'effectivement', 'bien sûr'
-    ]
-    
-    # Corriger l'attribution si patterns évidents
-    client_score = sum(1 for pattern in client_patterns if pattern in text_lower)
-    agent_score = sum(1 for pattern in agent_patterns if pattern in text_lower)
-    
-    # Cas spéciaux de correction
-    if client_score > agent_score and client_score >= 2:
-        # Fort indice que c'est le client, mais attribué à l'agent
-        if speaker == "Agent":
-            log(f"[CORRECTION] Likely client text attributed to Agent: '{text[:30]}...'")
-            return text  # Pour l'instant on garde tel quel, mais on log
-    elif agent_score > client_score and agent_score >= 2:
-        # Fort indice que c'est l'agent, mais attribué au client  
-        if speaker == "Client":
-            log(f"[CORRECTION] Likely agent text attributed to Client: '{text[:30]}...'")
-            return text
-    
-    # Nettoyage des artefacts de découpage
-    text = re.sub(r'\s+', ' ', text)  # Normaliser les espaces
-    text = re.sub(r'([.!?])\s*([.!?])', r'\1', text)  # Supprimer ponctuation double
-
-    return text.strip()
+    return merge_micro_segments(segments)
 
 def llm_verify_and_fix_attributions(segments: List[Dict[str, Any]]) -> int:
-    """
-    Relecture INTELLIGENTE par Voxtral LLM des attributions speaker.
-
-    Voxtral relit le transcript complet et identifie UNIQUEMENT les segments
-    évidemment mal attribués basés sur le contexte de la conversation.
-
-    Retourne le nombre de corrections effectuées.
-    """
     if not DETECT_GLOBAL_SWAP or not segments or len(segments) < 2:
         return 0
-
-    log("[LLM_REVIEW] Starting intelligent transcript review by Voxtral...")
-
-    # Construire le transcript avec numéros de segments
-    transcript_lines = []
-    for i, seg in enumerate(segments, 1):
-        speaker = seg.get("speaker", "Unknown")
-        text = seg.get("text", "").strip()
-        transcript_lines.append(f"{i}. {speaker}: {text}")
-
-    transcript_text = "\n".join(transcript_lines)
-
-    # Limiter à 30 segments max pour ne pas surcharger (garder début + fin si > 30)
+    log("[LLM_REVIEW] Starting intelligent transcript review...")
+    transcript_lines = [f"{i+1}. {s.get('speaker', '?')}: {s.get('text', '').strip()}" for i, s in enumerate(segments)]
     if len(segments) > 30:
-        middle_start = len(segments) // 2 - 5
-        middle_end = len(segments) // 2 + 5
-        transcript_lines_limited = transcript_lines[:15] + \
-                                   [f"... ({len(segments) - 30} segments omis) ..."] + \
-                                   transcript_lines[-15:]
-        transcript_text = "\n".join(transcript_lines_limited)
+        transcript_lines = transcript_lines[:15] + [f"... ({len(segments)-30} segments omis) ..."] + transcript_lines[-15:]
+    transcript_text = "\n".join(transcript_lines)
+    review_prompt = f"""Contexte: Cabinet médical/dentaire. L'Agent est le SECRÉTARIAT qui RÉPOND. Le Client est la PERSONNE qui APPELLE.
 
-    # Prompt pour Voxtral
-    review_prompt = f"""Contexte: Cabinet médical/dentaire. L'Agent est le SECRÉTARIAT qui RÉPOND au téléphone. Le Client est la PERSONNE qui APPELLE pour prendre rendez-vous.
-
-Transcript avec attributions actuelles:
+Transcript:
 {transcript_text}
 
-Mission: Identifie UNIQUEMENT les segments ÉVIDEMMENT mal attribués (incohérences flagrantes dans le contexte de la conversation).
-
-Exemples d'erreurs à détecter:
-- Agent dit "ma femme a mal" (= devrait être Client)
-- Client dit "je regarde l'agenda" (= devrait être Agent)
-- Question posée par Agent puis réponse du même Agent (impossible)
-
-Format de réponse STRICT (un par ligne):
-3:Client
-7:Agent
-12:Client
-
+Mission: Identifie UNIQUEMENT les segments ÉVIDEMMENT mal attribués.
+Format: "3:Client" ou "7:Agent" — un par ligne.
 Si AUCUNE erreur évidente, réponds: "OK"
 """
-
     try:
-        conv = [{
-            "role": "user",
-            "content": [{"type": "text", "text": review_prompt}]
-        }]
-
-        # Tokens estimés : ~4 tokens par segment pour "N:Agent\n" ou "N:Client\n"
-        # Plus une marge de sécurité pour les numéros à 2 chiffres
-        max_tokens_needed = max(100, len(segments) * 5 + 20)
-        result = run_voxtral_with_timeout(conv, max_new_tokens=max_tokens_needed, timeout=30)
+        conv   = [{"role": "user", "content": [{"type": "text", "text": review_prompt}]}]
+        result = run_voxtral_with_timeout(conv, max_new_tokens=max(100, len(segments) * 5 + 20), timeout=30)
         response = result.get("text", "").strip()
-
         log(f"[LLM_REVIEW] Response: {response}")
-
-        # Parser la réponse
         if response.upper() == "OK" or not response:
-            log("[LLM_REVIEW] ✅ No attribution errors detected by LLM")
             return 0
-
         corrections = 0
-        lines = response.split("\n")
-
-        for line in lines:
+        for line in response.split("\n"):
             line = line.strip()
             if not line or ":" not in line:
                 continue
-
             try:
-                # Format attendu: "3:Client" ou "7:Agent"
                 parts = line.split(":")
                 if len(parts) != 2:
                     continue
-
-                segment_num = int(parts[0].strip())
-                new_speaker = parts[1].strip()
-
-                # Valider
-                if segment_num < 1 or segment_num > len(segments):
-                    log(f"[LLM_REVIEW] Invalid segment number: {segment_num}")
-                    continue
-
-                if new_speaker not in ["Agent", "Client"]:
-                    log(f"[LLM_REVIEW] Invalid speaker: {new_speaker}")
-                    continue
-
-                # Appliquer la correction
-                idx = segment_num - 1  # Index 0-based
-                old_speaker = segments[idx]["speaker"]
-
-                if old_speaker != new_speaker:
-                    log(f"[LLM_REVIEW] Correcting segment {segment_num}: {old_speaker} → {new_speaker}")
-                    log(f"[LLM_REVIEW]   Text: '{segments[idx].get('text', '')[:60]}...'")
-                    segments[idx]["speaker"] = new_speaker
-                    corrections += 1
-
-            except (ValueError, IndexError) as e:
-                log(f"[LLM_REVIEW] Error parsing line '{line}': {e}")
+                idx    = int(parts[0].strip()) - 1
+                new_sp = parts[1].strip()
+                if 0 <= idx < len(segments) and new_sp in ["Agent", "Client"]:
+                    old_sp = segments[idx]["speaker"]
+                    if old_sp != new_sp:
+                        log(f"[LLM_REVIEW] Correcting segment {idx+1}: {old_sp} → {new_sp}")
+                        segments[idx]["speaker"] = new_sp
+                        corrections += 1
+            except (ValueError, IndexError):
                 continue
-
-        if corrections > 0:
-            log(f"[LLM_REVIEW] ✅ Corrected {corrections} attributions based on LLM review")
-        else:
-            log(f"[LLM_REVIEW] ✅ No corrections needed")
-
+        log(f"[LLM_REVIEW] {'✅ Corrected' if corrections else '✅ No corrections'} ({corrections} attributions)")
         return corrections
-
     except Exception as e:
-        log(f"[LLM_REVIEW] Error during LLM review: {e}")
+        log(f"[LLM_REVIEW] Error: {e}")
         return 0
 
 def detect_and_fix_speaker_inversion(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Relecture INTELLIGENTE par Voxtral LLM pour corriger les attributions évidentes mal placées.
-
-    PHILOSOPHIE:
-    - La diarisation Voxtral est LA VÉRITÉ DE BASE
-    - Voxtral se relit lui-même et identifie UNIQUEMENT les incohérences évidentes
-    - Pas de règles rigides : compréhension contextuelle du dialogue complet
-    - DÉSACTIVÉ PAR DÉFAUT - Activer avec DETECT_GLOBAL_SWAP=1
-    """
     if not segments or len(segments) < 2:
         return segments
-
-    # Relecture intelligente par LLM (si activée)
     llm_verify_and_fix_attributions(segments)
-
     return segments
 
+def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
+    log(f"[VOXTRAL_ID] Starting speaker identification: language={language}")
+    ok, err, est_dur = _validate_audio(wav_path)
+    if not ok:
+        return {"error": err}
+    # ── Calcul des tokens ────────────────────────────────────────────────────
+    # Français parlé ≈ 2.5 mots/s × 2.5 tokens/mot = ~6.5 tokens/s de contenu
+    # + overhead format "Agent: \n" ≈ 0.8 tokens/s
+    # Total ≈ 7.5 tokens/s, arrondi à 10 pour la marge
+    # Cap à 12 000 : limite safe pour Voxtral (contexte 32k mais on laisse de la place
+    # pour l'input audio + le prompt)
+    # Minimum 512 pour les très courts audios
+    speaker_tokens = max(512, min(int(est_dur * 10), 12000))
 
-def improve_diarization_quality(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Améliore la qualité de la diarization en post-traitement.
-    """
+    # ── Timeout adaptatif ────────────────────────────────────────────────────
+    # Inférence Voxtral ≈ 30-50% de la durée audio en INT4
+    # On prend 70% de la durée + 60s de marge, cap à 600s (10 min)
+    infer_timeout = min(int(est_dur * 0.7) + 60, 600)
+
+    log(f"[VOXTRAL_ID] Audio: {est_dur:.1f}s → tokens={speaker_tokens}, timeout={infer_timeout}s")
+
+    # ── Prompt ───────────────────────────────────────────────────────────────
+    instruction = (
+        f"lang:{language or 'fr'} "
+        "Tu transcris un appel téléphonique professionnel entrant. "
+        "Il y a exactement deux interlocuteurs : l'Agent et le Client.\n\n"
+
+        "RÈGLE N°1 — IDENTIFICATION DES RÔLES :\n"
+        "La toute première personne qui parle (qui décroche, dit 'bonjour', nomme le cabinet) "
+        "est TOUJOURS l'Agent. L'autre est le Client.\n\n"
+
+        "AGENT = secrétariat / cabinet / service qui REÇOIT l'appel :\n"
+        "• Répond en premier : 'Bonjour, cabinet [nom]', 'Bonjour, [service]'\n"
+        "• Gère l'agenda : 'je vais regarder', 'j'ai de la place le...', 'je vous propose'\n"
+        "• Prend note : 'je note', 'c'est noté', 'votre nom ?', 'votre numéro ?'\n"
+        "• Formules pro : 'ne quittez pas', 'je vous mets en attente', 'de la part de qui'\n"
+        "• Confirme : 'entendu', 'parfait', 'c'est bien noté', 'à lundi donc'\n\n"
+
+        "CLIENT = personne qui APPELLE pour obtenir quelque chose :\n"
+        "• Motif d'appel : 'je vous appelle pour', 'je voudrais', 'est-ce possible', 'j'aurais besoin'\n"
+        "• Demande RDV : 'prendre un rendez-vous', 'annuler', 'reporter', 'confirmer'\n"
+        "• Donne infos : son nom, date de naissance, numéro, adresse\n"
+        "• Parle de proches : 'ma femme', 'mon mari', 'mon fils', 'ma fille', 'mon enfant'\n"
+        "• Répond aux questions : 'oui', 'non', 'c'est ça', 'exact', 'plutôt le matin'\n\n"
+
+        "RÈGLE N°2 — FORMAT DE SORTIE :\n"
+        "Chaque prise de parole sur une NOUVELLE ligne, préfixée par Agent: ou Client:\n\n"
+        "Agent: Bonjour, cabinet dentaire, j'écoute.\n"
+        "Client: Bonjour, je voudrais prendre rendez-vous.\n"
+        "Agent: Bien sûr, c'est pour quel soin ?\n"
+        "Client: Un détartrage.\n"
+        "Agent: D'accord, vous êtes disponible quand ?\n\n"
+
+        "RÈGLE N°3 — QUALITÉ DE TRANSCRIPTION :\n"
+        "• Transcris MOT POUR MOT tout ce qui est dit, sans paraphraser\n"
+        "• Une seule prise de parole par ligne — ne fusionne JAMAIS deux voix\n"
+        "• Si quelqu'un parle longtemps sans interruption → une seule ligne Agent: ou Client:\n"
+        "• Conserve les hésitations naturelles : 'euh', 'bah', 'alors', 'donc'\n\n"
+
+        "RÈGLE N°4 — CE QU'IL NE FAUT PAS FAIRE :\n"
+        "• N'écris JAMAIS [Musique] [Silence] [Attente] [Sonnerie] [Pause]\n"
+        "• N'invente RIEN — si tu n'entends pas clairement, transcris ce que tu peux\n"
+        "• Ne résume pas, ne paraphrase pas, ne corrige pas les fautes de langage\n"
+        "• Ne mets pas de numéros de ligne, de timestamps ni de commentaires"
+    )
+
+    conv = [{"role": "user", "content": [
+        {"type": "audio", "path": wav_path},
+        {"type": "text", "text": instruction}
+    ]}]
+    log("[VOXTRAL_ID] Starting transcription with speaker identification...")
+    out = run_voxtral_with_timeout(conv, max_new_tokens=speaker_tokens, timeout=infer_timeout)
+    speaker_transcript = (out.get("text") or "").strip()
+    if not speaker_transcript:
+        log("[VOXTRAL_ID] Empty result, returning empty")
+        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée."}
+    original_len       = len(speaker_transcript)
+    speaker_transcript = remove_repetitive_loops(speaker_transcript, max_repetitions=5)
+    chars_per_sec      = len(speaker_transcript) / max(est_dur, 1)
+    if chars_per_sec > 50:
+        log(f"[VOXTRAL_ID] WARNING: Suspicious chars/sec ratio: {chars_per_sec:.1f}")
+    if original_len != len(speaker_transcript):
+        log(f"[VOXTRAL_ID] Cleaned repetitive loops: {original_len} → {len(speaker_transcript)} chars")
+    speaker_transcript = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]\s*', '', speaker_transcript, flags=re.IGNORECASE).strip()
+    log(f"[VOXTRAL_ID] Completed: {len(speaker_transcript)} chars in {out.get('latency_s', 0):.1f}s")
+    log(f"[VOXTRAL_ID] Raw (first 500): {speaker_transcript[:500]}")
+    if len(speaker_transcript) < 10:
+        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée (musique/silence uniquement)."}
+    segments = parse_speaker_identified_transcript(speaker_transcript, est_dur)
     if not segments:
-        return segments
-
-    improved_segments = []
-
-    for i, seg in enumerate(segments):
-        text = seg.get("text", "")
-        speaker = seg["speaker"]
-
-        # Si le segment est très court et répète le speaker précédent/suivant,
-        # il pourrait s'agir d'une erreur de segmentation
-        if len(text.split()) < 3:
-            # Regarder le contexte
-            prev_speaker = segments[i-1]["speaker"] if i > 0 else None
-            next_speaker = segments[i+1]["speaker"] if i < len(segments)-1 else None
-
-            # Si entouré du même speaker, c'est probablement une erreur de segmentation
-            if prev_speaker == next_speaker and prev_speaker != speaker:
-                log(f"[QUALITY] Potential segmentation error: short '{text}' between {prev_speaker} segments")
-
-        improved_segments.append(seg)
-
-    return improved_segments
-def diarize_then_transcribe_hybrid(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
-    """
-    MODE HYBRIDE ULTRA-RAPIDE : 
-    1. Transcription globale complète (1 seul appel Voxtral)
-    2. Diarization pour les timestamps des speakers
-    3. Attribution du texte selon les timestamps
-    """
-    log(f"[HYBRID] Starting ultra-fast hybrid mode: language={language}, summary={with_summary}")
-    
-    # Durée max
-    try:
-        log("[HYBRID] Checking audio duration...")
-        import soundfile as sf
-        info = sf.info(wav_path)
-        est_dur = info.frames / float(info.samplerate or 1)
-        log(f"[HYBRID] Audio duration: {est_dur:.1f}s")
-        if est_dur > MAX_DURATION_S:
-            return {"error": f"Audio too long ({est_dur:.1f}s). Increase MAX_DURATION_S or send shorter file."}
-    except Exception as e:
-        log(f"[HYBRID] Could not check duration: {e}")
-
-    # ÉTAPE 1: TRANSCRIPTION GLOBALE (1 SEUL APPEL VOXTRAL)
-    log("[HYBRID] Step 1: Global transcription...")
-    conv_global = _build_conv_transcribe_ultra_strict(wav_path, language or "fr")
-    global_tokens = min(max_new_tokens, int(est_dur * 8))  # ~8 tokens par seconde max
-    out_global = run_voxtral_with_timeout(conv_global, max_new_tokens=global_tokens, timeout=60)
-    full_text = (out_global.get("text") or "").strip()
-    
-    if not full_text:
-        log("[HYBRID] Empty global transcription, fallback to segment mode")
-        return diarize_then_transcribe_fallback(wav_path, language, max_new_tokens, with_summary)
-    
-    log(f"[HYBRID] Global transcription: {len(full_text)} chars in {out_global.get('latency_s', 0):.1f}s")
-
-    # ÉTAPE 2: DIARIZATION POUR LES TIMESTAMPS
-    log("[HYBRID] Step 2: Diarization for speaker timestamps...")
-    dia = load_diarizer()
-    try:
-        if EXACT_TWO:
-            diarization = dia(wav_path, num_speakers=2, min_speakers=2, max_speakers=2)
-        else:
-            diarization = dia(wav_path, min_speakers=1, max_speakers=MAX_SPEAKERS)
-    except (TypeError, ValueError):
-        if EXACT_TWO:
-            diarization = dia(wav_path, num_speakers=2)
-        else:
-            diarization = dia(wav_path, num_speakers=MAX_SPEAKERS)
-    
-    # Collecter les segments de diarization
-    diar_segments = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        segment = {
-            "speaker": speaker,
-            "start": float(turn.start),
-            "end": float(turn.end)
-        }
-        diar_segments.append(segment)
-    
-    log(f"[HYBRID] Diarization found {len(diar_segments)} raw segments")
-
-    # ÉTAPE 3: OPTIMISATION DES SEGMENTS
-    optimized_segments = optimize_diarization_segments(diar_segments)
-    log(f"[HYBRID] After optimization: {len(optimized_segments)} segments")
-
-    # ÉTAPE 4: ATTRIBUTION INTELLIGENTE DU TEXTE SELON LES TIMESTAMPS
-    log("[HYBRID] Step 3: Smart text attribution to speakers...")
-    segments = []
-    
-    if not optimized_segments:
-        segments = [{
-            "speaker": "Agent",
-            "start": 0.0,
-            "end": total_duration,
-            "text": full_text,
-            "mood": None
-        }]
-    else:
-        # Nouvelle approche : attribution par phrases complètes
-        sentences = smart_sentence_split(full_text)
-        log(f"[HYBRID] Split into {len(sentences)} sentences for attribution")
-        
-        total_seg_duration = sum(seg["end"] - seg["start"] for seg in optimized_segments)
-        sentence_index = 0
-        
-        for i, seg in enumerate(optimized_segments):
-            seg_duration = seg["end"] - seg["start"]
-            seg_start = seg["start"]
-            seg_end = seg["end"]
-            
-            # Calculer combien de phrases attribuer à ce segment
-            sentence_proportion = seg_duration / total_seg_duration if total_seg_duration > 0 else 1.0/len(optimized_segments)
-            sentences_for_segment = max(1, int(len(sentences) * sentence_proportion))
-            
-            # Ajuster pour ne pas dépasser
-            sentences_for_segment = min(sentences_for_segment, len(sentences) - sentence_index)
-            
-            # Récupérer les phrases pour ce segment
-            if sentences_for_segment > 0:
-                seg_sentences = sentences[sentence_index:sentence_index + sentences_for_segment]
-                seg_text = " ".join(seg_sentences).strip()
-                sentence_index += sentences_for_segment
-            else:
-                seg_text = ""
-
-            # Pas de post-correction automatique - Voxtral fait foi
-            # La seule correction sera la relecture LLM (detect_and_fix_speaker_inversion) si DETECT_GLOBAL_SWAP=1
-
-            segments.append({
-                "speaker": seg["speaker"],
-                "start": seg_start,
-                "end": seg_end,
-                "text": seg_text,
-                "mood": None
-            })
-            
-            log(f"[HYBRID] Segment {i+1}/{len(optimized_segments)}: '{seg_text[:50]}...' → {seg['speaker']}")
-        
-        # Attribution des phrases restantes au dernier segment si nécessaire
-        if sentence_index < len(sentences):
-            remaining_sentences = sentences[sentence_index:]
-            if segments and remaining_sentences:
-                additional_text = " ".join(remaining_sentences)
-                segments[-1]["text"] += " " + additional_text
-                log(f"[HYBRID] Added {len(remaining_sentences)} remaining sentences to last segment")
-    
-    log("[HYBRID] Smart text attribution completed")
-
-    # ÉTAPE 5: POST-TRAITEMENT MINIMAL
-    # PHILOSOPHIE: Voxtral fait foi - pas de corrections automatiques heuristiques
-    # Seule correction possible: relecture LLM si DETECT_GLOBAL_SWAP=1
-    log("[HYBRID] Step 4: Post-processing...")
+        log("[VOXTRAL_ID] No speaker format found, retrying with forced prompt...")
+        forced = (
+            f"lang:{language or 'fr'} "
+            "Tu DOIS séparer les speakers. Voici le transcript brut, reformate-le:\n\n"
+            f"{speaker_transcript}\n\n"
+            "REFORMATE en séparant OBLIGATOIREMENT Agent et Client:\n"
+            "Agent: [sa phrase]\nClient: [sa phrase]\n...\n"
+            "L'Agent répond/travaille. Le Client appelle/demande."
+        )
+        retry_tokens = min(max_new_tokens, int(len(speaker_transcript) * 1.5))
+        out_retry    = run_voxtral_with_timeout([{"role": "user", "content": [{"type": "text", "text": forced}]}],
+                                                max_new_tokens=retry_tokens, timeout=60)
+        retry_transcript = (out_retry.get("text") or "").strip()
+        if retry_transcript:
+            segments = parse_speaker_identified_transcript(retry_transcript, est_dur)
+        if not segments:
+            segments = [{"speaker": "Agent", "start": 0.0, "end": est_dur, "text": speaker_transcript.strip(), "mood": None}]
+    log(f"[VOXTRAL_ID] Parsed {len(segments)} segments")
     segments = _enforce_max_two_speakers(segments)
-    _map_roles(segments)  # D'abord mapper SPEAKER_XX → Agent/Client
-    segments = detect_and_fix_speaker_inversion(segments)  # Relecture LLM si activée
-    
+    _map_roles(segments)
+    segments = detect_and_fix_speaker_inversion(segments)
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
-    
     result = {"segments": segments, "transcript": full_transcript}
-    
-    # Résumé
     if with_summary:
-        log("[HYBRID] Generating summary...")
-        audio_duration = max((s.get("end", 0) for s in segments), default=0)
-        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
-
-    # Sentiment par speaker (analyse améliorée)
+        log("[VOXTRAL_ID] Generating summary...")
+        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=est_dur)
     if ENABLE_SENTIMENT:
-        log("[HYBRID] Computing sentiment analysis by speaker...")
-
-        # Analyse le sentiment pour chaque speaker séparément
+        log("[VOXTRAL_ID] Computing sentiment by speaker...")
         speaker_sentiments = analyze_sentiment_by_speaker(segments)
-
         if speaker_sentiments:
-            # Attribuer le sentiment spécifique à chaque segment
             for seg in segments:
-                speaker = seg.get("speaker")
-                if speaker and speaker in speaker_sentiments:
-                    seg["mood"] = speaker_sentiments[speaker]
-
-            # Mood overall (moyenne pondérée de tous les speakers)
-            weighted_moods = []
-            for seg in segments:
-                if seg.get("text") and seg.get("mood"):
-                    duration = float(seg["end"]) - float(seg["start"])
-                    weighted_moods.append((seg["mood"], duration))
-            result["mood_overall"] = aggregate_mood(weighted_moods) if weighted_moods else None
-
-            # Mood par speaker (déjà calculé)
+                sp = seg.get("speaker")
+                if sp and sp in speaker_sentiments:
+                    seg["mood"] = speaker_sentiments[sp]
+            weighted = [(seg["mood"], float(seg["end"]) - float(seg["start"]))
+                        for seg in segments if seg.get("text") and seg.get("mood")]
+            result["mood_overall"]    = aggregate_mood(weighted) if weighted else None
             result["mood_by_speaker"] = speaker_sentiments
-
-            # NOUVEAU: Sentiment du client identifié
-            client_mood = get_client_sentiment(speaker_sentiments, segments)
-            result["mood_client"] = client_mood
-
-            # Protection maximale contre None
-            confidence_raw = client_mood.get('confidence')
-            if confidence_raw is None:
-                confidence = 0.0
-                log(f"[HYBRID] WARNING: Client sentiment confidence is None, using 0.0")
-            else:
-                confidence = float(confidence_raw)
-
-            label_fr = client_mood.get('label_fr') or 'inconnu'
-            log(f"[HYBRID] Client sentiment: {label_fr} (confidence: {confidence:.2f})")
-
-        log("[HYBRID] Sentiment analysis completed")
-    else:
-        log("[HYBRID] Sentiment analysis skipped")
-
-    log(f"[HYBRID] Completed: 1 Voxtral call instead of {len(diar_segments)}+ calls")
+            client_mood               = get_client_sentiment(speaker_sentiments, segments)
+            result["mood_client"]     = client_mood
+            label_fr = client_mood.get("label_fr") or "inconnu"
+            conf     = float(client_mood.get("confidence") or 0.0)
+            log(f"[VOXTRAL_ID] Client sentiment: {label_fr} (confidence: {conf:.2f})")
+    log("[VOXTRAL_ID] Voxtral speaker identification completed successfully")
     return result
 
-def diarize_then_transcribe_fallback(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool):
-    """Mode fallback segment-par-segment (ultra-optimisé) si le mode hybride échoue."""
-    log("[FALLBACK] Using segment-by-segment mode with ultra-aggressive filtering")
-    
-    # Diarization
-    dia = load_diarizer()
-    try:
-        if EXACT_TWO:
-            diarization = dia(wav_path, num_speakers=2)
-        else:
-            diarization = dia(wav_path, min_speakers=1, max_speakers=MAX_SPEAKERS)
-    except (TypeError, ValueError):
-        diarization = dia(wav_path, num_speakers=MAX_SPEAKERS)
-    
-    # Collecter et optimiser segments
-    raw_segments = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        segment = {
-            "speaker": speaker,
-            "start": float(turn.start),
-            "end": float(turn.end)
-        }
-        raw_segments.append(segment)
-    
-    # ULTRA-AGRESSIF : garde seulement les 4-6 plus longs segments
-    raw_segments.sort(key=lambda x: x["end"] - x["start"], reverse=True)
-    max_segments = min(6, len(raw_segments))
-    optimized_segments = raw_segments[:max_segments]
-    optimized_segments.sort(key=lambda x: x["start"])  # Retrier par temps
-    
-    log(f"[FALLBACK] Ultra-aggressive: {len(raw_segments)} → {max_segments} segments")
-    
-    # Transcription segment par segment
-    audio = AudioSegment.from_wav(wav_path)
-    segments = []
-    
-    for i, seg in enumerate(optimized_segments):
-        start_s = seg["start"]
-        end_s = seg["end"]
-        dur_s = end_s - start_s
-        speaker = seg["speaker"]
-        
-        # Extraction audio
-        seg_audio = audio[int(start_s * 1000): int(end_s * 1000)]
-        tmp = os.path.join(tempfile.gettempdir(), f"seg_{speaker}_{int(start_s*1000)}.wav")
-        seg_audio.export(tmp, format="wav")
-        
-        # Transcription
-        conv = _build_conv_transcribe_ultra_strict(tmp, "fr")
-        tokens = max(32, min(96, int(dur_s * 8)))
-        out = run_voxtral_with_timeout(conv, max_new_tokens=tokens, timeout=30)
-        text = (out.get("text") or "").strip()
-        
-        segments.append({
-            "speaker": speaker,
-            "start": start_s,
-            "end": end_s,
-            "text": text,
-            "mood": classify_sentiment(text) if ENABLE_SENTIMENT and text else None
-        })
-        
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-    
-    # Post-traitement
-    segments = _enforce_max_two_speakers(segments)
-    _map_roles(segments)  # D'abord mapper SPEAKER_XX → Agent/Client
-    segments = detect_and_fix_speaker_inversion(segments)  # Puis corriger les erreurs évidentes
-
-    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
-    result = {"segments": segments, "transcript": full_transcript}
-
-    if with_summary:
-        audio_duration = max((s.get("end", 0) for s in segments), default=0)
-        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=audio_duration)
-
-    return result
-
-# ---------------------------
-# Health
-# ---------------------------
+# =============================================================================
+# HEALTH CHECK
+# =============================================================================
 def health():
     info = {
         "app_version": APP_VERSION,
-        "python": os.popen("python -V").read().strip(),
         "torch": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
-        "cuda_device_count": torch.cuda.device_count(),
         "device": _device_str(),
-        "transformers_has_voxtral": _HAS_VOXTRAL_CLASS,
-        "hf_token_present": bool(HF_TOKEN),
+        "quant_mode": QUANT_MODE,
         "model_id": MODEL_ID,
-        "diar_model": DIAR_MODEL,
-        "sentiment_analysis": "Voxtral-based" if ENABLE_SENTIMENT else "Disabled",
-        "max_speakers": MAX_SPEAKERS,
-        "exact_two": EXACT_TWO,
-        "strict_transcription": STRICT_TRANSCRIPTION,
-        "smart_summary": SMART_SUMMARY,
-        "extractive_summary": EXTRACTIVE_SUMMARY,
-        "min_seg_dur": MIN_SEG_DUR,
-        "min_speaker_time": MIN_SPEAKER_TIME,
-        "merge_consecutive": MERGE_CONSECUTIVE,
-        "role_labels": ROLE_LABELS,
-        "hybrid_mode": HYBRID_MODE,
-        "voxtral_speaker_id": VOXTRAL_SPEAKER_ID,  # NOUVEAU
-        "pyannote_auto": PYANNOTE_AUTO,  # NOUVEAU
-        "aggressive_merge": AGGRESSIVE_MERGE,
-        "single_voice_detection": ENABLE_SINGLE_VOICE_DETECTION,  # NOUVEAU
-        "single_voice_detection_timeout": SINGLE_VOICE_DETECTION_TIMEOUT,  # NOUVEAU
-        "single_voice_summary_tokens": SINGLE_VOICE_SUMMARY_TOKENS,  # NOUVEAU
+        "sentiment": "Voxtral-based" if ENABLE_SENTIMENT else "Disabled",
+        "single_voice_detection": ENABLE_SINGLE_VOICE_DETECTION,
         "hold_music_detection": ENABLE_HOLD_MUSIC_DETECTION,
-        "hold_music_thresholds": {
-            "speech_ratio_hard": HOLD_MUSIC_SPEECH_RATIO_HARD,
-            "speech_ratio_soft": HOLD_MUSIC_SPEECH_RATIO_SOFT,
-            "min_duration": HOLD_MUSIC_MIN_DURATION,
-        },
-        "diarization_modes": {  # NOUVEAU : résumé des modes disponibles
-            "voxtral_speaker_id": VOXTRAL_SPEAKER_ID,
-            "pyannote_auto": PYANNOTE_AUTO, 
-            "hybrid_mode": HYBRID_MODE,
-            "fallback_mode": not (VOXTRAL_SPEAKER_ID or PYANNOTE_AUTO or HYBRID_MODE),
-            "single_voice_detection": ENABLE_SINGLE_VOICE_DETECTION
-        },
-        "optimizations": {
-            "quant_mode": QUANT_MODE,
-            "current_mode": "Voxtral Speaker ID" if VOXTRAL_SPEAKER_ID else "PyAnnote Auto" if PYANNOTE_AUTO else "Hybrid" if HYBRID_MODE else "Fallback",
-            "speaker_identification": "Context-based by Voxtral" if VOXTRAL_SPEAKER_ID else "Voice-based by PyAnnote",
-            "expected_quality": "High (contextual)" if VOXTRAL_SPEAKER_ID else "Medium-High (automatic)" if PYANNOTE_AUTO else "Medium (hybrid)",
-            "expected_speed": "Fast (1 Voxtral call)" if VOXTRAL_SPEAKER_ID else "Fast (minimal processing)" if PYANNOTE_AUTO else "Fast (1 Voxtral + PyAnnote)",
-        }
+        "detect_global_swap": DETECT_GLOBAL_SWAP,
+        "role_labels": ROLE_LABELS,
     }
-    
     try:
         if _model is not None:
             p = next(_model.parameters())
             info["voxtral_device"] = str(p.device)
-            info["voxtral_dtype"] = str(p.dtype)
-        else:
-            info["voxtral_device"] = None
-            info["voxtral_dtype"] = None
+            info["voxtral_dtype"]  = str(p.dtype)
     except Exception:
-        info["voxtral_device"] = "unknown"
-        info["voxtral_dtype"] = "unknown"
-
+        pass
     errors = {}
     try:
         load_voxtral()
     except Exception as e:
         errors["voxtral_load"] = f"{type(e).__name__}: {e}"
-    try:
-        load_diarizer()
-    except Exception as e:
-        errors["diarizer_load"] = f"{type(e).__name__}: {e}"
-    
     return {"ok": len(errors) == 0, "info": info, "errors": errors}
 
-# ---------------------------
-# Handler
-# ---------------------------
+# =============================================================================
+# HANDLER RUNPOD
+# =============================================================================
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
+    inp = job.get("input", {}) or {}
+    log(f"[HANDLER] New job received: {inp.get('task', 'unknown')}")
+
+    if inp.get("ping"):
+        return {"pong": True}
+    if inp.get("task") == "health":
+        return health()
+
+    task         = (inp.get("task") or "transcribe_diarized").lower()
+    language     = inp.get("language") or None
+    max_new_tokens = int(inp.get("max_new_tokens", MAX_NEW_TOKENS))
+    with_summary   = bool(inp.get("with_summary", WITH_SUMMARY_DEFAULT))
+    log(f"[HANDLER] Task: {task}, language: {language}, max_tokens: {max_new_tokens}, summary: {with_summary}")
+
+    local_path, cleanup = None, False
     try:
-        log(f"[HANDLER] New job received: {job.get('input', {}).get('task', 'unknown')}")
-        inp = job.get("input", {}) or {}
-
-        if inp.get("ping"):
-            log("[HANDLER] Ping request")
-            return {"pong": True}
-
-        if inp.get("task") == "health":
-            log("[HANDLER] Health check request")
-            return health()
-
-        task = (inp.get("task") or "transcribe").lower()
-        language = inp.get("language") or None
-        max_new_tokens = int(inp.get("max_new_tokens", MAX_NEW_TOKENS))
-        with_summary = bool(inp.get("with_summary", WITH_SUMMARY_DEFAULT))
-
-        log(f"[HANDLER] Task: {task}, language: {language}, max_tokens: {max_new_tokens}, summary: {with_summary}")
-
-        local_path, cleanup = None, False
+        # ── Récupération de l'audio ──────────────────────────────────────────
         if inp.get("audio_url"):
-            local_path = _download_to_tmp(inp["audio_url"]); cleanup = True
-            log(f"[HANDLER] Downloaded audio from URL: {inp['audio_url']}")
+            url = inp["audio_url"].strip()
+            # Validation basique de l'URL avant téléchargement
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            if not parsed.path or parsed.path in ('', '/'):
+                log(f"[HANDLER] Invalid audio_url (no file path): '{url}'")
+                return {"error": f"audio_url invalide ou tronquée: '{url}'"}
+            local_path = _download_to_tmp(url); cleanup = True
+            log(f"[HANDLER] Downloaded audio from URL: {url}")
         elif inp.get("audio_b64"):
             local_path = _b64_to_tmp(inp["audio_b64"]); cleanup = True
             log("[HANDLER] Decoded audio from base64")
         elif inp.get("file_path"):
             local_path = inp["file_path"]
             log(f"[HANDLER] Using file path: {local_path}")
-        elif task not in ("health",):
-            log("[HANDLER] ERROR: No audio input provided")
+        else:
             return {"error": "Provide 'audio_url', 'audio_b64' or 'file_path'."}
 
-        log(f"[HANDLER] Processing audio file: {local_path}")
+        # ── Validation audio ─────────────────────────────────────────────────
+        ok, err, _ = _validate_audio(local_path)
+        if not ok:
+            log(f"[HANDLER] Invalid audio: {err}")
+            return {"error": err}
+        log(f"[HANDLER] Processing audio: {local_path}")
 
-        if task in ("transcribe_diarized", "diarized", "diarize"):
-            log("[HANDLER] Starting diarized transcription...")
+        # ── Détection musique d'attente ───────────────────────────────────────
+        if ENABLE_HOLD_MUSIC_DETECTION:
+            hold_result = detect_hold_music(local_path)
+            if hold_result["is_hold_music"]:
+                log("[HANDLER] Hold music detected — skipping inference")
+                out = build_hold_music_response(hold_result, with_summary)
+                return {"task": task, **out}
+            if hold_result.get("speech_blocks"):
+                local_path, cleanup = trim_audio_to_speech_blocks(local_path, hold_result, cleanup)
 
-            # Détection musique d'attente AVANT toute inférence Voxtral
-            if ENABLE_HOLD_MUSIC_DETECTION:
-                hold_music_result = detect_hold_music(local_path)
-                if hold_music_result["is_hold_music"]:
-                    log(f"[HANDLER] Hold music detected, skipping Voxtral inference")
-                    out = build_hold_music_response(hold_music_result, with_summary)
-                    return {"task": "transcribe_diarized", **out}
+        # ── Détection voix unique ─────────────────────────────────────────────
+        if ENABLE_SINGLE_VOICE_DETECTION:
+            content_type = detect_single_voice_content(local_path, language)
+            if content_type["type"] in ("announcement", "voicemail"):
+                log(f"[HANDLER] Detected {content_type['type']}, using single voice mode")
+                out = transcribe_single_voice_content(local_path, language, max_new_tokens, with_summary)
+                if "error" in out:
+                    return out
+                return {"task": task, **out}
 
-                # Extraire les blocs de parole, supprimer la musique d'attente
-                if hold_music_result.get("speech_blocks"):
-                    local_path, cleanup = trim_audio_to_speech_blocks(local_path, hold_music_result, cleanup)
-
-            # NOUVEAU : Détection précoce du type de contenu (si activée)
-            if ENABLE_SINGLE_VOICE_DETECTION:
-                content_type = detect_single_voice_content(local_path, language)
-                
-                if content_type["type"] == "announcement":
-                    log("[HANDLER] Detected announcement/IVR, using single voice mode")
-                    out = transcribe_single_voice_content(local_path, language, max_new_tokens, with_summary)
-                elif content_type["type"] == "voicemail":
-                    log("[HANDLER] Detected voicemail, using single voice mode")
-                    out = transcribe_single_voice_content(local_path, language, max_new_tokens, with_summary)
-                else:
-                    # Mode normal pour les conversations (PIPELINE EXISTANT INCHANGÉ)
-                    if VOXTRAL_SPEAKER_ID:
-                        log("[HANDLER] Using Voxtral Speaker Identification mode")
-                        out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary)
-                    elif PYANNOTE_AUTO:
-                        log("[HANDLER] Using PyAnnote Auto mode")
-                        out = diarize_with_pyannote_auto(local_path, language, max_new_tokens, with_summary)
-                    elif HYBRID_MODE:
-                        log("[HANDLER] Using Hybrid mode (PyAnnote + Voxtral)")
-                        out = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, with_summary)
-                    else:
-                        log("[HANDLER] Using Fallback segment mode")
-                        out = diarize_then_transcribe_fallback(local_path, language, max_new_tokens, with_summary)
-            else:
-                # Détection désactivée - utiliser le pipeline existant (COMPORTEMENT ORIGINAL)
-                if VOXTRAL_SPEAKER_ID:
-                    log("[HANDLER] Using Voxtral Speaker Identification mode")
-                    out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary)
-                elif PYANNOTE_AUTO:
-                    log("[HANDLER] Using PyAnnote Auto mode")
-                    out = diarize_with_pyannote_auto(local_path, language, max_new_tokens, with_summary)
-                elif HYBRID_MODE:
-                    log("[HANDLER] Using Hybrid mode (PyAnnote + Voxtral)")
-                    out = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, with_summary)
-                else:
-                    log("[HANDLER] Using Fallback segment mode")
-                    out = diarize_then_transcribe_fallback(local_path, language, max_new_tokens, with_summary)
-                
-            if "error" in out:
-                log(f"[HANDLER] Error in diarized transcription: {out['error']}")
-                return out
-            log("[HANDLER] Diarized transcription completed successfully")
-            return {"task": "transcribe_diarized", **out}
-        elif task in ("summary", "summarize"):
-            log("[HANDLER] Starting summary task...")
-
-            # Détection musique d'attente AVANT toute inférence Voxtral
-            if ENABLE_HOLD_MUSIC_DETECTION:
-                hold_music_result = detect_hold_music(local_path)
-                if hold_music_result["is_hold_music"]:
-                    log(f"[HANDLER] Hold music detected, skipping summary inference")
-                    return {
-                        "task": "summary",
-                        "text": "Aucune conversation détectée - musique d'attente uniquement.",
-                        "hold_music_detected": True,
-                        "hold_music_speech_ratio": hold_music_result.get("speech_ratio", 0.0),
-                        "latency_s": hold_music_result.get("detection_time", 0.0),
-                    }
-
-                # Extraire les blocs de parole, supprimer la musique d'attente
-                if hold_music_result.get("speech_blocks"):
-                    local_path, cleanup = trim_audio_to_speech_blocks(local_path, hold_music_result, cleanup)
-
-            try:
-                temp_result = diarize_then_transcribe_hybrid(local_path, language, max_new_tokens, False)
-                if "error" in temp_result:
-                    return temp_result
-
-                transcript = temp_result.get("transcript", "")
-                segments = temp_result.get("segments", [])
-                audio_duration = max((s.get("end", 0) for s in segments), default=0) if segments else 0
-                summary = select_best_summary_approach(transcript, duration_seconds=audio_duration) if transcript else "Audio indisponible."
-
-                log("[HANDLER] Summary task completed")
-                return {"task": "summary", "text": summary, "latency_s": 0}
-            except Exception as e:
-                log(f"[ERROR] Smart summary failed: {e}")
-                # Fallback mode résumé audio direct
-                instruction = "Résume cette conversation en 1-2 phrases simples et utiles."
-                conv = [{
-                    "role": "user",
-                    "content": [
-                        {"type": "audio", "path": local_path},
-                        {"type": "text", "text": instruction}
-                    ]
-                }]
-                out = run_voxtral_with_timeout(conv, max_new_tokens=72, timeout=25)
-                log("[HANDLER] Fallback summary completed")
-                return {"task": "summary", **out}
-        else:
-            log("[HANDLER] Starting simple transcription...")
-
-            # Détection musique d'attente AVANT toute inférence Voxtral
-            if ENABLE_HOLD_MUSIC_DETECTION:
-                hold_music_result = detect_hold_music(local_path)
-                if hold_music_result["is_hold_music"]:
-                    log(f"[HANDLER] Hold music detected, skipping transcription inference")
-                    return {
-                        "task": "transcribe",
-                        "text": "",
-                        "hold_music_detected": True,
-                        "hold_music_speech_ratio": hold_music_result.get("speech_ratio", 0.0),
-                        "latency_s": hold_music_result.get("detection_time", 0.0),
-                    }
-
-                # Extraire les blocs de parole, supprimer la musique d'attente
-                if hold_music_result.get("speech_blocks"):
-                    local_path, cleanup = trim_audio_to_speech_blocks(local_path, hold_music_result, cleanup)
-
-            conv = _build_conv_transcribe_ultra_strict(local_path, language)
-            out = run_voxtral_with_timeout(conv, max_new_tokens=min(max_new_tokens, 64), timeout=30)
-            log("[HANDLER] Simple transcription completed")
-            return {"task": "transcribe", **out}
+        # ── Pipeline principal : Voxtral Speaker ID ───────────────────────────
+        log("[HANDLER] Using Voxtral Speaker Identification mode")
+        out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary)
+        if "error" in out:
+            log(f"[HANDLER] Error: {out['error']}")
+            return out
+        log("[HANDLER] Transcription completed successfully")
+        return {"task": task, **out}
 
     except Exception as e:
         log(f"[HANDLER] CRITICAL ERROR: {type(e).__name__}: {e}")
         return {"error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc(limit=3)}
     finally:
-        # Nettoyage mémoire GPU après chaque tâche
         try:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()  # IMPORTANT: attendre fin des opérations async
-                torch.cuda.empty_cache()
-                log("[HANDLER] GPU memory cleared after task")
+            _gpu_clear()
+            log("[HANDLER] GPU memory cleared after task")
         except Exception:
             pass
-        # Nettoyage fichier audio temporaire
         try:
-            if 'cleanup' in locals() and cleanup and local_path and os.path.exists(local_path):
+            if cleanup and local_path and os.path.exists(local_path):
                 os.remove(local_path)
                 log("[HANDLER] Temp file cleanup completed")
         except Exception:
             pass
 
-# Preload conditionnel et sûr
+# =============================================================================
+# INITIALISATION
+# =============================================================================
 try:
     log("[INIT] Starting conditional preload...")
     log(f"[INIT] QUANT_MODE={QUANT_MODE} | APP_VERSION={APP_VERSION}")
-    
     if not check_gpu_memory():
         log(f"[CRITICAL] Insufficient GPU memory (QUANT_MODE={QUANT_MODE}) — skipping preload")
-        log("[INIT] Skipping preload due to memory issues")
     else:
         log("[INIT] Preloading Voxtral...")
         load_voxtral()
-
-        # Lazy loading PyAnnote : charger seulement si modes qui l'utilisent
-        if VOXTRAL_SPEAKER_ID and not (PYANNOTE_AUTO or HYBRID_MODE):
-            log("[INIT] Skipping PyAnnote preload (Voxtral Speaker ID mode only)")
-        else:
-            log("[INIT] Preloading diarizer...")
-            load_diarizer()
-
         log("[INIT] Preload completed successfully")
 
-    if ENABLE_HOLD_MUSIC_DETECTION:
-        log(f"[INIT] Hold music detection: ENABLED "
-            f"(hard={HOLD_MUSIC_SPEECH_RATIO_HARD}, soft={HOLD_MUSIC_SPEECH_RATIO_SOFT}, "
-            f"min_duration={HOLD_MUSIC_MIN_DURATION}s)")
-    else:
-        log("[INIT] Hold music detection: DISABLED")
+    log(f"[INIT] Hold music detection: {'ENABLED' if ENABLE_HOLD_MUSIC_DETECTION else 'DISABLED'}")
+    log(f"[INIT] Single voice detection: {'ENABLED' if ENABLE_SINGLE_VOICE_DETECTION else 'DISABLED'}")
+    log(f"[INIT] Sentiment analysis: {'ENABLED' if ENABLE_SENTIMENT else 'DISABLED'}")
+    log(f"[INIT] LLM review (DETECT_GLOBAL_SWAP): {'ENABLED' if DETECT_GLOBAL_SWAP else 'DISABLED'}")
 
 except Exception as e:
-    log(f"[WARN] Preload failed - will load on first request: {e}")
+    log(f"[WARN] Preload failed — will load on first request: {e}")
     _processor = None
-    _model = None
-    _diarizer = None
-    _sentiment_clf = None
-    _sentiment_zero_shot = None
+    _model     = None
 
 runpod.serverless.start({"handler": handler})
