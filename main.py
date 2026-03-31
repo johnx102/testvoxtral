@@ -1368,7 +1368,7 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
             mono_result["mood_by_speaker"] = mood_by_speaker
             mono_result["mood_client"]     = client_mood
 
-    return result
+    return mono_result
 
 # =============================================================================
 # PIPELINE PRINCIPAL — VOXTRAL SPEAKER ID (fallback / mono)
