@@ -538,28 +538,44 @@ def create_extractive_summary(transcript: str) -> str:
     lines  = [l.strip() for l in transcript.split('\n') if l.strip() and ':' in l]
     if not lines:
         return "Conversation très courte."
+
     parts        = []
-    client_lines = [l for l in lines if l.lower().startswith('client:')]
-    for line in client_lines:
-        text = line.replace('Client:', '').strip().lower()
-        if any(kw in text for kw in ['rendez-vous', 'rdv', 'prendre', 'avancer', 'reporter']):
+    client_lines = [l.split(':', 1)[1].strip() for l in lines if l.lower().startswith('client:')]
+    agent_lines  = [l.split(':', 1)[1].strip() for l in lines if l.lower().startswith('agent:')]
+
+    # Identifier le motif de l'appel depuis les paroles du client
+    for text in client_lines:
+        tl = text.lower()
+        if any(kw in tl for kw in ['rendez-vous', 'rdv', 'prendre', 'avancer', 'reporter', 'place pour']):
             parts.append("Appel pour un rendez-vous"); break
-        elif any(kw in text for kw in ['information', 'renseignement', 'savoir']):
+        elif any(kw in tl for kw in ['dent', 'mal', 'douleur', 'cassé', 'cassée', 'urgence']):
+            parts.append("Appel pour un problème dentaire"); break
+        elif any(kw in tl for kw in ['information', 'renseignement', 'savoir', 'question']):
             parts.append("Demande d'information"); break
-        elif any(kw in text for kw in ['problème', 'souci', 'bug']):
+        elif any(kw in tl for kw in ['problème', 'souci', 'bug', 'réclamation']):
             parts.append("Signalement d'un problème"); break
-    agent_lines = [l for l in lines if l.lower().startswith('agent:')]
-    for line in agent_lines:
-        text = line.replace('Agent:', '').strip().lower()
-        if any(kw in text for kw in ['je vais', 'on va', 'nous allons']):
-            parts.append(f"L'agent va {line.replace('Agent:', '').strip().lower()}"); break
-        elif any(kw in text for kw in ['pas possible', 'impossible', 'désolé']):
+        elif any(kw in tl for kw in ['annuler', 'annulation', 'supprimer']):
+            parts.append("Appel pour annuler un rendez-vous"); break
+        elif any(kw in tl for kw in ['confirmer', 'confirmation']):
+            parts.append("Appel pour confirmer un rendez-vous"); break
+
+    # Identifier la résolution depuis les paroles de l'agent
+    for text in agent_lines:
+        tl = text.lower()
+        if any(kw in tl for kw in ["c'est noté", "c'est bon", "c'est enregistré", "je vous mets"]):
+            parts.append("Rendez-vous confirmé par l'agent"); break
+        elif any(kw in tl for kw in ['pas possible', 'impossible', 'désolé', 'complet']):
             parts.append("L'agent ne peut pas satisfaire la demande"); break
+        elif any(kw in tl for kw in ['rappeler', 'on vous rappelle', 'je vous rappelle']):
+            parts.append("L'agent va rappeler"); break
+
     if not parts:
-        for line in lines[:2]:
-            text = line.split(':', 1)[1].strip() if ':' in line else line
-            if len(text) > 15 and not any(pol in text.lower() for pol in ['bonjour', 'au revoir', 'merci']):
-                parts.append(text)
+        # Fallback : prendre la première phrase substantielle du client
+        for text in client_lines:
+            if len(text) > 20 and not any(pol in text.lower() for pol in ['bonjour', 'au revoir', 'merci', 'oui', 'ok']):
+                parts.append(text[:120])
+                break
+
     return ". ".join(parts) + "." if parts else "Conversation brève sans motif identifié."
 
 def select_best_summary_approach(transcript: str, duration_seconds: float = 0) -> str:
