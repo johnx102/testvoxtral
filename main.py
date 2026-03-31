@@ -64,7 +64,9 @@ MAX_DURATION_S       = int(os.environ.get("MAX_DURATION_S", "3600"))
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
 # Diarization stéréo : utilise les canaux L/R du fichier WAV stéréo
-# Canal gauche (rx) = Client, Canal droit (tx) = Agent
+# Mapping canal → rôle dépend de call_direction (détecté via préfixe in-/out-)
+#   Entrant : ch0(left/rx) = Client, ch1(right/tx) = Agent
+#   Sortant : ch0(left/rx) = Agent,  ch1(right/tx) = Client
 # Fallback automatique vers Voxtral Speaker ID si audio mono
 STEREO_DIARIZATION = os.environ.get("STEREO_DIARIZATION", "1") == "1"
 
@@ -806,6 +808,20 @@ def transcribe_single_voice_content(wav_path: str, language: Optional[str], max_
     full_text = (out.get("text") or "").strip()
     if not full_text:
         return {"error": "Empty transcription for single voice content"}
+
+    # Nettoyage anti-hallucination
+    full_text = remove_repetitive_loops(full_text, max_repetitions=3)
+    full_text = re.sub(r'(\.\s*){5,}', '', full_text).strip()  # "... ... ... ..." → vide
+    full_text = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]\s*', '', full_text, flags=re.IGNORECASE).strip()
+    if not full_text or len(full_text.split()) < 3:
+        log("[SINGLE_VOICE] Empty after cleanup — likely silence/music")
+        return {
+            "segments": [], "transcript": "",
+            "summary": "Aucune conversation détectée - silence ou musique d'attente.",
+            "hold_music_detected": True,
+            "mood_overall": {"label_en": "neutral", "label_fr": "neutre", "confidence": 0.95,
+                             "scores": {"negative": 0.0, "neutral": 0.95, "positive": 0.05}},
+        }
     conversation_markers = ["allô ?", "allo ?", "oui, bonjour", "bonjour,", "c'est noté",
                             "pas de souci", "à tout à l'heure", "au revoir", "je vous remercie",
                             "d'accord", "pas de problème", "merci beaucoup"]
@@ -982,17 +998,20 @@ def _vad_speech_blocks(wav_path: str, frame_ms: int = 20, min_speech_ms: int = 1
         blocks.append((round(start_f * frame_ms / 1000, 3),
                        round(n_frames * frame_ms / 1000, 3)))
 
-    # Fusionner les blocs séparés par moins de 500ms
+    # Fusionner les blocs séparés par moins de 2s (forme des tours de parole cohérents)
     if not blocks:
         return []
     merged = [list(blocks[0])]
     for s, e in blocks[1:]:
-        if s - merged[-1][1] < 0.5:
+        if s - merged[-1][1] < 2.0:
             merged[-1][1] = e
         else:
             merged.append([s, e])
 
-    log(f"[VAD] {len(merged)} speech blocks detected in {wav_path.split('/')[-1]}")
+    # Filtrer les micro-blocs < 300ms (crosstalk/bruit)
+    merged = [(s, e) for s, e in merged if e - s >= 0.3]
+
+    log(f"[VAD] {len(merged)} speech turns detected in {wav_path.split('/')[-1]}")
     return [(round(s, 3), round(e, 3)) for s, e in merged]
 
 def _extract_speech_only(wav_path: str, vad_blocks: List[Tuple[float, float]]) -> Optional[str]:
@@ -1121,26 +1140,61 @@ def _transcribe_channel_with_vad(wav_path: str, speaker: str, language: Optional
 def _merge_stereo_segments(agent_segs: List[Dict], client_segs: List[Dict]) -> List[Dict]:
     """
     Fusionne les segments Agent et Client en les triant par timestamp réel.
-    Fusionne les segments consécutifs du même speaker séparés de moins de 500ms.
+    Fusionne les segments consécutifs du même speaker (même si un micro-segment
+    de l'autre speaker s'intercale) pour former des tours de parole lisibles.
     """
     all_segs = sorted(agent_segs + client_segs, key=lambda s: s["start"])
 
     if not all_segs:
         return []
 
-    # Fusionner les segments consécutifs du même speaker
+    # Passe 1 : fusionner les segments consécutifs du même speaker (gap < 3s)
     merged = [all_segs[0].copy()]
     for seg in all_segs[1:]:
         prev = merged[-1]
         if (seg["speaker"] == prev["speaker"] and
-                seg["start"] - prev["end"] < 0.8):
+                seg["start"] - prev["end"] < 3.0):
             prev["text"] = prev["text"].rstrip() + " " + seg["text"].lstrip()
-            prev["end"]  = seg["end"]
+            prev["end"]  = max(prev["end"], seg["end"])
         else:
             merged.append(seg.copy())
 
-    log(f"[STEREO] Merged: {len(all_segs)} → {len(merged)} segments (sorted by timestamp)")
-    return merged
+    # Passe 2 : absorber les micro-segments (< 1s) isolés entre deux segments du même speaker
+    if len(merged) >= 3:
+        cleaned = [merged[0]]
+        i = 1
+        while i < len(merged) - 1:
+            curr = merged[i]
+            prev = cleaned[-1]
+            nxt  = merged[i + 1]
+            curr_dur = curr["end"] - curr["start"]
+            # Si le segment courant est très court ET les segments autour sont du même speaker
+            if (curr_dur < 1.0 and prev["speaker"] == nxt["speaker"]
+                    and prev["speaker"] != curr["speaker"]):
+                # Absorber le micro-segment dans le speaker dominant
+                prev["text"] = prev["text"].rstrip() + " " + curr["text"].lstrip()
+                prev["end"]  = max(prev["end"], curr["end"])
+                log(f"[STEREO] Absorbed micro-segment ({curr_dur:.1f}s {curr['speaker']}) into {prev['speaker']}")
+                i += 1
+                continue
+            cleaned.append(curr)
+            i += 1
+        if i < len(merged):
+            cleaned.append(merged[i])
+        merged = cleaned
+
+    # Passe 3 : re-fusionner les segments consécutifs du même speaker (après absorption)
+    final = [merged[0]]
+    for seg in merged[1:]:
+        prev = final[-1]
+        if prev["speaker"] == seg["speaker"]:
+            prev["text"] = prev["text"].rstrip() + " " + seg["text"].lstrip()
+            prev["end"]  = max(prev["end"], seg["end"])
+        else:
+            final.append(seg)
+
+    log(f"[STEREO] Merged: {len(all_segs)} → {len(final)} segments (sorted by timestamp)")
+    return final
 
 def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new_tokens: int,
                                   with_summary: bool, call_direction: str = "unknown",
@@ -1588,11 +1642,6 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             log("[HANDLER] Using Stereo Channel Diarization (fallback: Voxtral Speaker ID if mono)")
             out = diarize_with_stereo_channels(local_path, language, max_new_tokens, with_summary, call_direction,
                                                ch0_path=ch0_path, ch1_path=ch1_path)
-            # Cleanup des canaux après usage
-            for p in [ch0_path, ch1_path]:
-                if p and os.path.exists(p):
-                    try: os.remove(p)
-                    except Exception: pass
         else:
             log("[HANDLER] Using Voxtral Speaker Identification mode")
             out = diarize_with_voxtral_speaker_id(local_path, language, max_new_tokens, with_summary, call_direction)
@@ -1610,6 +1659,19 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             _gpu_clear()
         except Exception:
             pass
+        # Cleanup fichiers temporaires (canaux stéréo + mono detection)
+        for p in [ch0_path, ch1_path]:
+            try:
+                if p and p != local_path and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        if mono_cleanup:
+            try:
+                if mono_path and mono_path != local_path and os.path.exists(mono_path):
+                    os.remove(mono_path)
+            except Exception:
+                pass
         try:
             if cleanup and local_path and os.path.exists(local_path):
                 os.remove(local_path)
