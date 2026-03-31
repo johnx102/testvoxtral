@@ -800,11 +800,15 @@ def transcribe_single_voice_content(wav_path: str, language: Optional[str], max_
     ok, err, est_dur = _validate_audio(wav_path)
     if not ok:
         return {"error": err}
+    # Limiter les tokens à la durée réelle (single voice = court, pas besoin de 2500 tokens)
+    sv_tokens = max(64, min(int(est_dur * 8), 512))
+    sv_timeout = min(int(est_dur * 0.7) + 30, 120)
+    log(f"[SINGLE_VOICE] Transcribing: {est_dur:.1f}s → tokens={sv_tokens}, timeout={sv_timeout}s")
     conv = [{"role": "user", "content": [
         {"type": "audio", "path": wav_path},
         {"type": "text", "text": f"lang:{language or 'fr'} [TRANSCRIBE] Écris exactement ce qui est dit, mot pour mot."}
     ]}]
-    out       = run_voxtral_with_timeout(conv, max_new_tokens=max_new_tokens, timeout=60)
+    out       = run_voxtral_with_timeout(conv, max_new_tokens=sv_tokens, timeout=sv_timeout)
     full_text = (out.get("text") or "").strip()
     if not full_text:
         return {"error": "Empty transcription for single voice content"}
@@ -926,6 +930,22 @@ def _attach_sentiment(segments, speaker_sentiments):
 # =============================================================================
 # DIARIZATION STÉRÉO PAR CANAUX
 # =============================================================================
+def _to_mono_tmp(wav_path: str) -> str:
+    """Convertit un fichier stéréo en mono temporaire pour fallback Voxtral Speaker ID."""
+    try:
+        import soundfile as sf
+        info = sf.info(wav_path)
+        if info.channels <= 1:
+            return wav_path
+        audio = AudioSegment.from_file(wav_path).set_channels(1)
+        out   = os.path.join(tempfile.gettempdir(), f"mono_fb_{uuid.uuid4().hex}.wav")
+        audio.export(out, format="wav")
+        log(f"[MONO_FB] Converted stereo → mono for fallback: {out}")
+        return out
+    except Exception as e:
+        log(f"[MONO_FB] Conversion failed: {e}")
+        return wav_path
+
 def _extract_mono_channel(wav_path: str, channel: int) -> str:
     """Extrait un canal d'un fichier stéréo en mono temporaire."""
     import soundfile as sf
@@ -1196,19 +1216,42 @@ def _merge_stereo_segments(agent_segs: List[Dict], client_segs: List[Dict]) -> L
     log(f"[STEREO] Merged: {len(all_segs)} → {len(final)} segments (sorted by timestamp)")
     return final
 
+def _get_dominant_speaker_at(ch0_vad: List[Tuple[float, float]], ch1_vad: List[Tuple[float, float]],
+                              start: float, end: float, left_role: str, right_role: str) -> Optional[str]:
+    """
+    Pour un segment [start, end], détermine quel canal a le plus d'énergie/parole.
+    Retourne left_role ou right_role, ou None si aucun ne parle.
+    """
+    def overlap(blocks, s, e):
+        total = 0.0
+        for bs, be in blocks:
+            ov_start = max(s, bs)
+            ov_end   = min(e, be)
+            if ov_end > ov_start:
+                total += ov_end - ov_start
+        return total
+
+    ch0_speech = overlap(ch0_vad, start, end)
+    ch1_speech = overlap(ch1_vad, start, end)
+
+    if ch0_speech <= 0 and ch1_speech <= 0:
+        return None
+    # Le canal avec le plus de parole dans ce segment = le speaker
+    return left_role if ch0_speech >= ch1_speech else right_role
+
+
 def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new_tokens: int,
                                   with_summary: bool, call_direction: str = "unknown",
                                   ch0_path: str = None, ch1_path: str = None):
     """
-    MODE STÉRÉO avec VAD :
-    Asterisk MixMonitor : canal 0 (left) = rx, canal 1 (right) = tx
-    Appel entrant  : left(0) = Caller → Client,  right(1) = Agent
-    Appel sortant  : left(0) = Agent (a composé), right(1) = Client (a décroché)
-    VAD sur chaque canal → timestamps réels → tri chronologique.
+    MODE HYBRIDE STÉRÉO :
+    1. VAD par canal → on sait QUAND chaque speaker parle (timestamps fiables)
+    2. Transcription Voxtral en MONO → dialogue fluide et naturel
+    3. Correction des labels Agent/Client via les timestamps VAD stéréo
+    = dialogue lisible + attribution correcte des speakers.
     Fallback automatique → Voxtral Speaker ID si audio mono.
-    ch0_path/ch1_path : canaux déjà extraits par le handler (évite double extraction).
     """
-    log(f"[STEREO] Starting stereo channel diarization (VAD): direction={call_direction}")
+    log(f"[STEREO] Starting HYBRID stereo diarization: direction={call_direction}")
     ok, err, est_dur = _validate_audio(wav_path)
     if not ok:
         return {"error": err}
@@ -1222,18 +1265,16 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     log(f"[STEREO] Audio: {info.channels}ch {info.samplerate}Hz {est_dur:.1f}s")
 
     # ── Mapping canal → rôle selon la direction de l'appel ──────────────────
-    # Asterisk MixMonitor : ch0=rx (audio reçu), ch1=tx (audio émis)
-    # Entrant : ch0 = appelant extérieur (Client), ch1 = agent local (Agent)
-    # Sortant : ch0 = agent local qui a composé (Agent), ch1 = personne appelée (Client)
     if call_direction == "outbound":
         left_role  = "Agent"
         right_role = "Client"
-    else:  # inbound ou unknown → défaut entrant
+    else:
         left_role  = "Client"
         right_role = "Agent"
 
     log(f"[STEREO] Channel mapping: left(ch0)={left_role}, right(ch1)={right_role}")
 
+    # ── Étape 1 : VAD par canal (on récupère juste les timestamps) ──────────
     own_ch0 = False
     own_ch1 = False
     try:
@@ -1244,12 +1285,9 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
             ch1_path = _extract_mono_channel(wav_path, 1)
             own_ch1 = True
 
-        log(f"[STEREO] Transcribing {left_role} channel (left/ch0) with VAD...")
-        left_segs = _transcribe_channel_with_vad(ch0_path, left_role, language, est_dur)
-        log(f"[STEREO] Transcribing {right_role} channel (right/ch1) with VAD...")
-        right_segs = _transcribe_channel_with_vad(ch1_path, right_role, language, est_dur)
+        ch0_vad = _vad_speech_blocks(ch0_path)
+        ch1_vad = _vad_speech_blocks(ch1_path)
     finally:
-        # Ne cleanup que les canaux qu'on a créés nous-mêmes
         for p, own in [(ch0_path, own_ch0), (ch1_path, own_ch1)]:
             if own and p and p != wav_path and os.path.exists(p):
                 try:
@@ -1257,27 +1295,79 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
                 except Exception:
                     pass
 
-    if not left_segs and not right_segs:
-        log("[STEREO] Both channels empty — falling back to Voxtral Speaker ID")
-        return diarize_with_voxtral_speaker_id(wav_path, language, max_new_tokens, with_summary, call_direction)
+    ch0_speech_s = sum(e - s for s, e in ch0_vad)
+    ch1_speech_s = sum(e - s for s, e in ch1_vad)
+    log(f"[STEREO] VAD: ch0({left_role})={len(ch0_vad)} turns {ch0_speech_s:.1f}s, ch1({right_role})={len(ch1_vad)} turns {ch1_speech_s:.1f}s")
 
-    # Tri chronologique par VAD timestamps réels
-    segments        = _merge_stereo_segments(left_segs, right_segs)
-    full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
-    result          = {"segments": segments, "transcript": full_transcript, "diarization_mode": "stereo_vad"}
+    # Si un seul canal a du contenu → fallback mono
+    if ch0_speech_s < 2.0 and ch1_speech_s < 2.0:
+        log("[STEREO] Both channels empty — falling back to Voxtral Speaker ID (mono)")
+        mono_fb = _to_mono_tmp(wav_path)
+        result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
+        if mono_fb != wav_path and os.path.exists(mono_fb):
+            os.remove(mono_fb)
+        return result
 
-    if with_summary:
-        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=est_dur)
+    if ch0_speech_s < 2.0 or ch1_speech_s < 2.0:
+        active = left_role if ch0_speech_s >= ch1_speech_s else right_role
+        log(f"[STEREO] Only {active} has speech — falling back to Voxtral Speaker ID (mono)")
+        mono_fb = _to_mono_tmp(wav_path)
+        result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
+        if mono_fb != wav_path and os.path.exists(mono_fb):
+            os.remove(mono_fb)
+        return result
 
-    if ENABLE_SENTIMENT:
+    # ── Étape 2 : Transcription Voxtral en MONO (dialogue naturel) ──────────
+    log("[STEREO] Step 2: Mono transcription for natural dialogue flow...")
+    mono_path = _to_mono_tmp(wav_path)
+    try:
+        mono_result = diarize_with_voxtral_speaker_id(
+            mono_path, language, max_new_tokens, with_summary, call_direction
+        )
+    finally:
+        if mono_path != wav_path and os.path.exists(mono_path):
+            os.remove(mono_path)
+
+    if "error" in mono_result or not mono_result.get("segments"):
+        return mono_result
+
+    # ── Étape 3 : Corriger les labels avec les timestamps VAD stéréo ────────
+    segments = mono_result["segments"]
+    corrections = 0
+
+    for seg in segments:
+        start = float(seg.get("start", 0))
+        end   = float(seg.get("end", 0))
+        if end - start < 0.5:
+            continue
+
+        dominant = _get_dominant_speaker_at(ch0_vad, ch1_vad, start, end, left_role, right_role)
+        if dominant and dominant != seg["speaker"]:
+            old = seg["speaker"]
+            seg["speaker"] = dominant
+            corrections += 1
+            log(f"[STEREO] Corrected {start:.1f}-{end:.1f}s: {old} → {dominant}")
+
+    if corrections > 0:
+        # Reconstruire le transcript avec les labels corrigés
+        full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
+        mono_result["transcript"] = full_transcript
+        log(f"[STEREO] Corrected {corrections} speaker labels using stereo VAD")
+    else:
+        log("[STEREO] No corrections needed — Voxtral labels match stereo channels")
+
+    mono_result["diarization_mode"] = "stereo_hybrid"
+    log("[STEREO] Hybrid stereo diarization completed successfully")
+
+    # Re-run sentiment si les labels ont changé
+    if corrections > 0 and ENABLE_SENTIMENT:
         speaker_sentiments = analyze_sentiment_by_speaker(segments)
         if speaker_sentiments:
             mood_overall, mood_by_speaker, client_mood = _attach_sentiment(segments, speaker_sentiments)
-            result["mood_overall"]    = mood_overall
-            result["mood_by_speaker"] = mood_by_speaker
-            result["mood_client"]     = client_mood
+            mono_result["mood_overall"]    = mood_overall
+            mono_result["mood_by_speaker"] = mood_by_speaker
+            mono_result["mood_client"]     = client_mood
 
-    log("[STEREO] Stereo diarization completed successfully")
     return result
 
 # =============================================================================
