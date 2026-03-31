@@ -867,10 +867,12 @@ def transcribe_single_voice_content(wav_path: str, language: Optional[str], max_
 def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
     if not text or len(text) < 20:
         return text
+
+    # Cas 1 : patterns courts répétés consécutivement (chars)
     for pattern_len in range(3, 21):
         if len(text) < pattern_len * max_repetitions:
             continue
-        pattern    = text[-pattern_len:]
+        pattern     = text[-pattern_len:]
         repetitions = 0
         pos         = len(text)
         while pos >= pattern_len:
@@ -882,21 +884,57 @@ def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
             truncate_pos = pos + pattern_len * 2
             log(f"[CLEANUP] Pattern loop '{pattern[:15]}...' ×{repetitions}, truncating")
             return text[:min(truncate_pos, len(text))]
+
     words = text.split()
     if len(words) < 10:
         return text
-    cleaned = []
+
+    # Cas 2 : mots identiques répétés consécutivement
+    cleaned   = []
     rep_count = 1
     last_word = None
     for word in words:
         if word == last_word:
             rep_count += 1
             if rep_count > max_repetitions:
+                log(f"[CLEANUP] Word loop '{word}' ×{rep_count}, truncating")
                 break
         else:
             rep_count = 1; last_word = word
         cleaned.append(word)
-    return " ".join(cleaned)
+    words = cleaned
+
+    # Cas 3 : phrases répétées (patterns de 4-15 mots, y compris alternés)
+    # Ex: "A B C D A B C D A B C D" ou "A B C D E F A B C D E F"
+    for phrase_len in range(4, 16):
+        if len(words) < phrase_len * 3:
+            continue
+        phrase = tuple(words[:phrase_len])
+        count  = 0
+        i      = 0
+        while i + phrase_len <= len(words):
+            if tuple(words[i:i + phrase_len]) == phrase:
+                count += 1
+                i += phrase_len
+            else:
+                i += 1
+        if count >= 3:
+            log(f"[CLEANUP] Phrase loop ({phrase_len} words) ×{count}, keeping 2 occurrences")
+            result = []
+            kept   = 0
+            i      = 0
+            while i < len(words):
+                if i + phrase_len <= len(words) and tuple(words[i:i + phrase_len]) == phrase:
+                    if kept < 2:
+                        result.extend(words[i:i + phrase_len])
+                        kept += 1
+                    i += phrase_len
+                else:
+                    result.append(words[i])
+                    i += 1
+            return " ".join(result)
+
+    return " ".join(words)
 
 def merge_micro_segments(segments: List[Dict[str, Any]], max_duration: float = 2.0, max_gap: float = 1.0) -> List[Dict[str, Any]]:
     if not segments:
@@ -1084,10 +1122,29 @@ def _transcribe_channel(wav_path: str, speaker: str, language: Optional[str], es
     ]}]
     out  = run_voxtral_with_timeout(conv, max_new_tokens=tokens, timeout=timeout)
     text = (out.get("text") or "").strip()
+
+    # ── Protection anti-hallucination ────────────────────────────────────────
+    # Voxtral hallucine quand l'audio est corrompu (mauvais codec, bruit)
+    # Le français parlé = max ~25 chars/sec. Au-delà → hallucination certaine.
+    if text and est_dur > 0:
+        chars_per_sec = len(text) / est_dur
+        if chars_per_sec > 30:
+            log(f"[STEREO] WARNING: {speaker} chars/sec={chars_per_sec:.1f} > 30 → hallucination détectée, canal ignoré")
+            return []
+
     text = remove_repetitive_loops(text, max_repetitions=5)
-    text = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]\s*', '', text, flags=re.IGNORECASE).strip()
-    if not text:
+    text = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold|BIP|Bip|bip|BEEP|Beep)\]\s*', '', text, flags=re.IGNORECASE).strip()
+
+    # Canal silencieux ou bruit uniquement
+    if not text or len(text.split()) < 2:
+        log(f"[STEREO] Channel {speaker} appears silent or noise-only — skipping")
         return []
+
+    # Vérification finale après nettoyage
+    if est_dur > 0 and len(text) / est_dur > 30:
+        log(f"[STEREO] WARNING: {speaker} still suspicious after cleanup — skipping")
+        return []
+
     return [{"speaker": speaker, "start": 0.0, "end": est_dur, "text": text, "mood": None}]
 
 def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool, call_direction: str = "unknown"):
