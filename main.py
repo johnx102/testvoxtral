@@ -897,7 +897,6 @@ def _attach_sentiment(segments, speaker_sentiments):
 def _extract_mono_channel(wav_path: str, channel: int) -> str:
     """Extrait un canal d'un fichier stéréo en mono temporaire."""
     import soundfile as sf
-    import numpy as np
     data, sr = sf.read(wav_path)
     if data.ndim == 1:
         return wav_path
@@ -906,8 +905,100 @@ def _extract_mono_channel(wav_path: str, channel: int) -> str:
     sf.write(out_path, mono, sr)
     return out_path
 
-def _transcribe_channel(wav_path: str, speaker: str, language: Optional[str], est_dur: float) -> List[Dict[str, Any]]:
-    """Transcrit un canal mono et retourne des segments pour ce speaker."""
+def _vad_speech_blocks(wav_path: str, frame_ms: int = 20, min_speech_ms: int = 150,
+                       padding_ms: int = 100) -> List[Tuple[float, float]]:
+    """
+    VAD légère basée sur l'énergie RMS — aucune dépendance supplémentaire.
+    Retourne une liste de (start_sec, end_sec) des blocs de parole.
+    """
+    import soundfile as sf
+    import numpy as np
+
+    data, sr = sf.read(wav_path, dtype="float32")
+    if data.ndim > 1:
+        data = data[:, 0]
+
+    frame_size    = int(sr * frame_ms / 1000)
+    padding_frames = int(padding_ms / frame_ms)
+    min_frames    = int(min_speech_ms / frame_ms)
+
+    if len(data) < frame_size:
+        return [(0.0, len(data) / sr)]
+
+    n_frames = len(data) // frame_size
+    rms = np.array([
+        np.sqrt(np.mean(data[i * frame_size:(i + 1) * frame_size] ** 2))
+        for i in range(n_frames)
+    ], dtype=np.float32)
+
+    # Seuil adaptatif : médiane + 0.6 * std (robuste au bruit de fond)
+    peak = np.max(rms)
+    if peak < 1e-6:
+        return []  # canal silencieux
+    rms_norm      = rms / peak
+    threshold     = float(np.percentile(rms_norm, 25)) + 0.6 * float(np.std(rms_norm))
+    threshold     = min(threshold, 0.15)  # cap pour ne pas être trop restrictif
+    speech_frames = rms_norm > threshold
+
+    # Padding : étendre les blocs de parole de quelques frames
+    padded = speech_frames.copy()
+    for i in range(len(speech_frames)):
+        if speech_frames[i]:
+            lo = max(0, i - padding_frames)
+            hi = min(len(speech_frames), i + padding_frames + 1)
+            padded[lo:hi] = True
+    speech_frames = padded
+
+    # Extraire les blocs
+    blocks    = []
+    in_speech = False
+    start_f   = 0
+    for i, is_sp in enumerate(speech_frames):
+        if is_sp and not in_speech:
+            start_f  = i
+            in_speech = True
+        elif not is_sp and in_speech:
+            if i - start_f >= min_frames:
+                blocks.append((round(start_f * frame_ms / 1000, 3),
+                               round(i * frame_ms / 1000, 3)))
+            in_speech = False
+    if in_speech and n_frames - start_f >= min_frames:
+        blocks.append((round(start_f * frame_ms / 1000, 3),
+                       round(n_frames * frame_ms / 1000, 3)))
+
+    # Fusionner les blocs séparés par moins de 500ms
+    if not blocks:
+        return []
+    merged = [list(blocks[0])]
+    for s, e in blocks[1:]:
+        if s - merged[-1][1] < 0.5:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+
+    log(f"[VAD] {len(merged)} speech blocks detected in {wav_path.split('/')[-1]}")
+    return [(round(s, 3), round(e, 3)) for s, e in merged]
+
+def _transcribe_channel_with_vad(wav_path: str, speaker: str, language: Optional[str],
+                                  est_dur: float) -> List[Dict[str, Any]]:
+    """
+    Transcrit un canal mono avec VAD pour obtenir les vrais timestamps.
+    1. VAD → liste de blocs de parole (start, end)
+    2. Transcription Voxtral du canal complet
+    3. Mapping des phrases sur les blocs VAD par proportion de mots
+    """
+    import soundfile as sf
+
+    # ── VAD ──────────────────────────────────────────────────────────────────
+    vad_blocks = _vad_speech_blocks(wav_path)
+    if not vad_blocks:
+        log(f"[STEREO] Channel {speaker} is silent (VAD found 0 blocks) — skipping")
+        return []
+
+    total_speech_dur = sum(e - s for s, e in vad_blocks)
+    log(f"[STEREO] {speaker} VAD: {len(vad_blocks)} blocks, {total_speech_dur:.1f}s speech / {est_dur:.1f}s total")
+
+    # ── Transcription Voxtral ─────────────────────────────────────────────────
     tokens  = max(256, min(int(est_dur * 10), 12000))
     timeout = min(int(est_dur * 0.7) + 60, 600)
     instruction = (f"lang:{language or 'fr'} "
@@ -920,66 +1011,121 @@ def _transcribe_channel(wav_path: str, speaker: str, language: Optional[str], es
     out  = run_voxtral_with_timeout(conv, max_new_tokens=tokens, timeout=timeout)
     text = (out.get("text") or "").strip()
 
-    # Protection anti-hallucination : >30 chars/sec = audio corrompu
+    # Protection anti-hallucination
     if text and est_dur > 0 and len(text) / est_dur > 30:
         log(f"[STEREO] WARNING: {speaker} {len(text)/est_dur:.1f} chars/sec > 30 → hallucination, canal ignoré")
         return []
 
     text = remove_repetitive_loops(text, max_repetitions=5)
-    text = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold|BIP|Bip|bip|BEEP)\]\s*', '', text, flags=re.IGNORECASE).strip()
+    text = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold|BIP|Bip|bip|BEEP)\]\s*',
+                  '', text, flags=re.IGNORECASE).strip()
 
     if not text or len(text.split()) < 2:
-        log(f"[STEREO] Channel {speaker} appears silent or noise-only — skipping")
+        log(f"[STEREO] Channel {speaker} empty after cleanup — skipping")
         return []
 
-    return [{"speaker": speaker, "start": 0.0, "end": est_dur, "text": text, "mood": None}]
+    # ── Mapping phrases → blocs VAD ──────────────────────────────────────────
+    # Découper le texte en phrases
+    sentences = re.split(r'(?<=[.!?,])\s+', text.strip())
+    sentences = [s.strip() for s in sentences if s.strip() and len(s.split()) >= 1]
+    if not sentences:
+        sentences = [text]
 
-def _interleave_stereo_segments(agent_segs: List[Dict], client_segs: List[Dict], total_dur: float) -> List[Dict]:
-    """Construit une liste interleaved Agent/Client en alternant par phrases."""
-    def split_sentences(text: str) -> List[str]:
-        parts = re.split(r'(?<=[.!?])\s+', text.strip())
-        return [p.strip() for p in parts if p.strip() and len(p.split()) > 1]
+    if len(vad_blocks) == 1 or len(sentences) == 1:
+        # Cas simple : tout mapper sur le premier/unique bloc
+        s_start, s_end = vad_blocks[0][0], vad_blocks[-1][1]
+        segments = []
+        total_words = sum(len(s.split()) for s in sentences)
+        current_t   = s_start
+        span        = s_end - s_start
+        for sentence in sentences:
+            wc      = len(sentence.split())
+            seg_dur = (wc / total_words) * span if total_words > 0 else span / len(sentences)
+            segments.append({
+                "speaker": speaker,
+                "start":   round(current_t, 3),
+                "end":     round(min(current_t + seg_dur, s_end), 3),
+                "text":    sentence,
+                "mood":    None,
+            })
+            current_t += seg_dur
+        return segments
 
-    agent_text       = agent_segs[0]["text"]  if agent_segs  else ""
-    client_text      = client_segs[0]["text"] if client_segs else ""
-    agent_sentences  = split_sentences(agent_text)  or ([agent_text]  if agent_text  else [])
-    client_sentences = split_sentences(client_text) or ([client_text] if client_text else [])
+    # Cas multiple : distribuer les phrases sur les blocs VAD proportionnellement
+    # Chaque bloc VAD reçoit un nombre de phrases proportionnel à sa durée
+    total_vad_dur = sum(e - s for s, e in vad_blocks)
+    n_sentences   = len(sentences)
+    segments      = []
+    sent_idx      = 0
 
-    items: List[Tuple[str, str]] = []
-    ai, ci = 0, 0
-    while ai < len(agent_sentences) or ci < len(client_sentences):
-        if ai < len(agent_sentences):
-            items.append(("Agent", agent_sentences[ai])); ai += 1
-        if ci < len(client_sentences):
-            items.append(("Client", client_sentences[ci])); ci += 1
+    for block_idx, (b_start, b_end) in enumerate(vad_blocks):
+        if sent_idx >= n_sentences:
+            break
+        block_dur    = b_end - b_start
+        # Nombre de phrases pour ce bloc (proportionnel à sa durée)
+        if block_idx == len(vad_blocks) - 1:
+            # Dernier bloc : prend toutes les phrases restantes
+            block_sents  = sentences[sent_idx:]
+            sent_idx     = n_sentences
+        else:
+            n_block = max(1, round((block_dur / total_vad_dur) * n_sentences))
+            n_block = min(n_block, n_sentences - sent_idx)
+            block_sents  = sentences[sent_idx:sent_idx + n_block]
+            sent_idx    += n_block
 
-    if not items:
-        return []
+        if not block_sents:
+            continue
 
-    total_words = sum(len(t.split()) for _, t in items)
-    segments    = []
-    current_t   = 0.0
-    for speaker, text in items:
-        word_count = len(text.split())
-        seg_dur    = (word_count / total_words) * total_dur if total_words > 0 else total_dur / len(items)
-        segments.append({
-            "speaker": speaker,
-            "start":   round(current_t, 3),
-            "end":     round(min(current_t + seg_dur, total_dur), 3),
-            "text":    text,
-            "mood":    None,
-        })
-        current_t += seg_dur
+        total_words = sum(len(s.split()) for s in block_sents)
+        current_t   = b_start
+        for sentence in block_sents:
+            wc      = len(sentence.split())
+            seg_dur = (wc / total_words) * block_dur if total_words > 0 else block_dur / len(block_sents)
+            segments.append({
+                "speaker": speaker,
+                "start":   round(current_t, 3),
+                "end":     round(min(current_t + seg_dur, b_end), 3),
+                "text":    sentence,
+                "mood":    None,
+            })
+            current_t += seg_dur
+
+    log(f"[STEREO] {speaker}: {len(segments)} segments from {len(sentences)} sentences / {len(vad_blocks)} VAD blocks")
     return segments
+
+def _merge_stereo_segments(agent_segs: List[Dict], client_segs: List[Dict]) -> List[Dict]:
+    """
+    Fusionne les segments Agent et Client en les triant par timestamp réel.
+    Fusionne les segments consécutifs du même speaker séparés de moins de 500ms.
+    """
+    all_segs = sorted(agent_segs + client_segs, key=lambda s: s["start"])
+
+    if not all_segs:
+        return []
+
+    # Fusionner les segments consécutifs du même speaker
+    merged = [all_segs[0].copy()]
+    for seg in all_segs[1:]:
+        prev = merged[-1]
+        if (seg["speaker"] == prev["speaker"] and
+                seg["start"] - prev["end"] < 0.8):
+            prev["text"] = prev["text"].rstrip() + " " + seg["text"].lstrip()
+            prev["end"]  = seg["end"]
+        else:
+            merged.append(seg.copy())
+
+    log(f"[STEREO] Merged: {len(all_segs)} → {len(merged)} segments (sorted by timestamp)")
+    return merged
 
 def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool, call_direction: str = "unknown"):
     """
-    MODE STÉRÉO :
+    MODE STÉRÉO avec VAD :
     Canal gauche (0) = rx = CLIENT
     Canal droit  (1) = tx = AGENT
+    VAD sur chaque canal → timestamps réels → tri chronologique.
     Fallback automatique → Voxtral Speaker ID si audio mono.
     """
-    log(f"[STEREO] Starting stereo channel diarization: direction={call_direction}")
+    log(f"[STEREO] Starting stereo channel diarization (VAD): direction={call_direction}")
     ok, err, est_dur = _validate_audio(wav_path)
     if not ok:
         return {"error": err}
@@ -997,10 +1143,10 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     try:
         ch_client_path = _extract_mono_channel(wav_path, 0)  # gauche = Client
         ch_agent_path  = _extract_mono_channel(wav_path, 1)  # droite = Agent
-        log("[STEREO] Transcribing Client channel (left/rx)...")
-        client_segs = _transcribe_channel(ch_client_path, "Client", language, est_dur)
-        log("[STEREO] Transcribing Agent channel (right/tx)...")
-        agent_segs  = _transcribe_channel(ch_agent_path, "Agent", language, est_dur)
+        log("[STEREO] Transcribing Client channel (left/rx) with VAD...")
+        client_segs = _transcribe_channel_with_vad(ch_client_path, "Client", language, est_dur)
+        log("[STEREO] Transcribing Agent channel (right/tx) with VAD...")
+        agent_segs  = _transcribe_channel_with_vad(ch_agent_path, "Agent", language, est_dur)
     finally:
         for p in [ch_client_path, ch_agent_path]:
             if p and p != wav_path and os.path.exists(p):
@@ -1013,9 +1159,10 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         log("[STEREO] Both channels empty — falling back to Voxtral Speaker ID")
         return diarize_with_voxtral_speaker_id(wav_path, language, max_new_tokens, with_summary, call_direction)
 
-    segments        = _interleave_stereo_segments(agent_segs, client_segs, est_dur)
+    # Tri chronologique par VAD timestamps réels
+    segments        = _merge_stereo_segments(agent_segs, client_segs)
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
-    result          = {"segments": segments, "transcript": full_transcript, "diarization_mode": "stereo"}
+    result          = {"segments": segments, "transcript": full_transcript, "diarization_mode": "stereo_vad"}
 
     if with_summary:
         result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=est_dur)
