@@ -145,7 +145,7 @@ def _normalize_audio_keepstereo(path: str) -> str:
             return path
         out_path = path.rsplit(".", 1)[0] + "_16k.wav"
         audio.export(out_path, format="wav")
-        log(f"[AUDIO] Resampled (stereo kept): {audio.channels}ch → {out_path}")
+        log(f"[AUDIO] Resampled: {audio.channels}ch {audio.frame_rate}Hz → 16kHz {out_path}")
         try:
             os.remove(path)
         except Exception:
@@ -1546,6 +1546,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     return {"task": task, **build_hold_music_response(hold_result, with_summary)}
                 if hold_result.get("speech_blocks"):
                     local_path, cleanup = trim_audio_to_speech_blocks(local_path, hold_result, cleanup)
+                    # IMPORTANT : mono_path doit suivre local_path après trim
+                    mono_path = local_path
 
         # ── Détection voix unique (sur mono mix) ─────────────────────────────
         if ENABLE_SINGLE_VOICE_DETECTION:
