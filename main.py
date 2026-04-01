@@ -1217,25 +1217,44 @@ def _merge_stereo_segments(agent_segs: List[Dict], client_segs: List[Dict]) -> L
     log(f"[STEREO] Merged: {len(all_segs)} → {len(final)} segments (sorted by timestamp)")
     return final
 
-def _build_turn_timeline(ch0_vad: List[Tuple[float, float]], ch1_vad: List[Tuple[float, float]],
-                          left_role: str, right_role: str,
-                          max_turn_s: float = 25.0, merge_gap_s: float = 1.5) -> List[Dict[str, Any]]:
-    """
-    Fusionne les blocs VAD des 2 canaux en une timeline de tours de parole.
-    Chaque tour = {speaker, start, end} représentant un segment continu d'un speaker.
-    Les tours adjacents du même speaker séparés par < merge_gap_s sont fusionnés.
-    Les tours > max_turn_s sont découpés.
-    """
-    # Créer des événements bruts avec le speaker
-    raw = []
-    for s, e in ch0_vad:
-        raw.append({"speaker": left_role, "start": s, "end": e})
-    for s, e in ch1_vad:
-        raw.append({"speaker": right_role, "start": s, "end": e})
-    raw.sort(key=lambda t: t["start"])
+def _get_channel_energy(wav_path: str, start: float, end: float, channel: int) -> float:
+    """Mesure l'énergie RMS d'un segment sur un canal spécifique."""
+    try:
+        import soundfile as sf
+        import numpy as np
+        data, sr = sf.read(wav_path, dtype="float32")
+        if data.ndim == 1:
+            return 0.0
+        ch_data = data[:, channel]
+        s_frame = int(start * sr)
+        e_frame = min(int(end * sr), len(ch_data))
+        segment = ch_data[s_frame:e_frame]
+        if len(segment) < 100:
+            return 0.0
+        return float(np.sqrt(np.mean(segment ** 2)))
+    except Exception:
+        return 0.0
 
-    if not raw:
+
+def _build_turn_timeline_from_mono(mono_vad: List[Tuple[float, float]],
+                                    wav_path: str,
+                                    left_role: str, right_role: str,
+                                    max_turn_s: float = 25.0, merge_gap_s: float = 1.5) -> List[Dict[str, Any]]:
+    """
+    Construit la timeline de tours à partir du VAD MONO (capte toute la parole)
+    et attribue le speaker via comparaison d'énergie des canaux stéréo.
+    """
+    if not mono_vad:
         return []
+
+    # Attribuer un speaker à chaque bloc mono via l'énergie par canal
+    raw = []
+    for s, e in mono_vad:
+        ch0_energy = _get_channel_energy(wav_path, s, e, 0)
+        ch1_energy = _get_channel_energy(wav_path, s, e, 1)
+        # Le canal avec le plus d'énergie = le speaker dominant
+        speaker = left_role if ch0_energy >= ch1_energy else right_role
+        raw.append({"speaker": speaker, "start": s, "end": e})
 
     # Passe 1 : fusionner les segments consécutifs du même speaker (gap < merge_gap_s)
     merged = [raw[0].copy()]
@@ -1246,7 +1265,7 @@ def _build_turn_timeline(ch0_vad: List[Tuple[float, float]], ch1_vad: List[Tuple
         else:
             merged.append(seg.copy())
 
-    # Passe 2 : absorber les micro-segments (< 1s) isolés entre 2 segments du même speaker
+    # Passe 2 : absorber les micro-segments (< 1.5s) isolés entre 2 du même speaker
     if len(merged) >= 3:
         cleaned = [merged[0]]
         i = 1
@@ -1255,7 +1274,7 @@ def _build_turn_timeline(ch0_vad: List[Tuple[float, float]], ch1_vad: List[Tuple
             prev = cleaned[-1]
             nxt  = merged[i + 1]
             curr_dur = curr["end"] - curr["start"]
-            if curr_dur < 1.0 and prev["speaker"] == nxt["speaker"] and prev["speaker"] != curr["speaker"]:
+            if curr_dur < 1.5 and prev["speaker"] == nxt["speaker"] and prev["speaker"] != curr["speaker"]:
                 prev["end"] = max(prev["end"], curr["end"])
                 i += 1
                 continue
@@ -1265,7 +1284,7 @@ def _build_turn_timeline(ch0_vad: List[Tuple[float, float]], ch1_vad: List[Tuple
             cleaned.append(merged[i])
         merged = cleaned
 
-    # Passe 3 : re-fusionner après absorption
+    # Passe 3 : re-fusionner
     final = [merged[0]]
     for seg in merged[1:]:
         prev = final[-1]
@@ -1274,7 +1293,7 @@ def _build_turn_timeline(ch0_vad: List[Tuple[float, float]], ch1_vad: List[Tuple
         else:
             final.append(seg)
 
-    # Passe 4 : découper les tours trop longs (> max_turn_s) en sous-segments
+    # Passe 4 : découper les tours > max_turn_s
     split = []
     for turn in final:
         dur = turn["end"] - turn["start"]
@@ -1287,23 +1306,22 @@ def _build_turn_timeline(ch0_vad: List[Tuple[float, float]], ch1_vad: List[Tuple
                 split.append({"speaker": turn["speaker"], "start": round(t, 3), "end": round(chunk_end, 3)})
                 t = chunk_end
 
-    log(f"[TURNS] Built {len(split)} turns from {len(raw)} raw VAD blocks")
+    log(f"[TURNS] Built {len(split)} turns from {len(mono_vad)} mono VAD blocks")
     return split
 
 
-def _extract_turn_audio(wav_path: str, start: float, end: float, channel: int) -> Optional[str]:
-    """Extrait un segment audio d'un canal spécifique d'un fichier stéréo."""
+def _extract_turn_audio_mono(mono_path: str, start: float, end: float) -> Optional[str]:
+    """Extrait un segment audio depuis le fichier MONO (pas depuis un canal isolé)."""
     try:
         import soundfile as sf
-        data, sr = sf.read(wav_path, dtype="float32")
-        if data.ndim == 1:
-            ch_data = data
-        else:
-            ch_data = data[:, channel]
+        data, sr = sf.read(mono_path, dtype="float32")
+        if data.ndim > 1:
+            import numpy as np
+            data = np.mean(data, axis=1)
         start_frame = int(start * sr)
-        end_frame   = min(int(end * sr), len(ch_data))
-        segment     = ch_data[start_frame:end_frame]
-        if len(segment) < sr * 0.3:  # < 300ms → skip
+        end_frame   = min(int(end * sr), len(data))
+        segment     = data[start_frame:end_frame]
+        if len(segment) < sr * 0.3:
             return None
         out_path = os.path.join(tempfile.gettempdir(), f"turn_{uuid.uuid4().hex}.wav")
         sf.write(out_path, segment, sr)
@@ -1319,7 +1337,7 @@ def _transcribe_turn(turn_audio_path: str, language: Optional[str], duration: fl
     timeout = min(int(duration * 0.8) + 30, 120)
     instruction = (f"lang:{language or 'fr'} "
                    "[TRANSCRIBE] Transcris exactement ce qui est dit, mot pour mot. "
-                   "Une seule personne parle. Conserve les hésitations. "
+                   "Conserve les hésitations (euh, bah, alors). "
                    "N'invente rien. N'écris JAMAIS [Musique] [Silence] [Attente].")
     conv = [{"role": "user", "content": [
         {"type": "audio", "path": turn_audio_path},
@@ -1393,15 +1411,16 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
                                   with_summary: bool, call_direction: str = "unknown",
                                   ch0_path: str = None, ch1_path: str = None):
     """
-    MODE STÉRÉO PAR TOURS :
-    1. VAD par canal → timeline de tours de parole (qui parle quand)
-    2. Extraction audio de chaque tour depuis le bon canal
-    3. Transcription Voxtral par tour (segments courts = stable, pas de boucles)
-    4. Assemblage chronologique → dialogue lisible
-    5. 1 seul appel summary+sentiment combiné
+    MODE STÉRÉO OPTIMAL :
+    1. VAD sur MONO → capte TOUTE la parole (y compris voix douce)
+    2. Comparaison énergie ch0 vs ch1 par segment → attribution speaker fiable
+    3. Extraction de chaque tour depuis le MONO (rien n'est perdu)
+    4. Transcription Voxtral par tour court (stable, pas de boucles)
+    5. Assemblage chronologique → dialogue complet et lisible
+    6. 1 seul appel summary+sentiment combiné
     Fallback → Voxtral Speaker ID si mono ou canaux vides.
     """
-    log(f"[STEREO] Starting PER-TURN stereo diarization: direction={call_direction}")
+    log(f"[STEREO] Starting OPTIMAL stereo diarization: direction={call_direction}")
     ok, err, est_dur = _validate_audio(wav_path)
     if not ok:
         return {"error": err}
@@ -1409,7 +1428,7 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     import soundfile as sf
     info = sf.info(wav_path)
     if info.channels < 2:
-        log(f"[STEREO] Audio is mono ({info.channels}ch) — falling back to Voxtral Speaker ID")
+        log(f"[STEREO] Audio is mono ({info.channels}ch) → fallback Voxtral Speaker ID")
         return diarize_with_voxtral_speaker_id(wav_path, language, max_new_tokens, with_summary, call_direction)
 
     log(f"[STEREO] Audio: {info.channels}ch {info.samplerate}Hz {est_dur:.1f}s")
@@ -1419,101 +1438,77 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         left_role, right_role = "Agent", "Client"
     else:
         left_role, right_role = "Client", "Agent"
+    log(f"[STEREO] Channel mapping: ch0={left_role}, ch1={right_role}")
 
-    log(f"[STEREO] Channel mapping: left(ch0)={left_role}, right(ch1)={right_role}")
+    # ── Étape 1 : Créer un fichier mono temporaire ──────────────────────────
+    mono_path = _to_mono_tmp(wav_path)
+    mono_cleanup = mono_path != wav_path
 
-    # ── Étape 1 : VAD par canal ─────────────────────────────────────────────
-    own_ch0 = False
-    own_ch1 = False
-    ch0_vad, ch1_vad = [], []
     try:
-        if not ch0_path:
-            ch0_path = _extract_mono_channel(wav_path, 0)
-            own_ch0 = True
-        if not ch1_path:
-            ch1_path = _extract_mono_channel(wav_path, 1)
-            own_ch1 = True
-        ch0_vad = _vad_speech_blocks(ch0_path)
-        ch1_vad = _vad_speech_blocks(ch1_path)
+        # ── Étape 2 : VAD sur le MONO (capte TOUTE la parole) ───────────────
+        mono_vad = _vad_speech_blocks(mono_path)
+        total_speech = sum(e - s for s, e in mono_vad)
+        log(f"[STEREO] Mono VAD: {len(mono_vad)} blocks, {total_speech:.1f}s speech / {est_dur:.1f}s total")
+
+        if total_speech < 2.0:
+            log("[STEREO] No speech detected → fallback Voxtral Speaker ID")
+            result = diarize_with_voxtral_speaker_id(mono_path, language, max_new_tokens, with_summary, call_direction)
+            return result
+
+        # ── Étape 3 : Construire la timeline (attribuer speaker via énergie canaux) ─
+        turns = _build_turn_timeline_from_mono(mono_vad, wav_path, left_role, right_role)
+        if not turns:
+            log("[STEREO] No turns → fallback Voxtral Speaker ID")
+            result = diarize_with_voxtral_speaker_id(mono_path, language, max_new_tokens, with_summary, call_direction)
+            return result
+
+        # Vérifier que les 2 speakers sont présents
+        speakers_found = set(t["speaker"] for t in turns)
+        if len(speakers_found) < 2:
+            log(f"[STEREO] Only {speakers_found} detected → fallback Voxtral Speaker ID")
+            result = diarize_with_voxtral_speaker_id(mono_path, language, max_new_tokens, with_summary, call_direction)
+            return result
+
+        log(f"[STEREO] Timeline: {len(turns)} turns ({', '.join(f'{s}={sum(1 for t in turns if t[\"speaker\"]==s)}' for s in speakers_found)})")
+
+        # ── Étape 4 : Transcrire chaque tour depuis le MONO ─────────────────
+        segments = []
+        for i, turn in enumerate(turns):
+            speaker  = turn["speaker"]
+            turn_dur = turn["end"] - turn["start"]
+
+            turn_audio = _extract_turn_audio_mono(mono_path, turn["start"], turn["end"])
+            if not turn_audio:
+                continue
+
+            try:
+                text = _transcribe_turn(turn_audio, language, turn_dur)
+            finally:
+                if os.path.exists(turn_audio):
+                    os.remove(turn_audio)
+
+            if text and len(text.split()) >= 2:
+                segments.append({
+                    "speaker": speaker,
+                    "start": round(turn["start"], 2),
+                    "end": round(turn["end"], 2),
+                    "text": text,
+                    "mood": None,
+                })
+                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): {len(text)} chars")
+            else:
+                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty, skipped")
+
+        if not segments:
+            log("[STEREO] All turns empty → fallback Voxtral Speaker ID")
+            result = diarize_with_voxtral_speaker_id(mono_path, language, max_new_tokens, with_summary, call_direction)
+            return result
+
     finally:
-        for p, own in [(ch0_path, own_ch0), (ch1_path, own_ch1)]:
-            if own and p and p != wav_path and os.path.exists(p):
-                try: os.remove(p)
-                except Exception: pass
+        if mono_cleanup and os.path.exists(mono_path):
+            os.remove(mono_path)
 
-    ch0_speech = sum(e - s for s, e in ch0_vad)
-    ch1_speech = sum(e - s for s, e in ch1_vad)
-    log(f"[STEREO] VAD: ch0({left_role})={len(ch0_vad)} turns {ch0_speech:.1f}s, "
-        f"ch1({right_role})={len(ch1_vad)} turns {ch1_speech:.1f}s")
-
-    # ── Fallback mono si un seul canal actif ────────────────────────────────
-    if ch0_speech < 2.0 and ch1_speech < 2.0:
-        log("[STEREO] Both channels empty → fallback mono")
-        mono_fb = _to_mono_tmp(wav_path)
-        result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
-        if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
-        return result
-
-    if ch0_speech < 2.0 or ch1_speech < 2.0:
-        log(f"[STEREO] Only one channel active → fallback mono")
-        mono_fb = _to_mono_tmp(wav_path)
-        result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
-        if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
-        return result
-
-    # ── Étape 2 : Construire la timeline de tours ───────────────────────────
-    turns = _build_turn_timeline(ch0_vad, ch1_vad, left_role, right_role)
-    if not turns:
-        log("[STEREO] No turns built → fallback mono")
-        mono_fb = _to_mono_tmp(wav_path)
-        result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
-        if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
-        return result
-
-    log(f"[STEREO] Timeline: {len(turns)} turns to transcribe")
-
-    # ── Étape 3 : Transcrire chaque tour depuis le bon canal ────────────────
-    segments = []
-    channel_map = {left_role: 0, right_role: 1}
-
-    for i, turn in enumerate(turns):
-        speaker = turn["speaker"]
-        channel = channel_map.get(speaker, 0)
-        turn_dur = turn["end"] - turn["start"]
-
-        # Extraire l'audio du tour depuis le bon canal
-        turn_audio = _extract_turn_audio(wav_path, turn["start"], turn["end"], channel)
-        if not turn_audio:
-            log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): skip (too short)")
-            continue
-
-        try:
-            text = _transcribe_turn(turn_audio, language, turn_dur)
-        finally:
-            if os.path.exists(turn_audio):
-                os.remove(turn_audio)
-
-        if text and len(text.split()) >= 2:
-            segments.append({
-                "speaker": speaker,
-                "start": round(turn["start"], 2),
-                "end": round(turn["end"], 2),
-                "text": text,
-                "mood": None,
-            })
-            log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): "
-                f"{len(text)} chars")
-        else:
-            log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty after cleanup, skipped")
-
-    if not segments:
-        log("[STEREO] All turns empty → fallback mono")
-        mono_fb = _to_mono_tmp(wav_path)
-        result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
-        if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
-        return result
-
-    # ── Étape 4 : Fusionner les segments consécutifs du même speaker ────────
+    # ── Étape 5 : Fusionner segments consécutifs même speaker ───────────────
     merged = [segments[0]]
     for seg in segments[1:]:
         prev = merged[-1]
@@ -1523,7 +1518,7 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         else:
             merged.append(seg)
 
-    log(f"[STEREO] Final: {len(merged)} segments (from {len(segments)} turns)")
+    log(f"[STEREO] Final: {len(merged)} segments (from {len(turns)} turns)")
 
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in merged if s.get("text"))
     result = {
@@ -1533,7 +1528,7 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         "audio_duration": est_dur,
     }
 
-    # ── Étape 5 : Summary + Sentiment combinés (1 seul appel Voxtral) ──────
+    # ── Étape 6 : Summary + Sentiment combinés (1 appel) ───────────────────
     if with_summary or ENABLE_SENTIMENT:
         log("[STEREO] Generating summary + sentiment (single call)...")
         ss = _generate_summary_and_sentiment(full_transcript, language, est_dur)
@@ -1542,7 +1537,6 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
             result["summary"] = ss["summary"]
 
         if ENABLE_SENTIMENT:
-            mood_label = ss["mood_label"]
             mood_map = {
                 "bon": {"label_en": "positive", "label_fr": "bon", "confidence": ss["mood_confidence"],
                         "scores": {"negative": 0.05, "neutral": 0.15, "positive": 0.80}},
@@ -1551,12 +1545,12 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
                 "neutre": {"label_en": "neutral", "label_fr": "neutre", "confidence": ss["mood_confidence"],
                            "scores": {"negative": 0.10, "neutral": 0.80, "positive": 0.10}},
             }
-            mood = mood_map.get(mood_label, mood_map["neutre"])
+            mood = mood_map.get(ss["mood_label"], mood_map["neutre"])
             result["mood_overall"]    = mood
             result["mood_client"]     = mood
             result["mood_by_speaker"] = {"Agent": mood_map["neutre"], "Client": mood}
 
-    log("[STEREO] Per-turn stereo diarization completed successfully")
+    log("[STEREO] Optimal stereo diarization completed successfully")
     return result
 
 # =============================================================================
