@@ -858,6 +858,77 @@ def transcribe_single_voice_content(wav_path: str, language: Optional[str], max_
 # =============================================================================
 # UTILITAIRES COMMUNS
 # =============================================================================
+def find_conversation_start(ch0_vad: List[Tuple[float, float]],
+                             ch1_vad: List[Tuple[float, float]],
+                             proximity_s: float = 5.0) -> float:
+    """
+    Trouve le début de la vraie conversation = premier moment où LES DEUX canaux
+    ont de la parole (simultanément ou à moins de proximity_s l'un de l'autre).
+    Tout ce qui est avant = IVR / musique d'attente / annonce.
+    Retourne le timestamp de début de conversation (0.0 si pas de phase IVR détectée).
+    """
+    if not ch0_vad or not ch1_vad:
+        return 0.0
+
+    for b0 in ch0_vad:
+        for b1 in ch1_vad:
+            # Chevauchement direct
+            if min(b0[1], b1[1]) > max(b0[0], b1[0]):
+                start = min(b0[0], b1[0])
+                if start > 3.0:  # au moins 3s d'IVR pour que ça vaille le coup de couper
+                    log(f"[IVR_DETECT] Conversation starts at {start:.1f}s (overlap detected)")
+                    return start
+                return 0.0
+            # Proches (un finit, l'autre commence dans les proximity_s secondes)
+            gap = max(b1[0] - b0[1], b0[0] - b1[1])
+            if 0 < gap < proximity_s:
+                start = min(b0[0], b1[0])
+                if start > 3.0:
+                    log(f"[IVR_DETECT] Conversation starts at {start:.1f}s (gap={gap:.1f}s)")
+                    return start
+                return 0.0
+    return 0.0
+
+def remove_duplicate_segments(segments: List[Dict[str, Any]], similarity_threshold: float = 0.7) -> List[Dict[str, Any]]:
+    """
+    Supprime les segments dont le texte est quasi-identique à un segment précédent.
+    Détecte les annonces d'attente / IVR qui se répètent en boucle.
+    """
+    if len(segments) <= 1:
+        return segments
+
+    def text_similarity(a: str, b: str) -> float:
+        """Similarité basique par mots communs."""
+        if not a or not b:
+            return 0.0
+        words_a = set(a.lower().split())
+        words_b = set(b.lower().split())
+        if not words_a or not words_b:
+            return 0.0
+        intersection = words_a & words_b
+        return len(intersection) / max(len(words_a), len(words_b))
+
+    seen_texts = []
+    cleaned = []
+    for seg in segments:
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        # Vérifier si ce texte est trop similaire à un texte déjà vu
+        is_duplicate = False
+        for seen in seen_texts:
+            if text_similarity(text, seen) >= similarity_threshold:
+                log(f"[DEDUP] Removed duplicate segment: '{text[:60]}...'")
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            cleaned.append(seg)
+            seen_texts.append(text)
+
+    if len(cleaned) < len(segments):
+        log(f"[DEDUP] Removed {len(segments) - len(cleaned)} duplicate segments")
+    return cleaned
+
 def remove_repetitive_loops(text: str, max_repetitions: int = 5) -> str:
     if not text or len(text) < 20:
         return text
@@ -1383,9 +1454,13 @@ def _generate_summary_and_sentiment(transcript: str, language: Optional[str],
         out = run_voxtral_with_timeout(conv, max_new_tokens=total_tokens, timeout=30)
         response = (out.get("text") or "").strip()
 
-        # Parser la réponse
+        # Parser la réponse — nettoyer les labels que Voxtral peut inclure
         parts = response.split("---")
-        summary = clean_generated_summary(parts[0].strip()) if parts else ""
+        raw_summary = parts[0].strip() if parts else ""
+        # Supprimer les labels "Partie 1", "RÉSUMÉ", "**...**" etc.
+        raw_summary = re.sub(r'\*{1,2}(?:Partie\s*\d+\s*[-–—:]*\s*)?R[ée]sum[ée]\s*[-–—:]*\s*\*{0,2}\s*:?\s*', '', raw_summary, flags=re.IGNORECASE).strip()
+        raw_summary = re.sub(r'^(?:Partie\s*\d+\s*[-–—:]*\s*)?R[ée]sum[ée]\s*[-–—:]*\s*', '', raw_summary, flags=re.IGNORECASE).strip()
+        summary = clean_generated_summary(raw_summary)
         mood_label = "neutre"
         if len(parts) >= 2:
             mood_raw = parts[1].strip().lower()
@@ -1440,13 +1515,41 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         left_role, right_role = "Client", "Agent"
     log(f"[STEREO] Channel mapping: ch0={left_role}, ch1={right_role}")
 
-    # ── Étape 1 : Créer un fichier mono temporaire ──────────────────────────
+    # ── Étape 1 : VAD par canal pour détecter l'IVR/attente ────────────────
+    own_ch0, own_ch1 = False, False
+    try:
+        if not ch0_path:
+            ch0_path = _extract_mono_channel(wav_path, 0); own_ch0 = True
+        if not ch1_path:
+            ch1_path = _extract_mono_channel(wav_path, 1); own_ch1 = True
+        ch0_vad = _vad_speech_blocks(ch0_path)
+        ch1_vad = _vad_speech_blocks(ch1_path)
+    finally:
+        for p, own in [(ch0_path, own_ch0), (ch1_path, own_ch1)]:
+            if own and p and p != wav_path and os.path.exists(p):
+                try: os.remove(p)
+                except Exception: pass
+
+    # Détecter le début de la vraie conversation (après IVR/musique d'attente)
+    conv_start = find_conversation_start(ch0_vad, ch1_vad)
+
+    # ── Étape 2 : Créer un fichier mono temporaire ──────────────────────────
     mono_path = _to_mono_tmp(wav_path)
     mono_cleanup = mono_path != wav_path
 
     try:
-        # ── Étape 2 : VAD sur le MONO (capte TOUTE la parole) ───────────────
+        # ── Étape 3 : VAD sur le MONO (capte TOUTE la parole) ───────────────
         mono_vad = _vad_speech_blocks(mono_path)
+
+        # Filtrer les blocs VAD qui sont AVANT le début de conversation (IVR/attente)
+        if conv_start > 0:
+            original_count = len(mono_vad)
+            mono_vad = [(s, e) for s, e in mono_vad if e > conv_start]
+            # Ajuster le premier bloc si partiellement dans l'IVR
+            if mono_vad and mono_vad[0][0] < conv_start:
+                mono_vad[0] = (conv_start, mono_vad[0][1])
+            log(f"[IVR_DETECT] Trimmed {original_count - len(mono_vad)} VAD blocks before conversation start ({conv_start:.1f}s)")
+
         total_speech = sum(e - s for s, e in mono_vad)
         log(f"[STEREO] Mono VAD: {len(mono_vad)} blocks, {total_speech:.1f}s speech / {est_dur:.1f}s total")
 
@@ -1469,7 +1572,8 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
             result = diarize_with_voxtral_speaker_id(mono_path, language, max_new_tokens, with_summary, call_direction)
             return result
 
-        log(f"[STEREO] Timeline: {len(turns)} turns ({', '.join(f'{s}={sum(1 for t in turns if t[\"speaker\"]==s)}' for s in speakers_found)})")
+        turn_counts = {s: sum(1 for t in turns if t["speaker"] == s) for s in speakers_found}
+        log(f"[STEREO] Timeline: {len(turns)} turns ({turn_counts})")
 
         # ── Étape 4 : Transcrire chaque tour depuis le MONO ─────────────────
         segments = []
@@ -1508,7 +1612,12 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         if mono_cleanup and os.path.exists(mono_path):
             os.remove(mono_path)
 
-    # ── Étape 5 : Fusionner segments consécutifs même speaker ───────────────
+    # ── Étape 5 : Supprimer les segments dupliqués (annonces en boucle) ────
+    segments = remove_duplicate_segments(segments)
+    if not segments:
+        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée.", "diarization_mode": "stereo_per_turn"}
+
+    # ── Étape 6 : Fusionner segments consécutifs même speaker ───────────────
     merged = [segments[0]]
     for seg in segments[1:]:
         prev = merged[-1]
@@ -1747,6 +1856,11 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     segments = _enforce_max_two_speakers(segments)
     _map_roles(segments)
     segments = detect_and_fix_speaker_inversion(segments)
+    # Supprimer les annonces IVR et doublons (mono aussi)
+    segments = remove_ivr_segments(segments)
+    segments = remove_duplicate_segments(segments)
+    if not segments:
+        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée.", "diarization_mode": "voxtral_speaker_id"}
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
     result          = {"segments": segments, "transcript": full_transcript, "diarization_mode": "voxtral_speaker_id"}
     if with_summary:
