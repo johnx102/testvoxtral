@@ -1589,6 +1589,10 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     # Le prompt dit à Voxtral de transcrire uniquement la voix principale
     channel_map = {left_role: 0, right_role: 1}
 
+    # Créer mono temporaire pour les tours courts (réponses brèves mieux captées sur mono)
+    mono_path = _to_mono_tmp(wav_path)
+    mono_cleanup = mono_path != wav_path
+
     try:
         segments = []
         for i, turn in enumerate(turns):
@@ -1596,17 +1600,25 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
             channel  = channel_map.get(speaker, 0)
             turn_dur = turn["end"] - turn["start"]
 
-            turn_audio = _extract_turn_audio_channel(wav_path, turn["start"], turn["end"], channel)
+            # Tours courts (< 3s) : extraire depuis MONO (réponses "oui", "d'accord" mieux captées)
+            # Tours longs : extraire depuis le CANAL du speaker (voix principale plus forte)
+            if turn_dur < 3.0:
+                turn_audio = _extract_turn_audio_mono(mono_path, turn["start"], turn["end"])
+                from_ch = False
+            else:
+                turn_audio = _extract_turn_audio_channel(wav_path, turn["start"], turn["end"], channel)
+                from_ch = True
+
             if not turn_audio:
                 continue
 
             try:
-                text = _transcribe_turn(turn_audio, language, turn_dur, from_channel=True)
+                text = _transcribe_turn(turn_audio, language, turn_dur, from_channel=from_ch)
             finally:
                 if os.path.exists(turn_audio):
                     os.remove(turn_audio)
 
-            if text and len(text.split()) >= 2:
+            if text and len(text.split()) >= 1:
                 segments.append({
                     "speaker": speaker,
                     "start": round(turn["start"], 2),
@@ -1614,7 +1626,7 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
                     "text": text,
                     "mood": None,
                 })
-                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): {len(text)} chars")
+                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): {len(text)} chars {'(mono)' if not from_ch else ''}")
             else:
                 log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty, skipped")
 
@@ -1626,7 +1638,8 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
             return result
 
     finally:
-        pass  # Pas de mono à nettoyer — transcription directe depuis le stéréo
+        if mono_cleanup and os.path.exists(mono_path):
+            os.remove(mono_path)
 
     # ── Étape 5 : Supprimer les segments dupliqués (annonces en boucle) ────
     segments = remove_duplicate_segments(segments)
@@ -2031,7 +2044,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 ch1_vad_quick = _vad_speech_blocks(ch1_path) if ch1_path else []
                 ch0_speech_quick = sum(e - s for s, e in ch0_vad_quick)
                 ch1_speech_quick = sum(e - s for s, e in ch1_vad_quick)
-                is_single_voice = (ch0_speech_quick < 2.0 or ch1_speech_quick < 2.0)
+                is_single_voice = (ch0_speech_quick < 5.0 or ch1_speech_quick < 5.0)
 
                 if is_single_voice:
                     active_speech = max(ch0_speech_quick, ch1_speech_quick)
