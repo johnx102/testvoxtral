@@ -1299,25 +1299,25 @@ def _vad_overlap(blocks: List[Tuple[float, float]], start: float, end: float) ->
     return total
 
 
-def _build_turn_timeline_from_mono(mono_vad: List[Tuple[float, float]],
-                                    ch0_vad: List[Tuple[float, float]],
-                                    ch1_vad: List[Tuple[float, float]],
-                                    left_role: str, right_role: str,
-                                    max_turn_s: float = 25.0, merge_gap_s: float = 1.5) -> List[Dict[str, Any]]:
+def _build_turn_timeline_from_channels(ch0_vad: List[Tuple[float, float]],
+                                        ch1_vad: List[Tuple[float, float]],
+                                        left_role: str, right_role: str,
+                                        max_turn_s: float = 25.0, merge_gap_s: float = 1.5) -> List[Dict[str, Any]]:
     """
-    Construit la timeline de tours à partir du VAD MONO (capte toute la parole)
-    et attribue le speaker via les VAD par canal (plus fiable que l'énergie brute).
+    Construit la timeline de tours directement depuis les VAD par canal.
+    Chaque bloc VAD = un événement de parole avec le bon speaker.
+    Fusionne, absorbe les micro-segments, et découpe les tours longs.
     """
-    if not mono_vad:
-        return []
-
-    # Attribuer un speaker à chaque bloc mono via le chevauchement avec les VAD par canal
+    # Créer les événements bruts depuis les VAD par canal
     raw = []
-    for s, e in mono_vad:
-        ch0_overlap = _vad_overlap(ch0_vad, s, e)
-        ch1_overlap = _vad_overlap(ch1_vad, s, e)
-        speaker = left_role if ch0_overlap >= ch1_overlap else right_role
-        raw.append({"speaker": speaker, "start": s, "end": e})
+    for s, e in ch0_vad:
+        raw.append({"speaker": left_role, "start": s, "end": e})
+    for s, e in ch1_vad:
+        raw.append({"speaker": right_role, "start": s, "end": e})
+    raw.sort(key=lambda t: t["start"])
+
+    if not raw:
+        return []
 
     # Passe 1 : fusionner les segments consécutifs du même speaker (gap < merge_gap_s)
     merged = [raw[0].copy()]
@@ -1525,47 +1525,40 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     # Détecter le début de la vraie conversation (après IVR/musique d'attente)
     conv_start = find_conversation_start(ch0_vad, ch1_vad)
 
-    # ── Étape 2 : Créer un fichier mono temporaire ──────────────────────────
+    # Filtrer les blocs VAD avant le début de conversation (IVR/attente)
+    if conv_start > 0:
+        ch0_vad_filtered = [(s, e) for s, e in ch0_vad if e > conv_start]
+        ch1_vad_filtered = [(s, e) for s, e in ch1_vad if e > conv_start]
+        log(f"[IVR_DETECT] Conversation starts at {conv_start:.1f}s — trimmed IVR portion")
+    else:
+        ch0_vad_filtered = ch0_vad
+        ch1_vad_filtered = ch1_vad
+
+    # ── Étape 2 : Construire la timeline depuis les VAD par canal ───────────
+    turns = _build_turn_timeline_from_channels(ch0_vad_filtered, ch1_vad_filtered, left_role, right_role)
+    if not turns:
+        log("[STEREO] No turns → fallback Voxtral Speaker ID")
+        mono_fb = _to_mono_tmp(wav_path)
+        result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
+        if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
+        return result
+
+    speakers_found = set(t["speaker"] for t in turns)
+    if len(speakers_found) < 2:
+        log(f"[STEREO] Only {speakers_found} detected → fallback Voxtral Speaker ID")
+        mono_fb = _to_mono_tmp(wav_path)
+        result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
+        if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
+        return result
+
+    turn_counts = {s: sum(1 for t in turns if t["speaker"] == s) for s in speakers_found}
+    log(f"[STEREO] Timeline: {len(turns)} turns ({turn_counts})")
+
+    # ── Étape 3 : Créer mono pour la transcription ──────────────────────────
     mono_path = _to_mono_tmp(wav_path)
     mono_cleanup = mono_path != wav_path
 
     try:
-        # ── Étape 3 : VAD sur le MONO (capte TOUTE la parole) ───────────────
-        mono_vad = _vad_speech_blocks(mono_path)
-
-        # Filtrer les blocs VAD qui sont AVANT le début de conversation (IVR/attente)
-        if conv_start > 0:
-            original_count = len(mono_vad)
-            mono_vad = [(s, e) for s, e in mono_vad if e > conv_start]
-            # Ajuster le premier bloc si partiellement dans l'IVR
-            if mono_vad and mono_vad[0][0] < conv_start:
-                mono_vad[0] = (conv_start, mono_vad[0][1])
-            log(f"[IVR_DETECT] Trimmed {original_count - len(mono_vad)} VAD blocks before conversation start ({conv_start:.1f}s)")
-
-        total_speech = sum(e - s for s, e in mono_vad)
-        log(f"[STEREO] Mono VAD: {len(mono_vad)} blocks, {total_speech:.1f}s speech / {est_dur:.1f}s total")
-
-        if total_speech < 2.0:
-            log("[STEREO] No speech detected → fallback Voxtral Speaker ID")
-            result = diarize_with_voxtral_speaker_id(mono_path, language, max_new_tokens, with_summary, call_direction)
-            return result
-
-        # ── Étape 3 : Construire la timeline (attribuer speaker via énergie canaux) ─
-        turns = _build_turn_timeline_from_mono(mono_vad, ch0_vad, ch1_vad, left_role, right_role)
-        if not turns:
-            log("[STEREO] No turns → fallback Voxtral Speaker ID")
-            result = diarize_with_voxtral_speaker_id(mono_path, language, max_new_tokens, with_summary, call_direction)
-            return result
-
-        # Vérifier que les 2 speakers sont présents
-        speakers_found = set(t["speaker"] for t in turns)
-        if len(speakers_found) < 2:
-            log(f"[STEREO] Only {speakers_found} detected → fallback Voxtral Speaker ID")
-            result = diarize_with_voxtral_speaker_id(mono_path, language, max_new_tokens, with_summary, call_direction)
-            return result
-
-        turn_counts = {s: sum(1 for t in turns if t["speaker"] == s) for s in speakers_found}
-        log(f"[STEREO] Timeline: {len(turns)} turns ({turn_counts})")
 
         # ── Étape 4 : Transcrire chaque tour depuis le MONO ─────────────────
         segments = []
