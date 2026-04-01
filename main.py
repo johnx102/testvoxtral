@@ -1811,36 +1811,98 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     log(f"[STEREO] Timeline: {len(turns)} turns ({turn_counts})")
 
     # ── Étape 3 : Transcrire chaque tour depuis SON CANAL ─────────────────
-    # TOUJOURS le canal du speaker (même tours courts) — c'est l'avantage du stéréo
+    # Avec filtre crosstalk + batching tours courts consécutifs même speaker
+    import soundfile as sf
+    import numpy as np
+    stereo_data, stereo_sr = sf.read(wav_path, dtype="float32")
+    ch0_data = stereo_data[:, 0] if stereo_data.ndim > 1 else stereo_data
+    ch1_data = stereo_data[:, 1] if stereo_data.ndim > 1 else stereo_data
+
     channel_map = {left_role: 0, right_role: 1}
+    crosstalk_threshold = 1.3  # ratio min speaker_ch/other_ch pour transcrire
     segments = []
+    skipped_crosstalk = 0
 
-    for i, turn in enumerate(turns):
-        speaker  = turn["speaker"]
-        channel  = channel_map.get(speaker, 0)
-        turn_dur = turn["end"] - turn["start"]
+    # Réponses courtes légitimes (pas des hallucinations)
+    LEGIT_SHORT = {"oui", "non", "ok", "d'accord", "merci", "bonjour", "au revoir", "allô",
+                   "pardon", "voilà", "exactement", "parfait", "entendu", "bien sûr",
+                   "c'est ça", "bonne journée", "bonne soirée", "je vous en prie",
+                   "pas de souci", "ah", "euh", "bah", "hein", "ouais", "mm-hmm"}
 
-        turn_audio = _extract_turn_audio_channel(wav_path, turn["start"], turn["end"], channel)
+    # Grouper les tours pour batching : tours consécutifs du même speaker < 2s → un seul appel
+    i = 0
+    while i < len(turns):
+        turn = turns[i]
+        speaker = turn["speaker"]
+        channel = channel_map.get(speaker, 0)
+        other_ch = 1 - channel
+
+        # --- Filtre crosstalk : vérifier que le canal du speaker domine ---
+        s_f = int(turn["start"] * stereo_sr)
+        e_f = min(int(turn["end"] * stereo_sr), len(ch0_data))
+        if e_f > s_f:
+            rms_speaker = float(np.sqrt(np.mean((ch0_data if channel == 0 else ch1_data)[s_f:e_f] ** 2)))
+            rms_other   = float(np.sqrt(np.mean((ch1_data if channel == 0 else ch0_data)[s_f:e_f] ** 2)))
+            if rms_other > 0 and rms_speaker / rms_other < crosstalk_threshold:
+                skipped_crosstalk += 1
+                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): crosstalk (ratio={rms_speaker/rms_other:.2f}), skipped")
+                i += 1
+                continue
+
+        # --- Batching : regrouper tours courts consécutifs du même speaker ---
+        batch_end = i
+        batch_dur = turn["end"] - turn["start"]
+        while (batch_end + 1 < len(turns)
+               and turns[batch_end + 1]["speaker"] == speaker
+               and turns[batch_end + 1]["end"] - turn["start"] < 8.0  # max 8s de batch
+               and turns[batch_end + 1]["end"] - turns[batch_end + 1]["start"] < 2.0):
+            batch_end += 1
+            batch_dur = turns[batch_end]["end"] - turn["start"]
+
+        batch_start_t = turn["start"]
+        batch_end_t = turns[batch_end]["end"]
+        batch_count = batch_end - i + 1
+
+        turn_audio = _extract_turn_audio_channel(wav_path, batch_start_t, batch_end_t, channel)
         if not turn_audio:
+            i = batch_end + 1
             continue
 
         try:
-            text = _transcribe_turn(turn_audio, language, turn_dur, from_channel=True)
+            text = _transcribe_turn(turn_audio, language, batch_end_t - batch_start_t, from_channel=True)
         finally:
             if os.path.exists(turn_audio):
                 os.remove(turn_audio)
 
         if text and len(text.split()) >= 1:
-            segments.append({
-                "speaker": speaker,
-                "start": round(turn["start"], 2),
-                "end": round(turn["end"], 2),
-                "text": text,
-                "mood": None,
-            })
-            log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): {len(text)} chars")
+            # --- Filtre hallucinations courtes ---
+            turn_dur = batch_end_t - batch_start_t
+            words = text.split()
+            is_hallucination = False
+            if turn_dur < 1.5 and len(words) <= 3:
+                # Vérifier si c'est une réponse courte légitime
+                text_lower = text.lower().strip().rstrip('.!?,;:')
+                if not any(legit in text_lower for legit in LEGIT_SHORT):
+                    is_hallucination = True
+                    log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {batch_start_t:.1f}-{batch_end_t:.1f}s): hallucination '{text}', skipped")
+
+            if not is_hallucination:
+                segments.append({
+                    "speaker": speaker,
+                    "start": round(batch_start_t, 2),
+                    "end": round(batch_end_t, 2),
+                    "text": text,
+                    "mood": None,
+                })
+                batch_label = f" (batch {batch_count})" if batch_count > 1 else ""
+                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {batch_start_t:.1f}-{batch_end_t:.1f}s): {len(text)} chars{batch_label}")
         else:
             log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty, skipped")
+
+        i = batch_end + 1
+
+    if skipped_crosstalk > 0:
+        log(f"[STEREO] Skipped {skipped_crosstalk} turns due to crosstalk")
 
     if not segments:
         log("[STEREO] All turns empty → fallback Voxtral Speaker ID")
