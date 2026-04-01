@@ -1369,7 +1369,7 @@ def _build_turn_timeline_from_channels(ch0_vad: List[Tuple[float, float]],
                 split.append({"speaker": turn["speaker"], "start": round(t, 3), "end": round(chunk_end, 3)})
                 t = chunk_end
 
-    log(f"[TURNS] Built {len(split)} turns from {len(mono_vad)} mono VAD blocks")
+    log(f"[TURNS] Built {len(split)} turns from {len(raw)} raw VAD blocks")
     return split
 
 
@@ -1413,6 +1413,7 @@ def _transcribe_turn(turn_audio_path: str, language: Optional[str], duration: fl
                   '', text, flags=re.IGNORECASE).strip()
     text = re.sub(r'^(?:Agent|Client|Speaker\s*\d*)\s*:\s*', '', text, flags=re.IGNORECASE).strip()
     text = re.sub(r'(\.\s*){4,}', '', text).strip()
+    text = re.sub(r'\*{1,3}', '', text).strip()  # nettoyer le markdown bold **
     return text
 
 
