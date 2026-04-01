@@ -1522,7 +1522,8 @@ def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
     # Méthode : analyser l'énergie sur fenêtres de 5s. Si pendant >25s consécutives
     # un seul canal a de l'énergie significative (musique d'attente / IVR sur le canal local)
     # ET l'autre canal est quasi-silencieux (patient en attente), c'est du hold.
-    hold_min_duration = 25.0  # durée min pour considérer comme hold (secondes)
+    hold_min_duration_start = 8.0   # seuil plus bas pour l'IVR en début d'appel
+    hold_min_duration_mid = 25.0    # seuil plus haut pour le hold en milieu d'appel
     hold_check_window = 5.0   # taille des fenêtres de vérification
     hold_ratio_threshold = 3.0  # ratio min entre canal dominant et canal faible
 
@@ -1557,22 +1558,27 @@ def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
                 hold_dominant = dominant
             elif dominant != hold_dominant:
                 # Changement de canal dominant → pas du hold continu
-                if check_pos - hold_start >= hold_min_duration:
+                min_dur = hold_min_duration_start if hold_start == 0.0 else hold_min_duration_mid
+                if check_pos - hold_start >= min_dur:
                     hold_regions.append((hold_start, check_pos))
                 hold_start = check_pos
                 hold_dominant = dominant
         else:
             # Les deux canaux sont actifs → conversation normale
-            if hold_start is not None and check_pos - hold_start >= hold_min_duration:
-                hold_regions.append((hold_start, check_pos))
+            if hold_start is not None:
+                min_dur = hold_min_duration_start if hold_start == 0.0 else hold_min_duration_mid
+                if check_pos - hold_start >= min_dur:
+                    hold_regions.append((hold_start, check_pos))
             hold_start = None
             hold_dominant = None
 
         check_pos = check_end
 
     # Fermer le dernier hold si en cours
-    if hold_start is not None and duration - hold_start >= hold_min_duration:
-        hold_regions.append((hold_start, duration))
+    if hold_start is not None:
+        min_dur = hold_min_duration_start if hold_start == 0.0 else hold_min_duration_mid
+        if duration - hold_start >= min_dur:
+            hold_regions.append((hold_start, duration))
 
     # Supprimer les tours qui tombent dans les hold regions
     if hold_regions:
@@ -1879,6 +1885,24 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         if ENABLE_SENTIMENT:
             mood_label = ss.get("mood_label", "neutre")
             mood_conf  = ss.get("mood_confidence", 0.75)
+
+            # Validation par keywords : si Voxtral dit "neutre" mais le transcript
+            # contient des marqueurs positifs clairs → upgrader vers "bon"
+            if mood_label == "neutre":
+                text_lower = full_transcript.lower()
+                positive_markers = ["merci", "parfait", "très bien", "super", "excellent",
+                                    "bonne journée", "bonne soirée", "bonne fin de journée",
+                                    "au revoir", "à bientôt", "c'est gentil", "je vous remercie",
+                                    "merci beaucoup", "avec plaisir", "je vous en prie",
+                                    "c'est noté", "entendu", "pas de souci", "c'est bon"]
+                negative_markers = ["pas content", "inadmissible", "problème", "plainte",
+                                    "en colère", "mécontent", "déçu", "inacceptable"]
+                pos_count = sum(1 for m in positive_markers if m in text_lower)
+                neg_count = sum(1 for m in negative_markers if m in text_lower)
+                if pos_count >= 2 and neg_count == 0:
+                    mood_label = "bon"
+                    mood_conf = 0.75
+                    log(f"[STEREO] Sentiment upgraded neutre→bon (pos={pos_count}, neg={neg_count})")
 
             label_map = {"bon": "positive", "mauvais": "negative", "neutre": "neutral"}
             label_en  = label_map.get(mood_label, "neutral")
