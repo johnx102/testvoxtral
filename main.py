@@ -350,7 +350,9 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
                        "ça suffit", "patienter", "retard", "toujours le même", "ça traîne", "trop long"]
     positive_indicators = ["merci", "parfait", "très bien", "super", "excellent", "c'est bon", "d'accord",
                            "ça marche", "pas de problème", "bonne journée", "confirmé", "réglé",
-                           "je vous remercie", "merci beaucoup", "c'est gentil", "avec plaisir", "volontiers"]
+                           "je vous remercie", "merci beaucoup", "c'est gentil", "avec plaisir", "volontiers",
+                           "au revoir", "à bientôt", "entendu", "c'est noté", "bonne fin de journée",
+                           "bonne soirée", "à tout à l'heure", "je vous souhaite"]
     neutral_phrases = ["c'est bon alors", "ah d'accord", "pas de problème", "c'est réglé", "ça marche"]
     strong_neg_count = sum(1 for p in strong_negative if p in text_lower)
     mild_neg_count   = sum(1 for w in mild_negative if w in text_lower)
@@ -359,7 +361,7 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
     if strong_neg_count >= 1:
         return {"label_en": "negative", "label_fr": "mauvais", "confidence": 0.90,
                 "scores": {"negative": 0.90, "neutral": 0.08, "positive": 0.02}}
-    if positive_count >= 3 and mild_neg_count == 0:
+    if positive_count >= 2 and mild_neg_count == 0:
         return {"label_en": "positive", "label_fr": "bon", "confidence": 0.85,
                 "scores": {"negative": 0.05, "neutral": 0.10, "positive": 0.85}}
     if neutral_found and mild_neg_count <= 1:
@@ -372,9 +374,12 @@ def classify_sentiment_with_voxtral(text: str) -> Dict[str, Any]:
     if word_count < 100 and positive_count >= 1 and mild_neg_count == 0:
         return {"label_en": "positive", "label_fr": "bon", "confidence": 0.70,
                 "scores": {"negative": 0.10, "neutral": 0.20, "positive": 0.70}}
-    instruction = ("Analyse le sentiment de cette conversation téléphonique professionnelle.\n"
+    instruction = ("Analyse le ressenti global de cette conversation téléphonique professionnelle.\n"
                    "Réponds par UN SEUL MOT : satisfaisant, neutre, ou insatisfaisant\n\n"
-                   "NOTE : La plupart des appels courts et polis sont satisfaisants.\n\n"
+                   "GUIDE :\n"
+                   "- satisfaisant : échange poli, demande traitée, conversation cordiale (cas le plus fréquent)\n"
+                   "- neutre : très bref, ton froid, pas assez d'éléments pour juger\n"
+                   "- insatisfaisant : plainte, mécontentement, frustration\n\n"
                    f"Conversation : {text[:1500]}")
     conv = [{"role": "user", "content": [{"type": "text", "text": instruction}]}]
     try:
@@ -1373,6 +1378,121 @@ def _build_turn_timeline_from_channels(ch0_vad: List[Tuple[float, float]],
     return split
 
 
+def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
+                            window_ms: int = 300, merge_gap_s: float = 1.5) -> List[Dict[str, Any]]:
+    """
+    Attribution speaker par comparaison d'énergie entre canaux stéréo.
+
+    1. VAD sur mono → trouve TOUTE la parole (y compris voix douce)
+    2. Détection début conversation (après IVR/attente)
+    3. Fenêtres de window_ms ms : RMS ch0 vs ch1 → canal dominant = speaker
+    4. Fusion fenêtres consécutives même speaker
+    5. Filtrage micro-segments bruit
+    6. Découpe tours > 25s
+
+    Avantage vs VAD indépendant : le crosstalk ne trompe plus l'attribution
+    car le vrai speaker est TOUJOURS plus fort sur son canal.
+    """
+    import soundfile as sf
+    import numpy as np
+
+    data, sr = sf.read(wav_path, dtype="float32")
+    if data.ndim == 1:
+        return []
+
+    ch0 = data[:, 0]  # left = remote
+    ch1 = data[:, 1]  # right = local
+    duration = len(ch0) / sr
+
+    # --- VAD sur mono pour trouver TOUTE la parole ---
+    mono = (ch0 + ch1) / 2.0
+    mono_tmp = os.path.join(tempfile.gettempdir(), f"mono_energy_{uuid.uuid4().hex}.wav")
+    sf.write(mono_tmp, mono, sr)
+    vad_blocks = _vad_speech_blocks(mono_tmp)
+
+    # --- VAD par canal pour détecter début conversation (IVR) ---
+    ch0_tmp = os.path.join(tempfile.gettempdir(), f"ch0_energy_{uuid.uuid4().hex}.wav")
+    ch1_tmp = os.path.join(tempfile.gettempdir(), f"ch1_energy_{uuid.uuid4().hex}.wav")
+    sf.write(ch0_tmp, ch0, sr)
+    sf.write(ch1_tmp, ch1, sr)
+    ch0_vad = _vad_speech_blocks(ch0_tmp)
+    ch1_vad = _vad_speech_blocks(ch1_tmp)
+
+    for p in [mono_tmp, ch0_tmp, ch1_tmp]:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+    if not vad_blocks:
+        return []
+
+    # --- Détecter début de conversation (après IVR/musique) ---
+    conv_start = find_conversation_start(ch0_vad, ch1_vad)
+    if conv_start > 0:
+        vad_blocks = [(max(s, conv_start), e) for s, e in vad_blocks if e > conv_start]
+        vad_blocks = [(s, e) for s, e in vad_blocks if e > s]
+        log(f"[STEREO_ENERGY] Conversation starts at {conv_start:.1f}s — trimmed IVR")
+
+    # --- Fenêtrage et comparaison d'énergie ch0 vs ch1 ---
+    window_size = int(sr * window_ms / 1000)
+    raw_windows = []
+
+    for block_start, block_end in vad_blocks:
+        s_frame = int(block_start * sr)
+        e_frame = min(int(block_end * sr), len(ch0))
+
+        pos = s_frame
+        while pos + window_size // 2 <= e_frame:
+            end_pos = min(pos + window_size, e_frame)
+            win_ch0 = ch0[pos:end_pos]
+            win_ch1 = ch1[pos:end_pos]
+
+            rms0 = float(np.sqrt(np.mean(win_ch0 ** 2))) if len(win_ch0) > 0 else 0.0
+            rms1 = float(np.sqrt(np.mean(win_ch1 ** 2))) if len(win_ch1) > 0 else 0.0
+
+            # Canal avec plus d'énergie = speaker actif (crosstalk est toujours plus faible)
+            speaker = left_role if rms0 > rms1 else right_role
+
+            raw_windows.append({
+                "speaker": speaker,
+                "start": round(pos / sr, 3),
+                "end": round(end_pos / sr, 3),
+            })
+            pos = end_pos
+
+    if not raw_windows:
+        return []
+
+    # --- Fusion fenêtres consécutives même speaker ---
+    merged = [raw_windows[0].copy()]
+    for win in raw_windows[1:]:
+        prev = merged[-1]
+        if win["speaker"] == prev["speaker"] and win["start"] - prev["end"] < merge_gap_s:
+            prev["end"] = win["end"]
+        else:
+            merged.append(win.copy())
+
+    # --- Filtrer micro-segments < 0.25s (bruit/artefact) ---
+    merged = [t for t in merged if t["end"] - t["start"] >= 0.25]
+
+    # --- Découper tours > 25s ---
+    final = []
+    for turn in merged:
+        dur = turn["end"] - turn["start"]
+        if dur <= 25.0:
+            final.append(turn)
+        else:
+            t = turn["start"]
+            while t < turn["end"]:
+                chunk_end = min(t + 25.0, turn["end"])
+                final.append({"speaker": turn["speaker"], "start": round(t, 3), "end": round(chunk_end, 3)})
+                t = chunk_end
+
+    log(f"[STEREO_ENERGY] Built {len(final)} turns from {len(raw_windows)} windows ({len(vad_blocks)} VAD blocks)")
+    return final
+
+
 def _extract_turn_audio_mono(mono_path: str, start: float, end: float) -> Optional[str]:
     """Extrait un segment audio depuis le fichier MONO (pas depuis un canal isolé)."""
     try:
@@ -1465,7 +1585,11 @@ def _generate_summary_and_sentiment(transcript: str, language: Optional[str],
         "PARTIE 1 — RÉSUMÉ :\n"
         "Résume en 1-2 phrases simples : qui appelle, pourquoi, et ce qui est décidé.\n\n"
         "PARTIE 2 — SENTIMENT :\n"
-        "Écris UN SEUL MOT pour le sentiment du client : bon, neutre, ou mauvais\n\n"
+        "Écris UN SEUL MOT pour le ressenti global de la conversation :\n"
+        "- bon : échange poli et cordial, demande traitée, conversation normale\n"
+        "- neutre : échange très bref, ton froid ou distant, pas assez d'éléments\n"
+        "- mauvais : mécontentement, plainte, frustration, problème non résolu\n"
+        "Note : la plupart des appels professionnels polis sont 'bon', pas 'neutre'.\n\n"
         "---\n\n"
         f"Conversation :\n{transcript[:3000]}\n\n"
         "Réponds maintenant (résumé puis --- puis sentiment) :"
@@ -1484,12 +1608,12 @@ def _generate_summary_and_sentiment(transcript: str, language: Optional[str],
         raw_summary = re.sub(r'^(?:Partie\s*\d+\s*[-–—:]*\s*)?R[ée]sum[ée]\s*[-–—:]*\s*', '', raw_summary, flags=re.IGNORECASE).strip()
         summary = clean_generated_summary(raw_summary)
         mood_label = "neutre"
-        if len(parts) >= 2:
-            mood_raw = parts[1].strip().lower()
-            if "mauvais" in mood_raw or "insatisf" in mood_raw:
-                mood_label = "mauvais"
-            elif "bon" in mood_raw or "satisf" in mood_raw or "positif" in mood_raw:
-                mood_label = "bon"
+        # Chercher le mood dans la partie 2 si séparateur présent, sinon dans toute la réponse
+        mood_raw = parts[1].strip().lower() if len(parts) >= 2 else response.lower()
+        if "mauvais" in mood_raw or "insatisf" in mood_raw or "négatif" in mood_raw:
+            mood_label = "mauvais"
+        elif "bon" in mood_raw or "satisf" in mood_raw or "positif" in mood_raw or "cordial" in mood_raw:
+            mood_label = "bon"
 
         if not summary or len(summary) < 10:
             summary = create_extractive_summary(transcript)
@@ -1508,16 +1632,15 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
                                   with_summary: bool, call_direction: str = "unknown",
                                   ch0_path: str = None, ch1_path: str = None):
     """
-    MODE STÉRÉO OPTIMAL :
+    MODE STÉRÉO v2 — Attribution par comparaison d'énergie entre canaux :
     1. VAD sur MONO → capte TOUTE la parole (y compris voix douce)
-    2. Comparaison énergie ch0 vs ch1 par segment → attribution speaker fiable
-    3. Extraction de chaque tour depuis le MONO (rien n'est perdu)
-    4. Transcription Voxtral par tour court (stable, pas de boucles)
-    5. Assemblage chronologique → dialogue complet et lisible
-    6. 1 seul appel summary+sentiment combiné
+    2. Fenêtres 300ms : compare RMS ch0 vs ch1 → canal dominant = speaker (crosstalk-proof)
+    3. Extraction de chaque tour depuis SON CANAL (jamais mono, même pour les tours courts)
+    4. Transcription Voxtral par tour
+    5. Summary + sentiment combinés (1 seul appel Voxtral)
     Fallback → Voxtral Speaker ID si mono ou canaux vides.
     """
-    log(f"[STEREO] Starting OPTIMAL stereo diarization: direction={call_direction}")
+    log(f"[STEREO] Starting energy-based stereo diarization: direction={call_direction}")
     ok, err, est_dur = _validate_audio(wav_path)
     if not ok:
         return {"error": err}
@@ -1531,41 +1654,14 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     log(f"[STEREO] Audio: {info.channels}ch {info.samplerate}Hz {est_dur:.1f}s")
 
     # ── Mapping canal → rôle ────────────────────────────────────────────────
-    if call_direction == "outbound":
-        left_role, right_role = "Agent", "Client"
-    else:
-        left_role, right_role = "Client", "Agent"
-    log(f"[STEREO] Channel mapping: ch0={left_role}, ch1={right_role}")
+    # Asterisk MixMonitor : ch0(left/read) = audio DISTANT, ch1(right/write) = audio LOCAL
+    left_role  = "Client"   # ch0 = partie distante (patient/appelant)
+    right_role = "Agent"    # ch1 = partie locale (cabinet/standard)
+    log(f"[STEREO] Channel mapping: ch0={left_role} (remote), ch1={right_role} (local)")
 
-    # ── Étape 1 : VAD par canal pour détecter l'IVR/attente ────────────────
-    own_ch0, own_ch1 = False, False
-    try:
-        if not ch0_path:
-            ch0_path = _extract_mono_channel(wav_path, 0); own_ch0 = True
-        if not ch1_path:
-            ch1_path = _extract_mono_channel(wav_path, 1); own_ch1 = True
-        ch0_vad = _vad_speech_blocks(ch0_path)
-        ch1_vad = _vad_speech_blocks(ch1_path)
-    finally:
-        for p, own in [(ch0_path, own_ch0), (ch1_path, own_ch1)]:
-            if own and p and p != wav_path and os.path.exists(p):
-                try: os.remove(p)
-                except Exception: pass
-
-    # Détecter le début de la vraie conversation (après IVR/musique d'attente)
-    conv_start = find_conversation_start(ch0_vad, ch1_vad)
-
-    # Filtrer les blocs VAD avant le début de conversation (IVR/attente)
-    if conv_start > 0:
-        ch0_vad_filtered = [(s, e) for s, e in ch0_vad if e > conv_start]
-        ch1_vad_filtered = [(s, e) for s, e in ch1_vad if e > conv_start]
-        log(f"[IVR_DETECT] Conversation starts at {conv_start:.1f}s — trimmed IVR portion")
-    else:
-        ch0_vad_filtered = ch0_vad
-        ch1_vad_filtered = ch1_vad
-
-    # ── Étape 2 : Construire la timeline depuis les VAD par canal ───────────
-    turns = _build_turn_timeline_from_channels(ch0_vad_filtered, ch1_vad_filtered, left_role, right_role)
+    # ── Étape 1-2 : Construire les tours par comparaison d'énergie ──────────
+    # _build_turns_by_energy gère aussi la détection IVR/attente en interne
+    turns = _build_turns_by_energy(wav_path, left_role, right_role)
     if not turns:
         log("[STEREO] No turns → fallback Voxtral Speaker ID")
         mono_fb = _to_mono_tmp(wav_path)
@@ -1585,68 +1681,50 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     log(f"[STEREO] Timeline: {len(turns)} turns ({turn_counts})")
 
     # ── Étape 3 : Transcrire chaque tour depuis SON CANAL ─────────────────
-    # Chaque canal a la voix du speaker assigné plus forte que le crosstalk
-    # Le prompt dit à Voxtral de transcrire uniquement la voix principale
+    # TOUJOURS le canal du speaker (même tours courts) — c'est l'avantage du stéréo
     channel_map = {left_role: 0, right_role: 1}
+    segments = []
 
-    # Créer mono temporaire pour les tours courts (réponses brèves mieux captées sur mono)
-    mono_path = _to_mono_tmp(wav_path)
-    mono_cleanup = mono_path != wav_path
+    for i, turn in enumerate(turns):
+        speaker  = turn["speaker"]
+        channel  = channel_map.get(speaker, 0)
+        turn_dur = turn["end"] - turn["start"]
 
-    try:
-        segments = []
-        for i, turn in enumerate(turns):
-            speaker  = turn["speaker"]
-            channel  = channel_map.get(speaker, 0)
-            turn_dur = turn["end"] - turn["start"]
+        turn_audio = _extract_turn_audio_channel(wav_path, turn["start"], turn["end"], channel)
+        if not turn_audio:
+            continue
 
-            # Tours courts (< 3s) : extraire depuis MONO (réponses "oui", "d'accord" mieux captées)
-            # Tours longs : extraire depuis le CANAL du speaker (voix principale plus forte)
-            if turn_dur < 3.0:
-                turn_audio = _extract_turn_audio_mono(mono_path, turn["start"], turn["end"])
-                from_ch = False
-            else:
-                turn_audio = _extract_turn_audio_channel(wav_path, turn["start"], turn["end"], channel)
-                from_ch = True
+        try:
+            text = _transcribe_turn(turn_audio, language, turn_dur, from_channel=True)
+        finally:
+            if os.path.exists(turn_audio):
+                os.remove(turn_audio)
 
-            if not turn_audio:
-                continue
+        if text and len(text.split()) >= 1:
+            segments.append({
+                "speaker": speaker,
+                "start": round(turn["start"], 2),
+                "end": round(turn["end"], 2),
+                "text": text,
+                "mood": None,
+            })
+            log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): {len(text)} chars")
+        else:
+            log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty, skipped")
 
-            try:
-                text = _transcribe_turn(turn_audio, language, turn_dur, from_channel=from_ch)
-            finally:
-                if os.path.exists(turn_audio):
-                    os.remove(turn_audio)
+    if not segments:
+        log("[STEREO] All turns empty → fallback Voxtral Speaker ID")
+        mono_fb = _to_mono_tmp(wav_path)
+        result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
+        if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
+        return result
 
-            if text and len(text.split()) >= 1:
-                segments.append({
-                    "speaker": speaker,
-                    "start": round(turn["start"], 2),
-                    "end": round(turn["end"], 2),
-                    "text": text,
-                    "mood": None,
-                })
-                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): {len(text)} chars {'(mono)' if not from_ch else ''}")
-            else:
-                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty, skipped")
-
-        if not segments:
-            log("[STEREO] All turns empty → fallback Voxtral Speaker ID")
-            mono_fb = _to_mono_tmp(wav_path)
-            result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
-            if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
-            return result
-
-    finally:
-        if mono_cleanup and os.path.exists(mono_path):
-            os.remove(mono_path)
-
-    # ── Étape 5 : Supprimer les segments dupliqués (annonces en boucle) ────
+    # ── Étape 4 : Supprimer les segments dupliqués (annonces en boucle) ────
     segments = remove_duplicate_segments(segments)
     if not segments:
-        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée.", "diarization_mode": "stereo_per_turn"}
+        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée.", "diarization_mode": "stereo_energy"}
 
-    # ── Étape 6 : Fusionner segments consécutifs même speaker ───────────────
+    # ── Étape 5 : Fusionner segments consécutifs même speaker ───────────────
     merged = [segments[0]]
     for seg in segments[1:]:
         prev = merged[-1]
@@ -1662,33 +1740,42 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     result = {
         "segments": merged,
         "transcript": full_transcript,
-        "diarization_mode": "stereo_per_turn",
+        "diarization_mode": "stereo_energy",
         "audio_duration": est_dur,
     }
 
-    # ── Étape 6 : Summary + Sentiment combinés (1 appel) ───────────────────
+    # ── Étape 6 : Summary + Sentiment combinés (1 seul appel Voxtral) ─────
     if with_summary or ENABLE_SENTIMENT:
-        log("[STEREO] Generating summary + sentiment (single call)...")
+        log("[STEREO] Generating summary + sentiment...")
         ss = _generate_summary_and_sentiment(full_transcript, language, est_dur)
 
         if with_summary:
             result["summary"] = ss["summary"]
 
         if ENABLE_SENTIMENT:
-            mood_map = {
-                "bon": {"label_en": "positive", "label_fr": "bon", "confidence": ss["mood_confidence"],
-                        "scores": {"negative": 0.05, "neutral": 0.15, "positive": 0.80}},
-                "mauvais": {"label_en": "negative", "label_fr": "mauvais", "confidence": ss["mood_confidence"],
-                            "scores": {"negative": 0.80, "neutral": 0.15, "positive": 0.05}},
-                "neutre": {"label_en": "neutral", "label_fr": "neutre", "confidence": ss["mood_confidence"],
-                           "scores": {"negative": 0.10, "neutral": 0.80, "positive": 0.10}},
-            }
-            mood = mood_map.get(ss["mood_label"], mood_map["neutre"])
-            result["mood_overall"]    = mood
-            result["mood_client"]     = mood
-            result["mood_by_speaker"] = {"Agent": mood_map["neutre"], "Client": mood}
+            mood_label = ss.get("mood_label", "neutre")
+            mood_conf  = ss.get("mood_confidence", 0.75)
 
-    log("[STEREO] Optimal stereo diarization completed successfully")
+            label_map = {"bon": "positive", "mauvais": "negative", "neutre": "neutral"}
+            label_en  = label_map.get(mood_label, "neutral")
+
+            # Construire les scores depuis le label
+            scores = {"negative": 0.10, "neutral": 0.10, "positive": 0.10}
+            scores[label_en] = mood_conf
+            total = sum(scores.values())
+            scores = {k: round(v / total, 2) for k, v in scores.items()}
+
+            mood_overall = {
+                "label_en": label_en,
+                "label_fr": mood_label,
+                "confidence": mood_conf,
+                "scores": scores,
+            }
+            result["mood_overall"]    = mood_overall
+            result["mood_by_speaker"] = {}
+            result["mood_client"]     = mood_overall
+
+    log("[STEREO] Energy-based stereo diarization completed successfully")
     return result
 
 # =============================================================================
