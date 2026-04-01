@@ -1822,6 +1822,11 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             call_direction = "unknown"
     log(f"[HANDLER] Task: {task}, language: {language}, direction: {call_direction}, max_tokens: {max_new_tokens}, summary: {with_summary}")
     local_path, cleanup = None, False
+    is_stereo    = False
+    mono_path    = None
+    mono_cleanup = False
+    ch0_path     = None
+    ch1_path     = None
     try:
         if inp.get("audio_url"):
             url = inp["audio_url"].strip()
@@ -1844,11 +1849,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         log(f"[HANDLER] Processing audio: {local_path}")
 
         # ── Détection stéréo et extraction canaux ─────────────────────────────
-        is_stereo    = False
-        mono_path    = local_path
-        mono_cleanup = False
-        ch0_path     = None  # left/rx
-        ch1_path     = None  # right/tx
+        mono_path = local_path
 
         if STEREO_DIARIZATION:
             import soundfile as sf
