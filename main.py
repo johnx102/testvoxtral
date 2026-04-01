@@ -2182,6 +2182,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     max_new_tokens = int(inp.get("max_new_tokens", MAX_NEW_TOKENS))
     with_summary   = bool(inp.get("with_summary", WITH_SUMMARY_DEFAULT))
     call_direction = (inp.get("call_direction") or "").lower().strip()
+    force_mono     = bool(inp.get("force_mono", False))
     if call_direction not in ("inbound", "outbound"):
         audio_url = inp.get("audio_url") or inp.get("file_path") or ""
         filename  = audio_url.split("/")[-1].lower()
@@ -2191,7 +2192,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             call_direction = "outbound"
         else:
             call_direction = "unknown"
-    log(f"[HANDLER] Task: {task}, language: {language}, direction: {call_direction}, max_tokens: {max_new_tokens}, summary: {with_summary}")
+    log(f"[HANDLER] Task: {task}, language: {language}, direction: {call_direction}, max_tokens: {max_new_tokens}, summary: {with_summary}, force_mono: {force_mono}")
     local_path, cleanup = None, False
     is_stereo    = False
     mono_path    = None
@@ -2310,7 +2311,13 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             os.remove(mono_path)
 
         # ── Pipeline principal ────────────────────────────────────────────────
-        if STEREO_DIARIZATION:
+        if force_mono:
+            # A/B test : forcer le pipeline mono même sur du stéréo
+            log("[HANDLER] FORCE_MONO: Converting to mono + Voxtral Speaker ID")
+            mono_fb = _to_mono_tmp(local_path)
+            out = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
+            if mono_fb != local_path and os.path.exists(mono_fb): os.remove(mono_fb)
+        elif STEREO_DIARIZATION:
             log("[HANDLER] Using Stereo Channel Diarization (fallback: Voxtral Speaker ID if mono)")
             out = diarize_with_stereo_channels(local_path, language, max_new_tokens, with_summary, call_direction,
                                                ch0_path=ch0_path, ch1_path=ch1_path)
