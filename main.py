@@ -295,7 +295,8 @@ def run_voxtral(conversation: List[Dict[str, Any]], max_new_tokens: int) -> Dict
     use_sampling = max_new_tokens > 3000
     gen_kwargs   = dict(max_new_tokens=max_new_tokens, do_sample=use_sampling,
                         temperature=0.1 if use_sampling else None,
-                        top_p=0.95 if use_sampling else None)
+                        top_p=0.95 if use_sampling else None,
+                        repetition_penalty=1.2)
     t0      = time.time()
     outputs = model.generate(**inputs, **gen_kwargs)
     dt      = round(time.time() - t0, 3)
