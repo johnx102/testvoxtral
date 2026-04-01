@@ -1394,14 +1394,43 @@ def _extract_turn_audio_mono(mono_path: str, start: float, end: float) -> Option
         return None
 
 
-def _transcribe_turn(turn_audio_path: str, language: Optional[str], duration: float) -> str:
+def _extract_turn_audio_channel(wav_path: str, start: float, end: float, channel: int) -> Optional[str]:
+    """Extrait un segment audio d'un canal spécifique d'un fichier stéréo."""
+    try:
+        import soundfile as sf
+        data, sr = sf.read(wav_path, dtype="float32")
+        if data.ndim == 1:
+            ch_data = data
+        else:
+            ch_data = data[:, channel]
+        s_frame = int(start * sr)
+        e_frame = min(int(end * sr), len(ch_data))
+        segment = ch_data[s_frame:e_frame]
+        if len(segment) < sr * 0.3:
+            return None
+        out_path = os.path.join(tempfile.gettempdir(), f"turn_ch{channel}_{uuid.uuid4().hex}.wav")
+        sf.write(out_path, segment, sr)
+        return out_path
+    except Exception as e:
+        log(f"[EXTRACT_TURN_CH] Failed: {e}")
+        return None
+
+def _transcribe_turn(turn_audio_path: str, language: Optional[str], duration: float, from_channel: bool = False) -> str:
     """Transcrit un segment audio court (un tour de parole). Retourne le texte brut."""
     tokens  = max(64, min(int(duration * 10), 2000))
     timeout = min(int(duration * 0.8) + 30, 120)
-    instruction = (f"lang:{language or 'fr'} "
-                   "[TRANSCRIBE] Transcris exactement ce qui est dit, mot pour mot. "
-                   "Conserve les hésitations (euh, bah, alors). "
-                   "N'invente rien. N'écris JAMAIS [Musique] [Silence] [Attente].")
+    if from_channel:
+        # Transcription depuis un canal isolé : focus sur la voix principale
+        instruction = (f"lang:{language or 'fr'} "
+                       "[TRANSCRIBE] Transcris UNIQUEMENT la voix principale (la plus forte). "
+                       "Ignore les voix en arrière-plan ou les échos. "
+                       "Conserve les hésitations (euh, bah, alors). "
+                       "N'invente rien. N'écris JAMAIS [Musique] [Silence] [Attente].")
+    else:
+        instruction = (f"lang:{language or 'fr'} "
+                       "[TRANSCRIBE] Transcris exactement ce qui est dit, mot pour mot. "
+                       "Conserve les hésitations (euh, bah, alors). "
+                       "N'invente rien. N'écris JAMAIS [Musique] [Silence] [Attente].")
     conv = [{"role": "user", "content": [
         {"type": "audio", "path": turn_audio_path},
         {"type": "text",  "text": instruction}
@@ -1555,24 +1584,24 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     turn_counts = {s: sum(1 for t in turns if t["speaker"] == s) for s in speakers_found}
     log(f"[STEREO] Timeline: {len(turns)} turns ({turn_counts})")
 
-    # ── Étape 3 : Créer mono pour la transcription ──────────────────────────
-    mono_path = _to_mono_tmp(wav_path)
-    mono_cleanup = mono_path != wav_path
+    # ── Étape 3 : Transcrire chaque tour depuis SON CANAL ─────────────────
+    # Chaque canal a la voix du speaker assigné plus forte que le crosstalk
+    # Le prompt dit à Voxtral de transcrire uniquement la voix principale
+    channel_map = {left_role: 0, right_role: 1}
 
     try:
-
-        # ── Étape 4 : Transcrire chaque tour depuis le MONO ─────────────────
         segments = []
         for i, turn in enumerate(turns):
             speaker  = turn["speaker"]
+            channel  = channel_map.get(speaker, 0)
             turn_dur = turn["end"] - turn["start"]
 
-            turn_audio = _extract_turn_audio_mono(mono_path, turn["start"], turn["end"])
+            turn_audio = _extract_turn_audio_channel(wav_path, turn["start"], turn["end"], channel)
             if not turn_audio:
                 continue
 
             try:
-                text = _transcribe_turn(turn_audio, language, turn_dur)
+                text = _transcribe_turn(turn_audio, language, turn_dur, from_channel=True)
             finally:
                 if os.path.exists(turn_audio):
                     os.remove(turn_audio)
@@ -1591,12 +1620,13 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
 
         if not segments:
             log("[STEREO] All turns empty → fallback Voxtral Speaker ID")
-            result = diarize_with_voxtral_speaker_id(mono_path, language, max_new_tokens, with_summary, call_direction)
+            mono_fb = _to_mono_tmp(wav_path)
+            result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
+            if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
             return result
 
     finally:
-        if mono_cleanup and os.path.exists(mono_path):
-            os.remove(mono_path)
+        pass  # Pas de mono à nettoyer — transcription directe depuis le stéréo
 
     # ── Étape 5 : Supprimer les segments dupliqués (annonces en boucle) ────
     segments = remove_duplicate_segments(segments)
