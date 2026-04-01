@@ -522,6 +522,14 @@ def generate_natural_summary(full_transcript: str, language: Optional[str] = Non
 def clean_generated_summary(summary: str) -> str:
     if not summary:
         return ""
+    # Nettoyer les artefacts markdown et labels de parties
+    summary = re.sub(r'#{1,3}\s*', '', summary)  # ### headers
+    summary = re.sub(r'\*{1,3}', '', summary)     # **bold** / ***italic***
+    summary = re.sub(r'(?i)partie\s*\d+\s*[-–—:]*\s*', '', summary)  # "Partie 1 —"
+    summary = re.sub(r'(?i)r[ée]sum[ée]\s*[-–—:]*\s*', '', summary)  # "Résumé :"
+    summary = re.sub(r'(?i)sentiment\s*[-–—:]*\s*', '', summary)      # "Sentiment :"
+    summary = summary.strip(' \t\n-–—:')
+
     unwanted_starts = ["voici un résumé", "résumé de la conversation", "cette conversation",
                        "dans cette conversation", "le résumé", "il s'agit"]
     summary_lower   = summary.lower().strip()
@@ -1379,16 +1387,17 @@ def _build_turn_timeline_from_channels(ch0_vad: List[Tuple[float, float]],
 
 
 def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
-                            window_ms: int = 300, merge_gap_s: float = 1.5) -> List[Dict[str, Any]]:
+                            window_ms: int = 500, merge_gap_s: float = 2.5) -> List[Dict[str, Any]]:
     """
     Attribution speaker par comparaison d'énergie entre canaux stéréo.
 
     1. VAD sur mono → trouve TOUTE la parole (y compris voix douce)
     2. Détection début conversation (après IVR/attente)
     3. Fenêtres de window_ms ms : RMS ch0 vs ch1 → canal dominant = speaker
-    4. Fusion fenêtres consécutives même speaker
-    5. Filtrage micro-segments bruit
-    6. Découpe tours > 25s
+    4. Fusion fenêtres consécutives même speaker (gap < merge_gap_s)
+    5. Absorption des micro-segments isolés (< 0.8s entre 2 du même speaker)
+    6. Filtrage segments < 0.5s (bruit/artefact)
+    7. Découpe tours > 25s
 
     Avantage vs VAD indépendant : le crosstalk ne trompe plus l'attribution
     car le vrai speaker est TOUJOURS plus fort sur son canal.
@@ -1464,7 +1473,7 @@ def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
     if not raw_windows:
         return []
 
-    # --- Fusion fenêtres consécutives même speaker ---
+    # --- Passe 1 : Fusion fenêtres consécutives même speaker ---
     merged = [raw_windows[0].copy()]
     for win in raw_windows[1:]:
         prev = merged[-1]
@@ -1473,8 +1482,123 @@ def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
         else:
             merged.append(win.copy())
 
-    # --- Filtrer micro-segments < 0.25s (bruit/artefact) ---
-    merged = [t for t in merged if t["end"] - t["start"] >= 0.25]
+    # --- Passe 2 : Absorber les micro-segments isolés (< 0.8s) entre 2 du même speaker ---
+    # Évite la fragmentation due au crosstalk ponctuel
+    if len(merged) >= 3:
+        cleaned = [merged[0]]
+        i = 1
+        while i < len(merged) - 1:
+            curr = merged[i]
+            prev = cleaned[-1]
+            nxt  = merged[i + 1]
+            curr_dur = curr["end"] - curr["start"]
+            if (curr_dur < 0.8 and prev["speaker"] == nxt["speaker"]
+                    and prev["speaker"] != curr["speaker"]):
+                # Absorber dans le speaker dominant
+                prev["end"] = max(prev["end"], curr["end"])
+                i += 1
+                continue
+            cleaned.append(curr)
+            i += 1
+        if i < len(merged):
+            cleaned.append(merged[i])
+        merged = cleaned
+
+    # --- Passe 3 : Re-fusionner après absorption ---
+    if len(merged) >= 2:
+        refused = [merged[0]]
+        for seg in merged[1:]:
+            prev = refused[-1]
+            if prev["speaker"] == seg["speaker"]:
+                prev["end"] = seg["end"]
+            else:
+                refused.append(seg)
+        merged = refused
+
+    # --- Filtrer segments < 0.5s (bruit/artefact — pas assez pour Voxtral) ---
+    merged = [t for t in merged if t["end"] - t["start"] >= 0.5]
+
+    # --- Passe 4 : Détecter et supprimer les mises en attente mid-call ---
+    # Méthode : analyser l'énergie sur fenêtres de 5s. Si pendant >25s consécutives
+    # un seul canal a de l'énergie significative (musique d'attente / IVR sur le canal local)
+    # ET l'autre canal est quasi-silencieux (patient en attente), c'est du hold.
+    hold_min_duration = 25.0  # durée min pour considérer comme hold (secondes)
+    hold_check_window = 5.0   # taille des fenêtres de vérification
+    hold_ratio_threshold = 3.0  # ratio min entre canal dominant et canal faible
+
+    hold_regions = []
+    check_pos = 0.0
+    hold_start = None
+    hold_dominant = None
+
+    while check_pos < duration:
+        check_end = min(check_pos + hold_check_window, duration)
+        s_f = int(check_pos * sr)
+        e_f = min(int(check_end * sr), len(ch0))
+
+        if e_f - s_f < sr * 0.5:  # fenêtre trop courte
+            check_pos = check_end
+            continue
+
+        rms0 = float(np.sqrt(np.mean(ch0[s_f:e_f] ** 2)))
+        rms1 = float(np.sqrt(np.mean(ch1[s_f:e_f] ** 2)))
+        max_rms = max(rms0, rms1)
+        min_rms = min(rms0, rms1)
+
+        # Un canal domine fortement l'autre = probable hold/IVR
+        is_one_sided = (max_rms > 0 and min_rms > 0 and max_rms / min_rms > hold_ratio_threshold)
+        # Ou un canal est quasi-silencieux
+        is_one_sided = is_one_sided or (max_rms > 1e-4 and min_rms < 1e-5)
+
+        if is_one_sided:
+            dominant = right_role if rms1 > rms0 else left_role
+            if hold_start is None:
+                hold_start = check_pos
+                hold_dominant = dominant
+            elif dominant != hold_dominant:
+                # Changement de canal dominant → pas du hold continu
+                if check_pos - hold_start >= hold_min_duration:
+                    hold_regions.append((hold_start, check_pos))
+                hold_start = check_pos
+                hold_dominant = dominant
+        else:
+            # Les deux canaux sont actifs → conversation normale
+            if hold_start is not None and check_pos - hold_start >= hold_min_duration:
+                hold_regions.append((hold_start, check_pos))
+            hold_start = None
+            hold_dominant = None
+
+        check_pos = check_end
+
+    # Fermer le dernier hold si en cours
+    if hold_start is not None and duration - hold_start >= hold_min_duration:
+        hold_regions.append((hold_start, duration))
+
+    # Supprimer les tours qui tombent dans les hold regions
+    if hold_regions:
+        total_hold = sum(e - s for s, e in hold_regions)
+        log(f"[STEREO_ENERGY] Hold music detected: {len(hold_regions)} region(s), {total_hold:.0f}s total")
+        for hs, he in hold_regions:
+            log(f"[STEREO_ENERGY]   Hold: {hs:.1f}s - {he:.1f}s ({he - hs:.0f}s)")
+
+        def is_in_hold(turn_start, turn_end):
+            """Vérifie si un tour est majoritairement dans une zone de hold."""
+            turn_dur = turn_end - turn_start
+            if turn_dur <= 0:
+                return False
+            overlap = 0.0
+            for hs, he in hold_regions:
+                ov_start = max(turn_start, hs)
+                ov_end = min(turn_end, he)
+                if ov_end > ov_start:
+                    overlap += ov_end - ov_start
+            return overlap / turn_dur > 0.5  # >50% dans le hold → supprimer
+
+        before_count = len(merged)
+        merged = [t for t in merged if not is_in_hold(t["start"], t["end"])]
+        removed = before_count - len(merged)
+        if removed > 0:
+            log(f"[STEREO_ENERGY] Removed {removed} turns in hold regions")
 
     # --- Découper tours > 25s ---
     final = []
