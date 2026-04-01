@@ -1288,43 +1288,35 @@ def _merge_stereo_segments(agent_segs: List[Dict], client_segs: List[Dict]) -> L
     log(f"[STEREO] Merged: {len(all_segs)} → {len(final)} segments (sorted by timestamp)")
     return final
 
-def _get_channel_energy(wav_path: str, start: float, end: float, channel: int) -> float:
-    """Mesure l'énergie RMS d'un segment sur un canal spécifique."""
-    try:
-        import soundfile as sf
-        import numpy as np
-        data, sr = sf.read(wav_path, dtype="float32")
-        if data.ndim == 1:
-            return 0.0
-        ch_data = data[:, channel]
-        s_frame = int(start * sr)
-        e_frame = min(int(end * sr), len(ch_data))
-        segment = ch_data[s_frame:e_frame]
-        if len(segment) < 100:
-            return 0.0
-        return float(np.sqrt(np.mean(segment ** 2)))
-    except Exception:
-        return 0.0
+def _vad_overlap(blocks: List[Tuple[float, float]], start: float, end: float) -> float:
+    """Calcule la durée de chevauchement entre un segment [start, end] et des blocs VAD."""
+    total = 0.0
+    for bs, be in blocks:
+        ov_start = max(start, bs)
+        ov_end   = min(end, be)
+        if ov_end > ov_start:
+            total += ov_end - ov_start
+    return total
 
 
 def _build_turn_timeline_from_mono(mono_vad: List[Tuple[float, float]],
-                                    wav_path: str,
+                                    ch0_vad: List[Tuple[float, float]],
+                                    ch1_vad: List[Tuple[float, float]],
                                     left_role: str, right_role: str,
                                     max_turn_s: float = 25.0, merge_gap_s: float = 1.5) -> List[Dict[str, Any]]:
     """
     Construit la timeline de tours à partir du VAD MONO (capte toute la parole)
-    et attribue le speaker via comparaison d'énergie des canaux stéréo.
+    et attribue le speaker via les VAD par canal (plus fiable que l'énergie brute).
     """
     if not mono_vad:
         return []
 
-    # Attribuer un speaker à chaque bloc mono via l'énergie par canal
+    # Attribuer un speaker à chaque bloc mono via le chevauchement avec les VAD par canal
     raw = []
     for s, e in mono_vad:
-        ch0_energy = _get_channel_energy(wav_path, s, e, 0)
-        ch1_energy = _get_channel_energy(wav_path, s, e, 1)
-        # Le canal avec le plus d'énergie = le speaker dominant
-        speaker = left_role if ch0_energy >= ch1_energy else right_role
+        ch0_overlap = _vad_overlap(ch0_vad, s, e)
+        ch1_overlap = _vad_overlap(ch1_vad, s, e)
+        speaker = left_role if ch0_overlap >= ch1_overlap else right_role
         raw.append({"speaker": speaker, "start": s, "end": e})
 
     # Passe 1 : fusionner les segments consécutifs du même speaker (gap < merge_gap_s)
@@ -1559,7 +1551,7 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
             return result
 
         # ── Étape 3 : Construire la timeline (attribuer speaker via énergie canaux) ─
-        turns = _build_turn_timeline_from_mono(mono_vad, wav_path, left_role, right_role)
+        turns = _build_turn_timeline_from_mono(mono_vad, ch0_vad, ch1_vad, left_role, right_role)
         if not turns:
             log("[STEREO] No turns → fallback Voxtral Speaker ID")
             result = diarize_with_voxtral_speaker_id(mono_path, language, max_new_tokens, with_summary, call_direction)
@@ -1856,8 +1848,7 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     segments = _enforce_max_two_speakers(segments)
     _map_roles(segments)
     segments = detect_and_fix_speaker_inversion(segments)
-    # Supprimer les annonces IVR et doublons (mono aussi)
-    segments = remove_ivr_segments(segments)
+    # Supprimer les doublons (annonces en boucle)
     segments = remove_duplicate_segments(segments)
     if not segments:
         return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée.", "diarization_mode": "voxtral_speaker_id"}
