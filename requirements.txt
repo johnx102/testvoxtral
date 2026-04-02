@@ -25,7 +25,7 @@ huggingface_hub>=0.24.0,<1.0
 # -----------------------------------------------------------------------------
 pyannote.audio==3.3.2
 lightning>=2.0.1,<3.0.0
-
+faster-whisper>=1.0.0
 # -----------------------------------------------------------------------------
 # MISTRAL / VOXTRAL - Audio transcription
 # mistral_common[audio] nécessite Python >= 3.10
