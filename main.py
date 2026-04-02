@@ -2563,15 +2563,10 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 else:
                     log(f"[HANDLER] VAD heuristic: conversation (ch0={ch0_speech_quick:.1f}s, ch1={ch1_speech_quick:.1f}s)")
             else:
-                # MONO : détection LLM classique (on ne peut pas deviner via les canaux)
-                content_type = detect_single_voice_content(mono_path, language)
-                if content_type["type"] in ("announcement", "voicemail"):
-                    log(f"[HANDLER] Detected {content_type['type']}, trying single voice mode...")
-                    out = transcribe_single_voice_content(mono_path, language, max_new_tokens, with_summary)
-                    if out is None:
-                        log("[HANDLER] Real conversation found → switching to full diarization")
-                    elif "error" not in out:
-                        return {"task": task, **out}
+                # MONO : pas de détection single voice — Voxtral Speaker ID gère tout
+                # Les répondeurs/IVR seront transcrits normalement (1 speaker = Agent)
+                # Seule la musique d'attente est skippée (hold music detection RMS en amont)
+                log("[HANDLER] Mono audio — skipping single voice detection, direct to Voxtral Speaker ID")
 
         # Cleanup mono detection
         if mono_cleanup and os.path.exists(mono_path):
