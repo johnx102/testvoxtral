@@ -2093,54 +2093,20 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         "audio_duration": est_dur,
     }
 
-    # ── Étape 6 : Summary + Sentiment combinés (1 seul appel Voxtral) ─────
-    if with_summary or ENABLE_SENTIMENT:
-        log("[STEREO] Generating summary + sentiment...")
-        ss = _generate_summary_and_sentiment(full_transcript, language, est_dur)
+    # ── Étape 6 : Summary (même fonction que mono — résultats meilleurs) ────
+    if with_summary:
+        log("[STEREO] Generating summary...")
+        result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=est_dur)
 
-        if with_summary:
-            result["summary"] = ss["summary"]
-
-        if ENABLE_SENTIMENT:
-            mood_label = ss.get("mood_label", "neutre")
-            mood_conf  = ss.get("mood_confidence", 0.75)
-
-            # Validation par keywords : si Voxtral dit "neutre" mais le transcript
-            # contient des marqueurs positifs clairs → upgrader vers "bon"
-            if mood_label == "neutre":
-                text_lower = full_transcript.lower()
-                positive_markers = ["merci", "parfait", "très bien", "super", "excellent",
-                                    "bonne journée", "bonne soirée", "bonne fin de journée",
-                                    "au revoir", "à bientôt", "c'est gentil", "je vous remercie",
-                                    "merci beaucoup", "avec plaisir", "je vous en prie",
-                                    "c'est noté", "entendu", "pas de souci", "c'est bon"]
-                negative_markers = ["pas content", "inadmissible", "problème", "plainte",
-                                    "en colère", "mécontent", "déçu", "inacceptable"]
-                pos_count = sum(1 for m in positive_markers if m in text_lower)
-                neg_count = sum(1 for m in negative_markers if m in text_lower)
-                if pos_count >= 2 and neg_count == 0:
-                    mood_label = "bon"
-                    mood_conf = 0.75
-                    log(f"[STEREO] Sentiment upgraded neutre→bon (pos={pos_count}, neg={neg_count})")
-
-            label_map = {"bon": "positive", "mauvais": "negative", "neutre": "neutral"}
-            label_en  = label_map.get(mood_label, "neutral")
-
-            # Construire les scores depuis le label
-            scores = {"negative": 0.10, "neutral": 0.10, "positive": 0.10}
-            scores[label_en] = mood_conf
-            total = sum(scores.values())
-            scores = {k: round(v / total, 2) for k, v in scores.items()}
-
-            mood_overall = {
-                "label_en": label_en,
-                "label_fr": mood_label,
-                "confidence": mood_conf,
-                "scores": scores,
-            }
+    # ── Étape 7 : Sentiment (même analyse que mono — Voxtral sur le texte) ──
+    if ENABLE_SENTIMENT:
+        log("[STEREO] Analyzing sentiment by speaker...")
+        speaker_sentiments = analyze_sentiment_by_speaker(merged)
+        if speaker_sentiments:
+            mood_overall, mood_by_speaker, client_mood = _attach_sentiment(merged, speaker_sentiments)
             result["mood_overall"]    = mood_overall
-            result["mood_by_speaker"] = {}
-            result["mood_client"]     = mood_overall
+            result["mood_by_speaker"] = mood_by_speaker
+            result["mood_client"]     = client_mood
 
     log("[STEREO] Energy-based stereo diarization completed successfully")
     return result
