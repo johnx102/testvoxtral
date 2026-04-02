@@ -1522,10 +1522,12 @@ def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
     # Méthode : analyser l'énergie sur fenêtres de 5s. Si pendant >25s consécutives
     # un seul canal a de l'énergie significative (musique d'attente / IVR sur le canal local)
     # ET l'autre canal est quasi-silencieux (patient en attente), c'est du hold.
+    # IMPORTANT : valider avec le VAD par canal — si le canal "faible" a de la parole
+    # détectée dans la zone, c'est une vraie conversation avec audio déséquilibré, pas du hold.
     hold_min_duration_start = 8.0   # seuil plus bas pour l'IVR en début d'appel
     hold_min_duration_mid = 25.0    # seuil plus haut pour le hold en milieu d'appel
     hold_check_window = 5.0   # taille des fenêtres de vérification
-    hold_ratio_threshold = 3.0  # ratio min entre canal dominant et canal faible
+    hold_ratio_threshold = 5.0  # ratio min entre canal dominant et canal faible (augmenté de 3→5)
 
     hold_regions = []
     check_pos = 0.0
@@ -1548,8 +1550,8 @@ def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
 
         # Un canal domine fortement l'autre = probable hold/IVR
         is_one_sided = (max_rms > 0 and min_rms > 0 and max_rms / min_rms > hold_ratio_threshold)
-        # Ou un canal est quasi-silencieux
-        is_one_sided = is_one_sided or (max_rms > 1e-4 and min_rms < 1e-5)
+        # Ou un canal est quasi-silencieux (seuil très bas pour éviter les faux positifs)
+        is_one_sided = is_one_sided or (max_rms > 1e-3 and min_rms < 1e-6)
 
         if is_one_sided:
             dominant = right_role if rms1 > rms0 else left_role
@@ -1579,6 +1581,42 @@ def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
         min_dur = hold_min_duration_start if hold_start == 0.0 else hold_min_duration_mid
         if duration - hold_start >= min_dur:
             hold_regions.append((hold_start, duration))
+
+    # --- Validation des hold regions avec le VAD par canal ---
+    # Si le canal "faible" a des blocs de parole VAD dans la zone hold,
+    # c'est une vraie conversation avec audio déséquilibré, PAS du hold music.
+    if hold_regions and (ch0_vad or ch1_vad):
+        validated_holds = []
+        for hs, he in hold_regions:
+            # Quel canal est "faible" dans cette zone ? Celui qui n'est PAS le dominant.
+            # Vérifier si ce canal a de la parole VAD dans la zone
+            # Calculer l'énergie moyenne pour déterminer le dominant
+            hs_f = int(hs * sr)
+            he_f = min(int(he * sr), len(ch0))
+            avg_rms0 = float(np.sqrt(np.mean(ch0[hs_f:he_f] ** 2))) if he_f > hs_f else 0
+            avg_rms1 = float(np.sqrt(np.mean(ch1[hs_f:he_f] ** 2))) if he_f > hs_f else 0
+
+            # Le canal faible = celui avec moins d'énergie
+            weak_vad = ch1_vad if avg_rms0 > avg_rms1 else ch0_vad
+
+            # Compter la parole VAD du canal faible dans cette zone
+            weak_speech_in_region = 0.0
+            for vs, ve in weak_vad:
+                ov_start = max(vs, hs)
+                ov_end = min(ve, he)
+                if ov_end > ov_start:
+                    weak_speech_in_region += ov_end - ov_start
+
+            region_dur = he - hs
+            weak_speech_ratio = weak_speech_in_region / region_dur if region_dur > 0 else 0
+
+            if weak_speech_ratio > 0.15:
+                # >15% de parole sur le canal faible → c'est une conversation, pas du hold
+                log(f"[STEREO_ENERGY] Hold region {hs:.1f}-{he:.1f}s INVALIDATED: weak channel has {weak_speech_ratio:.1%} speech (conversation with unbalanced audio)")
+            else:
+                validated_holds.append((hs, he))
+
+        hold_regions = validated_holds
 
     # Supprimer les tours qui tombent dans les hold regions
     if hold_regions:
