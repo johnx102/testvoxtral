@@ -1409,9 +1409,27 @@ def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
     if data.ndim == 1:
         return []
 
-    ch0 = data[:, 0]  # left = remote
-    ch1 = data[:, 1]  # right = local
+    ch0 = data[:, 0].copy()  # left = remote
+    ch1 = data[:, 1].copy()  # right = local
     duration = len(ch0) / sr
+
+    # --- Normalisation des canaux si déséquilibrés ---
+    # Si un canal est beaucoup plus faible (micro faible, ligne basse),
+    # on normalise les deux au même RMS moyen pour que la comparaison
+    # d'énergie par fenêtre fonctionne correctement.
+    rms_ch0_global = float(np.sqrt(np.mean(ch0 ** 2)))
+    rms_ch1_global = float(np.sqrt(np.mean(ch1 ** 2)))
+    if rms_ch0_global > 0 and rms_ch1_global > 0:
+        ratio_global = max(rms_ch0_global, rms_ch1_global) / min(rms_ch0_global, rms_ch1_global)
+        if ratio_global > 2.0:
+            # Normaliser le canal faible pour matcher le canal fort
+            target_rms = max(rms_ch0_global, rms_ch1_global)
+            if rms_ch0_global < rms_ch1_global:
+                ch0 = ch0 * (target_rms / rms_ch0_global)
+                log(f"[STEREO_ENERGY] Channel imbalance detected (ratio={ratio_global:.1f}x) — normalized ch0 (was {rms_ch0_global:.6f}, now {target_rms:.6f})")
+            else:
+                ch1 = ch1 * (target_rms / rms_ch1_global)
+                log(f"[STEREO_ENERGY] Channel imbalance detected (ratio={ratio_global:.1f}x) — normalized ch1 (was {rms_ch1_global:.6f}, now {target_rms:.6f})")
 
     # --- VAD sur mono pour trouver TOUTE la parole ---
     mono = (ch0 + ch1) / 2.0
