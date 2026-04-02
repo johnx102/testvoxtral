@@ -2060,6 +2060,7 @@ def parse_speaker_identified_transcript(transcript: str, total_duration: float) 
         text    = lines[0].strip()
         pattern = r'(Agent|Client|Secrétaire|Secretaire|Patient|Médecin|Medecin|Docteur|Praticien|Appelant|AGENT|CLIENT):\s*([^:]+?)(?=\s*(?:Agent:|Client:|Secrétaire:|Secretaire:|Patient:|Médecin:|Medecin:|Docteur:|Praticien:|Appelant:|AGENT:|CLIENT:|$))'
         matches = re.findall(pattern, text, re.IGNORECASE)
+        log(f"[PARSE] Inline mode: found {len(matches)} speaker segments")
         speaker_mapping: Dict[str, str] = {}
         speaker_counter = 0
         for speaker_raw, text_part in matches:
@@ -2115,6 +2116,7 @@ def parse_speaker_identified_transcript(transcript: str, total_duration: float) 
         end_time         = min(current_time + segment_duration, total_duration)
         segments.append({"speaker": speaker, "start": start_time, "end": end_time, "text": text, "mood": None})
         current_time = end_time
+        log(f"[PARSE] Segment {i+1}: {speaker} ({start_time:.1f}s-{end_time:.1f}s) '{text[:30]}...'")
     return merge_micro_segments(segments)
 
 def llm_verify_and_fix_attributions(segments: List[Dict[str, Any]]) -> int:
@@ -2163,6 +2165,11 @@ def detect_and_fix_speaker_inversion(segments):
     return segments
 
 def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_new_tokens: int, with_summary: bool, call_direction: str = "unknown"):
+    """
+    call_direction : "inbound"  → client appelle, agent décroche en premier
+                     "outbound" → agent appelle, client décroche en premier
+                     "unknown"  → Voxtral décide sur le contenu sémantique uniquement
+    """
     log(f"[VOXTRAL_ID] Starting speaker identification: language={language}, direction={call_direction}")
     ok, err, est_dur = _validate_audio(wav_path)
     if not ok:
@@ -2171,62 +2178,85 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
     infer_timeout  = min(int(est_dur * 0.7) + 60, 600)
     log(f"[VOXTRAL_ID] Audio: {est_dur:.1f}s → tokens={speaker_tokens}, timeout={infer_timeout}s")
     if call_direction == "inbound":
-        direction_context = ("CONTEXTE : Appel ENTRANT — le CLIENT a appelé le cabinet.\n"
-                             "L'AGENT est celui qui gère le cabinet et a répondu à cet appel.\n"
-                             "Le CLIENT est celui qui a appelé pour obtenir quelque chose.\n\n")
+        direction_context = (
+            "CONTEXTE : Appel ENTRANT — le CLIENT a appelé le cabinet.\n"
+            "L'AGENT est celui qui gère le cabinet et a répondu à cet appel.\n"
+            "Le CLIENT est celui qui a appelé pour obtenir quelque chose.\n\n"
+        )
     elif call_direction == "outbound":
-        direction_context = ("CONTEXTE : Appel SORTANT — l'AGENT a appelé le client.\n"
-                             "L'AGENT est celui qui travaille au cabinet et a passé cet appel.\n"
-                             "Le CLIENT est la personne qui a été appelée.\n\n")
+        direction_context = (
+            "CONTEXTE : Appel SORTANT — l'AGENT a appelé le client.\n"
+            "L'AGENT est celui qui travaille au cabinet et a passé cet appel.\n"
+            "Le CLIENT est la personne qui a été appelée.\n\n"
+        )
     else:
-        direction_context = ("CONTEXTE : Direction de l'appel inconnue.\n"
-                             "Identifie Agent et Client UNIQUEMENT sur ce qu'ils disent, "
-                             "pas sur l'ordre de parole.\n\n")
-    instruction = (f"lang:{language or 'fr'} "
-                   "Tu transcris un appel téléphonique professionnel. "
-                   "Il y a exactement deux interlocuteurs : l'Agent et le Client.\n\n"
-                   + direction_context +
-                   "COMMENT IDENTIFIER L'AGENT (secrétariat / cabinet / professionnel de santé) :\n"
-                   "• Nomme le cabinet ou service : 'cabinet dentaire Dupont', 'docteur Martin', 'centre médical'\n"
-                   "• Gère l'agenda : 'j'ai de la place le...', 'je vous propose le...', 'je note', 'c'est noté'\n"
-                   "• Questions pro : 'c'est de la part de qui ?', 'votre date de naissance ?', 'votre numéro ?'\n"
-                   "• Formules pro : 'ne quittez pas', 'je vais regarder', 'je vous rappelle', 'bonne journée'\n"
-                   "• Confirme : 'entendu', 'c'est bien noté', 'à lundi donc', 'rendez-vous confirmé'\n\n"
-                   "COMMENT IDENTIFIER LE CLIENT (patient / appelant / particulier) :\n"
-                   "• Expose un besoin : 'je vous appelle pour', 'je voudrais', 'j'aurais besoin', 'c'est possible ?'\n"
-                   "• Demande ou modifie un RDV : 'prendre rendez-vous', 'annuler', 'reporter', 'confirmer'\n"
-                   "• Donne ses infos personnelles : son nom, date de naissance, numéro de téléphone, adresse\n"
-                   "• Parle de proches : 'ma femme', 'mon mari', 'mon fils', 'ma fille', 'mon enfant'\n"
-                   "• Décrit un problème médical : 'j'ai mal', 'ça fait X jours', 'j'ai un souci avec'\n\n"
-                   "FORMAT OBLIGATOIRE — une ligne par prise de parole :\n"
-                   "Agent: Bonjour, cabinet dentaire Dupont, j'écoute.\n"
-                   "Client: Bonjour, je voudrais prendre rendez-vous pour un détartrage.\n"
-                   "Agent: Bien sûr, vous êtes disponible quand ?\n"
-                   "Client: La semaine prochaine si possible.\n\n"
-                   "RÈGLES STRICTES :\n"
-                   "• Identifie les rôles sur CE QUE LES GENS DISENT, pas sur l'ordre de parole\n"
-                   "• Une seule prise de parole par ligne — ne fusionne JAMAIS deux voix\n"
-                   "• Transcris MOT POUR MOT, sans paraphraser ni corriger\n"
-                   "• Conserve les hésitations : 'euh', 'bah', 'alors', 'donc'\n"
-                   "• N'écris JAMAIS [Musique] [Silence] [Attente] [Sonnerie] [Pause]")
-    conv = [{"role": "user", "content": [{"type": "audio", "path": wav_path}, {"type": "text", "text": instruction}]}]
+        direction_context = (
+            "CONTEXTE : Direction de l'appel inconnue.\n"
+            "Identifie Agent et Client UNIQUEMENT sur ce qu'ils disent, "
+            "pas sur l'ordre de parole.\n\n"
+        )
+    instruction = (
+        f"lang:{language or 'fr'} "
+        "Tu transcris un appel téléphonique professionnel. "
+        "Il y a exactement deux interlocuteurs : l'Agent et le Client.\n\n"
+        + direction_context +
+        "COMMENT IDENTIFIER L'AGENT (secrétariat / cabinet / professionnel de santé) :\n"
+        "• Nomme le cabinet ou service : 'cabinet dentaire Dupont', 'docteur Martin', 'centre médical'\n"
+        "• Gère l'agenda : 'j'ai de la place le...', 'je vous propose le...', 'je note', 'c'est noté'\n"
+        "• Questions pro : 'c'est de la part de qui ?', 'votre date de naissance ?', 'votre numéro ?'\n"
+        "• Formules pro : 'ne quittez pas', 'je vais regarder', 'je vous rappelle', 'bonne journée'\n"
+        "• Confirme : 'entendu', 'c'est bien noté', 'à lundi donc', 'rendez-vous confirmé'\n\n"
+        "COMMENT IDENTIFIER LE CLIENT (patient / appelant / particulier) :\n"
+        "• Expose un besoin : 'je vous appelle pour', 'je voudrais', 'j'aurais besoin', 'c'est possible ?'\n"
+        "• Demande ou modifie un RDV : 'prendre rendez-vous', 'annuler', 'reporter', 'confirmer'\n"
+        "• Donne ses infos personnelles : son nom, date de naissance, numéro de téléphone, adresse\n"
+        "• Parle de proches : 'ma femme', 'mon mari', 'mon fils', 'ma fille', 'mon enfant'\n"
+        "• Décrit un problème médical : 'j'ai mal', 'ça fait X jours', 'j'ai un souci avec'\n\n"
+        "FORMAT OBLIGATOIRE — une ligne par prise de parole :\n"
+        "Agent: Bonjour, cabinet dentaire Dupont, j'écoute.\n"
+        "Client: Bonjour, je voudrais prendre rendez-vous pour un détartrage.\n"
+        "Agent: Bien sûr, vous êtes disponible quand ?\n"
+        "Client: La semaine prochaine si possible.\n\n"
+        "RÈGLES STRICTES :\n"
+        "• Identifie les rôles sur CE QUE LES GENS DISENT, pas sur l'ordre de parole\n"
+        "• Une seule prise de parole par ligne — ne fusionne JAMAIS deux voix\n"
+        "• Transcris MOT POUR MOT, sans paraphraser ni corriger\n"
+        "• Conserve les hésitations : 'euh', 'bah', 'alors', 'donc'\n"
+        "• N'écris JAMAIS [Musique] [Silence] [Attente] [Sonnerie] [Pause]"
+    )
+    conv = [{"role": "user", "content": [
+        {"type": "audio", "path": wav_path},
+        {"type": "text", "text": instruction}
+    ]}]
     log("[VOXTRAL_ID] Starting transcription with speaker identification...")
-    out                = run_voxtral_with_timeout(conv, max_new_tokens=speaker_tokens, timeout=infer_timeout)
+    out = run_voxtral_with_timeout(conv, max_new_tokens=speaker_tokens, timeout=infer_timeout)
     speaker_transcript = (out.get("text") or "").strip()
     if not speaker_transcript:
+        log("[VOXTRAL_ID] Empty result, returning empty")
         return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée."}
+    original_len       = len(speaker_transcript)
     speaker_transcript = remove_repetitive_loops(speaker_transcript, max_repetitions=5)
     chars_per_sec      = len(speaker_transcript) / max(est_dur, 1)
     if chars_per_sec > 50:
         log(f"[VOXTRAL_ID] WARNING: Suspicious chars/sec ratio: {chars_per_sec:.1f}")
+    if original_len != len(speaker_transcript):
+        log(f"[VOXTRAL_ID] Cleaned repetitive loops: {original_len} → {len(speaker_transcript)} chars")
     speaker_transcript = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]\s*', '', speaker_transcript, flags=re.IGNORECASE).strip()
     log(f"[VOXTRAL_ID] Completed: {len(speaker_transcript)} chars in {out.get('latency_s', 0):.1f}s")
+    log(f"[VOXTRAL_ID] Raw (first 500): {speaker_transcript[:500]}")
     if len(speaker_transcript) < 10:
-        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée."}
+        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée (musique/silence uniquement)."}
     segments = parse_speaker_identified_transcript(speaker_transcript, est_dur)
     if not segments:
-        forced       = (f"lang:{language or 'fr'} Tu DOIS séparer les speakers. Reformate ce transcript:\n\n"
-                        f"{speaker_transcript}\n\nAgent: [sa phrase]\nClient: [sa phrase]\n...")
+        log("[VOXTRAL_ID] No speaker format found, retrying with forced prompt...")
+        forced = (
+            f"lang:{language or 'fr'} "
+            "Tu DOIS séparer les speakers. Voici le transcript brut, reformate-le:\n\n"
+            f"{speaker_transcript}\n\n"
+            "REFORMATE en séparant OBLIGATOIREMENT Agent et Client:\n"
+            "Agent: [sa phrase]\nClient: [sa phrase]\n...\n"
+            "L'Agent répond/travaille. Le Client appelle/demande."
+        )
         retry_tokens = min(max_new_tokens, int(len(speaker_transcript) * 1.5))
         out_retry    = run_voxtral_with_timeout([{"role": "user", "content": [{"type": "text", "text": forced}]}],
                                                 max_new_tokens=retry_tokens, timeout=60)
@@ -2235,25 +2265,33 @@ def diarize_with_voxtral_speaker_id(wav_path: str, language: Optional[str], max_
             segments = parse_speaker_identified_transcript(retry_transcript, est_dur)
         if not segments:
             segments = [{"speaker": "Agent", "start": 0.0, "end": est_dur, "text": speaker_transcript.strip(), "mood": None}]
+    log(f"[VOXTRAL_ID] Parsed {len(segments)} segments")
     segments = _enforce_max_two_speakers(segments)
     _map_roles(segments)
     segments = detect_and_fix_speaker_inversion(segments)
-    # Supprimer les doublons (annonces en boucle)
-    segments = remove_duplicate_segments(segments)
-    if not segments:
-        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée.", "diarization_mode": "voxtral_speaker_id"}
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments if s.get("text"))
-    result          = {"segments": segments, "transcript": full_transcript, "diarization_mode": "voxtral_speaker_id"}
+    result = {"segments": segments, "transcript": full_transcript, "diarization_mode": "voxtral_speaker_id"}
     if with_summary:
+        log("[VOXTRAL_ID] Generating summary...")
         result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=est_dur)
     if ENABLE_SENTIMENT:
+        log("[VOXTRAL_ID] Computing sentiment by speaker...")
         speaker_sentiments = analyze_sentiment_by_speaker(segments)
         if speaker_sentiments:
-            mood_overall, mood_by_speaker, client_mood = _attach_sentiment(segments, speaker_sentiments)
-            result["mood_overall"]    = mood_overall
-            result["mood_by_speaker"] = mood_by_speaker
+            for seg in segments:
+                sp = seg.get("speaker")
+                if sp and sp in speaker_sentiments:
+                    seg["mood"] = speaker_sentiments[sp]
+            weighted = [(seg["mood"], float(seg["end"]) - float(seg["start"]))
+                        for seg in segments if seg.get("text") and seg.get("mood")]
+            result["mood_overall"]    = aggregate_mood(weighted) if weighted else None
+            result["mood_by_speaker"] = speaker_sentiments
+            client_mood               = get_client_sentiment(speaker_sentiments, segments)
             result["mood_client"]     = client_mood
-    log("[VOXTRAL_ID] Completed successfully")
+            label_fr = client_mood.get("label_fr") or "inconnu"
+            conf     = float(client_mood.get("confidence") or 0.0)
+            log(f"[VOXTRAL_ID] Client sentiment: {label_fr} (confidence: {conf:.2f})")
+    log("[VOXTRAL_ID] Voxtral speaker identification completed successfully")
     return result
 
 # =============================================================================
