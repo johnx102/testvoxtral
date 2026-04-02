@@ -828,14 +828,32 @@ def transcribe_single_voice_content(wav_path: str, language: Optional[str], max_
     ok, err, est_dur = _validate_audio(wav_path)
     if not ok:
         return {"error": err}
+    # Limiter les tokens à la durée réelle (single voice = court, pas besoin de 2500 tokens)
+    sv_tokens = max(64, min(int(est_dur * 8), 512))
+    sv_timeout = min(int(est_dur * 0.7) + 30, 120)
+    log(f"[SINGLE_VOICE] Transcribing: {est_dur:.1f}s → tokens={sv_tokens}, timeout={sv_timeout}s")
     conv = [{"role": "user", "content": [
         {"type": "audio", "path": wav_path},
         {"type": "text", "text": f"lang:{language or 'fr'} [TRANSCRIBE] Écris exactement ce qui est dit, mot pour mot."}
     ]}]
-    out       = run_voxtral_with_timeout(conv, max_new_tokens=max_new_tokens, timeout=60)
+    out       = run_voxtral_with_timeout(conv, max_new_tokens=sv_tokens, timeout=sv_timeout)
     full_text = (out.get("text") or "").strip()
     if not full_text:
         return {"error": "Empty transcription for single voice content"}
+
+    # Nettoyage anti-hallucination
+    full_text = remove_repetitive_loops(full_text, max_repetitions=3)
+    full_text = re.sub(r'(\.\s*){5,}', '', full_text).strip()
+    full_text = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]\s*', '', full_text, flags=re.IGNORECASE).strip()
+    if not full_text or len(full_text.split()) < 3:
+        log("[SINGLE_VOICE] Empty after cleanup — likely silence/music")
+        return {
+            "segments": [], "transcript": "",
+            "summary": "Aucune conversation détectée - silence ou musique d'attente.",
+            "hold_music_detected": True,
+            "mood_overall": {"label_en": "neutral", "label_fr": "neutre", "confidence": 0.95,
+                             "scores": {"negative": 0.0, "neutral": 0.95, "positive": 0.05}},
+        }
 
     # ── Détection d'une vraie conversation dans le transcript ────────────────
     # Cas typique : appel sortant → répondeur → puis la personne rappelle ou décroche
