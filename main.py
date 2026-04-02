@@ -1476,8 +1476,27 @@ def _transcribe_turn_whisper(audio_path: str, language: str = "fr") -> str:
             if text:
                 texts.append(text)
         result = " ".join(texts).strip()
-        # Nettoyage basique
-        result = re.sub(r'\[.*?\]', '', result).strip()  # [Musique], [Silence], etc.
+
+        # Nettoyage : tags [Musique], [Silence], etc.
+        result = re.sub(r'\[.*?\]', '', result).strip()
+
+        # Filtre hallucinations connues de Whisper (sous-titres, crédits vidéo)
+        # Ces phrases apparaissent quand Whisper reçoit du silence ou audio très faible
+        WHISPER_HALLUCINATIONS = [
+            "sous-titrage", "sous-titres", "sous titrage", "sous titres",
+            "st'", "st '", "amara.org", "amara org",
+            "merci d'avoir regardé", "merci d'avoir écouté",
+            "abonnez-vous", "likez", "partagez",
+            "cette vidéo", "la prochaine vidéo", "la prochaine fois",
+            "copyright", "tous droits réservés",
+            "www.", "http", ".com", ".fr", ".org",
+            "musique de", "générique",
+        ]
+        result_lower = result.lower()
+        if any(h in result_lower for h in WHISPER_HALLUCINATIONS):
+            log(f"[WHISPER] Hallucination filtered: '{result[:60]}'")
+            return ""
+
         return result
     except Exception as e:
         log(f"[WHISPER] Transcription error: {e}")
