@@ -70,6 +70,13 @@ WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 # Fallback automatique vers Voxtral Speaker ID si audio mono
 STEREO_DIARIZATION = os.environ.get("STEREO_DIARIZATION", "1") == "1"
 
+# Whisper pour la transcription stéréo (plus fiable que Voxtral pour la transcription pure)
+# Voxtral reste utilisé pour : résumé, sentiment, fallback mono (Speaker ID)
+USE_WHISPER_STEREO = os.environ.get("USE_WHISPER_STEREO", "0") == "1"
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v3")
+WHISPER_DEVICE     = os.environ.get("WHISPER_DEVICE", "cuda")
+WHISPER_COMPUTE    = os.environ.get("WHISPER_COMPUTE", "float16")
+
 # Sentiment
 ENABLE_SENTIMENT = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
 
@@ -1415,6 +1422,68 @@ def _build_turn_timeline_from_channels(ch0_vad: List[Tuple[float, float]],
     return split
 
 
+# =============================================================================
+# WHISPER — Transcription rapide et fiable (optionnel, stéréo uniquement)
+# =============================================================================
+_whisper_model = None
+
+def _load_whisper():
+    """Charge le modèle FasterWhisper (lazy loading, 1 seule fois)."""
+    global _whisper_model
+    if _whisper_model is not None:
+        return _whisper_model
+    try:
+        from faster_whisper import WhisperModel
+        log(f"[WHISPER] Loading model: {WHISPER_MODEL_SIZE} (device={WHISPER_DEVICE}, compute={WHISPER_COMPUTE})")
+        _whisper_model = WhisperModel(
+            WHISPER_MODEL_SIZE,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE,
+        )
+        log("[WHISPER] Model loaded successfully")
+        return _whisper_model
+    except ImportError:
+        log("[WHISPER] ERROR: faster-whisper not installed. Run: pip install faster-whisper")
+        return None
+    except Exception as e:
+        log(f"[WHISPER] ERROR loading model: {e}")
+        return None
+
+
+def _transcribe_turn_whisper(audio_path: str, language: str = "fr") -> str:
+    """
+    Transcrit un segment audio avec FasterWhisper.
+    Plus rapide et fiable que Voxtral pour la transcription pure.
+    Retourne le texte brut (pas de speaker labels).
+    """
+    model = _load_whisper()
+    if model is None:
+        return ""
+    try:
+        segments, info = model.transcribe(
+            audio_path,
+            language=language or "fr",
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters=dict(
+                min_silence_duration_ms=300,
+                speech_pad_ms=200,
+            ),
+        )
+        texts = []
+        for segment in segments:
+            text = segment.text.strip()
+            if text:
+                texts.append(text)
+        result = " ".join(texts).strip()
+        # Nettoyage basique
+        result = re.sub(r'\[.*?\]', '', result).strip()  # [Musique], [Silence], etc.
+        return result
+    except Exception as e:
+        log(f"[WHISPER] Transcription error: {e}")
+        return ""
+
+
 def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
                             window_ms: int = 500, merge_gap_s: float = 2.5) -> List[Dict[str, Any]]:
     """
@@ -1954,7 +2023,10 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
             continue
 
         try:
-            text = _transcribe_turn(turn_audio, language, batch_end_t - batch_start_t, from_channel=True)
+            if USE_WHISPER_STEREO:
+                text = _transcribe_turn_whisper(turn_audio, language or "fr")
+            else:
+                text = _transcribe_turn(turn_audio, language, batch_end_t - batch_start_t, from_channel=True)
         finally:
             if os.path.exists(turn_audio):
                 os.remove(turn_audio)
@@ -2017,7 +2089,7 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     result = {
         "segments": merged,
         "transcript": full_transcript,
-        "diarization_mode": "stereo_energy",
+        "diarization_mode": "stereo_energy_whisper" if USE_WHISPER_STEREO else "stereo_energy",
         "audio_duration": est_dur,
     }
 
@@ -2568,6 +2640,10 @@ try:
     log(f"[INIT] Single voice detection: {'ENABLED' if ENABLE_SINGLE_VOICE_DETECTION else 'DISABLED'}")
     log(f"[INIT] Sentiment analysis: {'ENABLED' if ENABLE_SENTIMENT else 'DISABLED'}")
     log(f"[INIT] Stereo diarization: {'ENABLED' if STEREO_DIARIZATION else 'DISABLED (Voxtral Speaker ID)'}")
+    log(f"[INIT] Whisper stereo transcription: {'ENABLED (' + WHISPER_MODEL_SIZE + ')' if USE_WHISPER_STEREO else 'DISABLED (using Voxtral)'}")
+    if USE_WHISPER_STEREO:
+        log("[INIT] Preloading Whisper...")
+        _load_whisper()
     log(f"[INIT] LLM review (DETECT_GLOBAL_SWAP): {'ENABLED' if DETECT_GLOBAL_SWAP else 'DISABLED'}")
 except Exception as e:
     log(f"[WARN] Preload failed — will load on first request: {e}")
