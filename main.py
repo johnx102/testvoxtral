@@ -2036,8 +2036,20 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         batch_start_t = turn["start"]
         batch_end_t = turns[batch_end]["end"]
         batch_count = batch_end - i + 1
+        actual_dur = batch_end_t - batch_start_t
 
-        turn_audio = _extract_turn_audio_channel(wav_path, batch_start_t, batch_end_t, channel)
+        # Padding pour les tours courts : extraire avec contexte audio autour
+        # pour donner plus de matière à Voxtral (un "oui" de 0.5s dans 2.5s de contexte)
+        MIN_EXTRACT_DURATION = 2.5  # durée minimum d'extraction en secondes
+        if actual_dur < MIN_EXTRACT_DURATION:
+            padding = (MIN_EXTRACT_DURATION - actual_dur) / 2.0
+            extract_start = max(0, batch_start_t - padding)
+            extract_end = batch_end_t + padding
+        else:
+            extract_start = batch_start_t
+            extract_end = batch_end_t
+
+        turn_audio = _extract_turn_audio_channel(wav_path, extract_start, extract_end, channel)
         if not turn_audio:
             i = batch_end + 1
             continue
