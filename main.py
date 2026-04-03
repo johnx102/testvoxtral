@@ -1464,11 +1464,7 @@ def _transcribe_turn_whisper(audio_path: str, language: str = "fr") -> str:
             audio_path,
             language=language or "fr",
             beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(
-                min_silence_duration_ms=300,
-                speech_pad_ms=200,
-            ),
+            vad_filter=False,  # Pas de VAD Whisper — notre pipeline gère déjà le découpage
         )
         texts = []
         for segment in segments:
@@ -1482,18 +1478,23 @@ def _transcribe_turn_whisper(audio_path: str, language: str = "fr") -> str:
 
         # Filtre hallucinations connues de Whisper (sous-titres, crédits vidéo)
         # Ces phrases apparaissent quand Whisper reçoit du silence ou audio très faible
+        # Filtre hallucinations Whisper : uniquement les phrases EXACTES connues
+        # (pas de mots isolés qui risquent de matcher du vrai contenu)
         WHISPER_HALLUCINATIONS = [
-            "sous-titrage", "sous-titres", "sous titrage", "sous titres",
-            "st'", "st '", "amara.org", "amara org",
-            "merci d'avoir regardé", "merci d'avoir écouté",
-            "abonnez-vous", "likez", "partagez",
-            "cette vidéo", "la prochaine vidéo", "la prochaine fois",
-            "copyright", "tous droits réservés",
-            "www.", "http", ".com", ".fr", ".org",
-            "musique de", "générique",
+            "sous-titrage st'",
+            "sous-titres réalisés par",
+            "sous titres réalisés par",
+            "sous-titrage société",
+            "amara.org",
+            "merci d'avoir regardé",
+            "merci d'avoir écouté cette vidéo",
+            "abonnez-vous à la chaîne",
+            "n'oubliez pas de vous abonner",
         ]
         result_lower = result.lower()
-        if any(h in result_lower for h in WHISPER_HALLUCINATIONS):
+        # Ne filtrer que si le texte est COURT (< 30 mots) et matche une hallucination
+        # Les longs textes avec un faux positif ne doivent pas être supprimés
+        if len(result.split()) < 30 and any(h in result_lower for h in WHISPER_HALLUCINATIONS):
             log(f"[WHISPER] Hallucination filtered: '{result[:60]}'")
             return ""
 
