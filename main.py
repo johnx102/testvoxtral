@@ -1911,11 +1911,14 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     channel_map = {left_role: 0, right_role: 1}
     segments = []
 
-    # Réponses courtes légitimes (pas des hallucinations)
-    LEGIT_SHORT = {"oui", "non", "ok", "d'accord", "merci", "bonjour", "au revoir", "allô",
-                   "pardon", "voilà", "exactement", "parfait", "entendu", "bien sûr",
-                   "c'est ça", "bonne journée", "bonne soirée", "je vous en prie",
-                   "pas de souci", "ah", "euh", "bah", "hein", "ouais", "mm-hmm"}
+    # Textes qui sont clairement des hallucinations (prompt echo, exemples, artefacts)
+    HALLUCINATION_PATTERNS = [
+        "[transcribe]", "transcris uniquement", "voix principale",
+        "ignore les voix", "ignore les annonces",
+        "conserve les hésitations", "n'invente rien",
+        "cabinet dentaire dupont",  # exemple du prompt mono
+        "rendez-vous pour un détartrage",  # exemple du prompt mono
+    ]
 
     i = 0
     while i < len(turns):
@@ -1938,11 +1941,10 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         batch_count = batch_end - i + 1
         actual_dur = batch_end_t - batch_start_t
 
-        # Padding pour les tours courts : extraire avec contexte audio autour
-        # pour donner plus de matière à Voxtral (un "oui" de 0.5s dans 2.5s de contexte)
-        MIN_EXTRACT_DURATION = 2.5  # durée minimum d'extraction en secondes
-        if actual_dur < MIN_EXTRACT_DURATION:
-            padding = (MIN_EXTRACT_DURATION - actual_dur) / 2.0
+        # Padding léger pour les tours courts (max 0.5s de chaque côté)
+        # Trop de padding = Voxtral reçoit du silence et hallucine/répète le prompt
+        if actual_dur < 2.0:
+            padding = min(0.5, (2.0 - actual_dur) / 2.0)
             extract_start = max(0, batch_start_t - padding)
             extract_end = batch_end_t + padding
         else:
@@ -1964,16 +1966,11 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
                 os.remove(turn_audio)
 
         if text and len(text.split()) >= 1:
-            # --- Filtre hallucinations courtes ---
-            turn_dur = batch_end_t - batch_start_t
-            words = text.split()
-            is_hallucination = False
-            if turn_dur < 1.5 and len(words) <= 3:
-                # Vérifier si c'est une réponse courte légitime
-                text_lower = text.lower().strip().rstrip('.!?,;:')
-                if not any(legit in text_lower for legit in LEGIT_SHORT):
-                    is_hallucination = True
-                    log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {batch_start_t:.1f}-{batch_end_t:.1f}s): hallucination '{text}', skipped")
+            # --- Filtre : uniquement les hallucinations de prompt (echo/exemple) ---
+            text_lower = text.lower()
+            is_hallucination = any(p in text_lower for p in HALLUCINATION_PATTERNS)
+            if is_hallucination:
+                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {batch_start_t:.1f}-{batch_end_t:.1f}s): prompt echo '{text[:50]}', skipped")
 
             if not is_hallucination:
                 segments.append({
