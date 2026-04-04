@@ -1654,105 +1654,22 @@ def _build_turns_by_energy(wav_path: str, left_role: str, right_role: str,
     # --- Filtrer segments < 0.5s (bruit/artefact — pas assez pour Voxtral) ---
     merged = [t for t in merged if t["end"] - t["start"] >= 0.5]
 
-    # --- Passe 4 : Détecter et supprimer les mises en attente mid-call ---
-    # Méthode : analyser l'énergie sur fenêtres de 5s. Si pendant >25s consécutives
-    # un seul canal a de l'énergie significative (musique d'attente / IVR sur le canal local)
-    # ET l'autre canal est quasi-silencieux (patient en attente), c'est du hold.
-    # IMPORTANT : valider avec le VAD par canal — si le canal "faible" a de la parole
-    # détectée dans la zone, c'est une vraie conversation avec audio déséquilibré, pas du hold.
-    hold_min_duration_start = 8.0   # seuil plus bas pour l'IVR en début d'appel
-    hold_min_duration_mid = 25.0    # seuil plus haut pour le hold en milieu d'appel
-    hold_check_window = 5.0   # taille des fenêtres de vérification
-    hold_ratio_threshold = 5.0  # ratio min entre canal dominant et canal faible (augmenté de 3→5)
-
+    # --- Passe 4 : Supprimer les tours dans les gaps du VAD mono ---
+    # Le VAD mono détecte TOUTE la parole (les 2 speakers mixés).
+    # Les zones SANS parole mono = silence pur ou musique d'attente → supprimer les tours.
+    # C'est la méthode la plus fiable : pas de ratio d'énergie, pas de faux positifs.
     hold_regions = []
-    check_pos = 0.0
-    hold_start = None
-    hold_dominant = None
-
-    while check_pos < duration:
-        check_end = min(check_pos + hold_check_window, duration)
-        s_f = int(check_pos * sr)
-        e_f = min(int(check_end * sr), len(ch0))
-
-        if e_f - s_f < sr * 0.5:  # fenêtre trop courte
-            check_pos = check_end
-            continue
-
-        rms0 = float(np.sqrt(np.mean(ch0[s_f:e_f] ** 2)))
-        rms1 = float(np.sqrt(np.mean(ch1[s_f:e_f] ** 2)))
-        max_rms = max(rms0, rms1)
-        min_rms = min(rms0, rms1)
-
-        # Un canal domine fortement l'autre = probable hold/IVR
-        is_one_sided = (max_rms > 0 and min_rms > 0 and max_rms / min_rms > hold_ratio_threshold)
-        # Ou un canal est quasi-silencieux (seuil très bas pour éviter les faux positifs)
-        is_one_sided = is_one_sided or (max_rms > 1e-3 and min_rms < 1e-6)
-
-        if is_one_sided:
-            dominant = right_role if rms1 > rms0 else left_role
-            if hold_start is None:
-                hold_start = check_pos
-                hold_dominant = dominant
-            elif dominant != hold_dominant:
-                # Changement de canal dominant → pas du hold continu
-                min_dur = hold_min_duration_start if hold_start == 0.0 else hold_min_duration_mid
-                if check_pos - hold_start >= min_dur:
-                    hold_regions.append((hold_start, check_pos))
-                hold_start = check_pos
-                hold_dominant = dominant
-        else:
-            # Les deux canaux sont actifs → conversation normale
-            if hold_start is not None:
-                min_dur = hold_min_duration_start if hold_start == 0.0 else hold_min_duration_mid
-                if check_pos - hold_start >= min_dur:
-                    hold_regions.append((hold_start, check_pos))
-            hold_start = None
-            hold_dominant = None
-
-        check_pos = check_end
-
-    # Fermer le dernier hold si en cours
-    if hold_start is not None:
-        min_dur = hold_min_duration_start if hold_start == 0.0 else hold_min_duration_mid
-        if duration - hold_start >= min_dur:
-            hold_regions.append((hold_start, duration))
-
-    # --- Validation des hold regions avec le VAD par canal ---
-    # Si le canal "faible" a des blocs de parole VAD dans la zone hold,
-    # c'est une vraie conversation avec audio déséquilibré, PAS du hold music.
-    if hold_regions and (ch0_vad or ch1_vad):
-        validated_holds = []
-        for hs, he in hold_regions:
-            # Quel canal est "faible" dans cette zone ? Celui qui n'est PAS le dominant.
-            # Vérifier si ce canal a de la parole VAD dans la zone
-            # Calculer l'énergie moyenne pour déterminer le dominant
-            hs_f = int(hs * sr)
-            he_f = min(int(he * sr), len(ch0))
-            avg_rms0 = float(np.sqrt(np.mean(ch0[hs_f:he_f] ** 2))) if he_f > hs_f else 0
-            avg_rms1 = float(np.sqrt(np.mean(ch1[hs_f:he_f] ** 2))) if he_f > hs_f else 0
-
-            # Le canal faible = celui avec moins d'énergie
-            weak_vad = ch1_vad if avg_rms0 > avg_rms1 else ch0_vad
-
-            # Compter la parole VAD du canal faible dans cette zone
-            weak_speech_in_region = 0.0
-            for vs, ve in weak_vad:
-                ov_start = max(vs, hs)
-                ov_end = min(ve, he)
-                if ov_end > ov_start:
-                    weak_speech_in_region += ov_end - ov_start
-
-            region_dur = he - hs
-            weak_speech_ratio = weak_speech_in_region / region_dur if region_dur > 0 else 0
-
-            if weak_speech_ratio > 0.15:
-                # >15% de parole sur le canal faible → c'est une conversation, pas du hold
-                log(f"[STEREO_ENERGY] Hold region {hs:.1f}-{he:.1f}s INVALIDATED: weak channel has {weak_speech_ratio:.1%} speech (conversation with unbalanced audio)")
-            else:
-                validated_holds.append((hs, he))
-
-        hold_regions = validated_holds
+    if len(vad_blocks) >= 2:
+        # Les gaps entre les blocs VAD mono = zones sans parole
+        for j in range(len(vad_blocks) - 1):
+            gap_start = vad_blocks[j][1]
+            gap_end = vad_blocks[j + 1][0]
+            gap_dur = gap_end - gap_start
+            if gap_dur >= 10.0:  # gap de 10s+ = probable musique/silence
+                hold_regions.append((gap_start, gap_end))
+    # Gap au début (avant le premier bloc VAD)
+    if vad_blocks and vad_blocks[0][0] > 5.0:
+        hold_regions.insert(0, (0.0, vad_blocks[0][0]))
 
     # Supprimer les tours qui tombent dans les hold regions
     if hold_regions:
@@ -1985,17 +1902,10 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     log(f"[STEREO] Timeline: {len(turns)} turns ({turn_counts})")
 
     # ── Étape 3 : Transcrire chaque tour depuis SON CANAL ─────────────────
-    # Avec filtre crosstalk + batching tours courts consécutifs même speaker
-    import soundfile as sf
-    import numpy as np
-    stereo_data, stereo_sr = sf.read(wav_path, dtype="float32")
-    ch0_data = stereo_data[:, 0] if stereo_data.ndim > 1 else stereo_data
-    ch1_data = stereo_data[:, 1] if stereo_data.ndim > 1 else stereo_data
-
+    # Chaque canal contient UN speaker — on transcrit toujours, sans filtrer.
+    # Le VAD mono a déjà validé qu'il y a de la parole dans ces régions.
     channel_map = {left_role: 0, right_role: 1}
-    crosstalk_threshold = 1.3  # ratio min speaker_ch/other_ch pour transcrire
     segments = []
-    skipped_crosstalk = 0
 
     # Réponses courtes légitimes (pas des hallucinations)
     LEGIT_SHORT = {"oui", "non", "ok", "d'accord", "merci", "bonjour", "au revoir", "allô",
@@ -2003,25 +1913,11 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
                    "c'est ça", "bonne journée", "bonne soirée", "je vous en prie",
                    "pas de souci", "ah", "euh", "bah", "hein", "ouais", "mm-hmm"}
 
-    # Grouper les tours pour batching : tours consécutifs du même speaker < 2s → un seul appel
     i = 0
     while i < len(turns):
         turn = turns[i]
         speaker = turn["speaker"]
         channel = channel_map.get(speaker, 0)
-        other_ch = 1 - channel
-
-        # --- Filtre crosstalk : vérifier que le canal du speaker domine ---
-        s_f = int(turn["start"] * stereo_sr)
-        e_f = min(int(turn["end"] * stereo_sr), len(ch0_data))
-        if e_f > s_f:
-            rms_speaker = float(np.sqrt(np.mean((ch0_data if channel == 0 else ch1_data)[s_f:e_f] ** 2)))
-            rms_other   = float(np.sqrt(np.mean((ch1_data if channel == 0 else ch0_data)[s_f:e_f] ** 2)))
-            if rms_other > 0 and rms_speaker / rms_other < crosstalk_threshold:
-                skipped_crosstalk += 1
-                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): crosstalk (ratio={rms_speaker/rms_other:.2f}), skipped")
-                i += 1
-                continue
 
         # --- Batching : regrouper tours courts consécutifs du même speaker ---
         batch_end = i
@@ -2089,9 +1985,6 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
             log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty, skipped")
 
         i = batch_end + 1
-
-    if skipped_crosstalk > 0:
-        log(f"[STEREO] Skipped {skipped_crosstalk} turns due to crosstalk")
 
     if not segments:
         log("[STEREO] All turns empty → fallback Voxtral Speaker ID")
