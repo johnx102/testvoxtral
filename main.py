@@ -1765,12 +1765,16 @@ def _transcribe_turn(turn_audio_path: str, language: Optional[str], duration: fl
         instruction = (f"lang:{language or 'fr'} "
                        "[TRANSCRIBE] Transcris UNIQUEMENT la voix principale (la plus forte). "
                        "Ignore les voix en arrière-plan ou les échos. "
+                       "Ignore les annonces d'attente, musique d'attente et messages IVR automatiques. "
                        "Conserve les hésitations (euh, bah, alors). "
+                       "Si tu n'entends que du silence ou de la musique, retourne une chaîne vide. "
                        "N'invente rien. N'écris JAMAIS [Musique] [Silence] [Attente].")
     else:
         instruction = (f"lang:{language or 'fr'} "
                        "[TRANSCRIBE] Transcris exactement ce qui est dit, mot pour mot. "
+                       "Ignore les annonces d'attente, musique d'attente et messages IVR automatiques. "
                        "Conserve les hésitations (euh, bah, alors). "
+                       "Si tu n'entends que du silence ou de la musique, retourne une chaîne vide. "
                        "N'invente rien. N'écris JAMAIS [Musique] [Silence] [Attente].")
     conv = [{"role": "user", "content": [
         {"type": "audio", "path": turn_audio_path},
