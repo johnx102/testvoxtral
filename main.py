@@ -73,7 +73,7 @@ STEREO_DIARIZATION = os.environ.get("STEREO_DIARIZATION", "1") == "1"
 # Whisper pour la transcription stéréo (plus fiable que Voxtral pour la transcription pure)
 # Voxtral reste utilisé pour : résumé, sentiment, fallback mono (Speaker ID)
 USE_WHISPER_STEREO = os.environ.get("USE_WHISPER_STEREO", "0") == "1"
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v3")
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v2")
 WHISPER_DEVICE     = os.environ.get("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE    = os.environ.get("WHISPER_COMPUTE", "float16")
 
@@ -1974,52 +1974,6 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
             return result
 
         log(f"[STEREO] Whisper: {len(segments)} segments total ({len(client_segs)} Client, {len(agent_segs)} Agent)")
-
-        # ── Correction Voxtral text-only : fixer les erreurs de mots ────
-        # Whisper a le bon timing mais parfois des mots faux sur l'audio téléphonique.
-        # Voxtral corrige le texte sans toucher aux timestamps ni à la structure.
-        raw_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments)
-        correction_prompt = (
-            f"lang:{language or 'fr'} "
-            "Voici la transcription d'un appel téléphonique professionnel.\n"
-            "Corrige UNIQUEMENT les erreurs évidentes de reconnaissance vocale.\n"
-            "Détermine le contexte métier à partir de la conversation et corrige les termes techniques mal reconnus.\n\n"
-            "RÈGLES STRICTES :\n"
-            "• Garde la MÊME structure Agent:/Client: ligne par ligne\n"
-            "• Ne change PAS l'ordre des répliques\n"
-            "• Ne supprime et n'ajoute AUCUNE réplique\n"
-            "• Corrige uniquement les mots visiblement mal reconnus\n"
-            "• Si un mot te semble correct, ne le change pas\n\n"
-            f"Transcription à corriger :\n{raw_transcript}\n\n"
-            "Transcription corrigée :"
-        )
-        try:
-            correction_tokens = min(int(len(raw_transcript) * 1.2), 6000)
-            log(f"[STEREO] Voxtral text correction: sending {len(raw_transcript)} chars...")
-            correction_result = run_voxtral_with_timeout(
-                [{"role": "user", "content": [{"type": "text", "text": correction_prompt}]}],
-                max_new_tokens=correction_tokens, timeout=60
-            )
-            corrected_text = (correction_result.get("text") or "").strip()
-
-            if corrected_text and len(corrected_text) > len(raw_transcript) * 0.5:
-                # Parser le texte corrigé et mettre à jour les segments
-                corrected_lines = [l.strip() for l in corrected_text.split('\n') if l.strip() and ':' in l]
-                if len(corrected_lines) == len(segments):
-                    # Même nombre de lignes = on peut mapper 1:1
-                    for idx, line in enumerate(corrected_lines):
-                        parts = line.split(':', 1)
-                        if len(parts) == 2:
-                            new_text = parts[1].strip()
-                            if new_text:
-                                segments[idx]["text"] = new_text
-                    log(f"[STEREO] Text correction applied: {len(corrected_lines)} lines corrected")
-                else:
-                    log(f"[STEREO] Text correction: line count mismatch ({len(corrected_lines)} vs {len(segments)}), skipping")
-            else:
-                log(f"[STEREO] Text correction: response too short, skipping")
-        except Exception as e_corr:
-            log(f"[STEREO] Text correction failed: {e_corr}, keeping Whisper text")
 
     else:
         # ── MODE VOXTRAL : transcription par canal entier ────
