@@ -73,7 +73,7 @@ STEREO_DIARIZATION = os.environ.get("STEREO_DIARIZATION", "1") == "1"
 # Whisper pour la transcription stéréo (plus fiable que Voxtral pour la transcription pure)
 # Voxtral reste utilisé pour : résumé, sentiment, fallback mono (Speaker ID)
 USE_WHISPER_STEREO = os.environ.get("USE_WHISPER_STEREO", "0") == "1"
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v3-turbo")
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v2")
 WHISPER_DEVICE     = os.environ.get("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE    = os.environ.get("WHISPER_COMPUTE", "float16")
 
