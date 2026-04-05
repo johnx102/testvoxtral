@@ -52,8 +52,8 @@ WHISPER_DEVICE     = os.environ.get("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE    = os.environ.get("WHISPER_COMPUTE", "float16")
 
 # Mistral Small 3.1 (texte only — résumé, sentiment, correction)
-LLM_MODEL_ID       = os.environ.get("LLM_MODEL_ID", "mistralai/Mistral-Small-3.1-24B-Instruct-2503").strip()
-QUANT_MODE         = os.environ.get("QUANT_MODE", "torchao").lower()
+LLM_MODEL_ID       = os.environ.get("LLM_MODEL_ID", "mistralai/Mistral-Nemo-Instruct-2407").strip()
+QUANT_MODE         = os.environ.get("QUANT_MODE", "bnb8").lower()
 
 # Sentiment
 ENABLE_SENTIMENT   = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
@@ -226,7 +226,14 @@ def _load_llm():
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
 
-    if QUANT_MODE in ("torchao", "bnb4") and torch.cuda.is_available():
+    if QUANT_MODE in ("bnb8", "int8") and torch.cuda.is_available():
+        try:
+            from transformers import BitsAndBytesConfig
+            mdl_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            log("[LLM] INT8 BnB config ready")
+        except ImportError:
+            mdl_kwargs["torch_dtype"] = torch.bfloat16
+    elif QUANT_MODE in ("torchao", "bnb4") and torch.cuda.is_available():
         try:
             from transformers import BitsAndBytesConfig
             mdl_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -239,14 +246,7 @@ def _load_llm():
     else:
         mdl_kwargs["torch_dtype"] = torch.bfloat16
 
-    # Mistral Small 3.1 utilise Mistral3ForConditionalGeneration (modèle multimodal)
-    try:
-        from transformers import Mistral3ForConditionalGeneration
-        _llm_model = Mistral3ForConditionalGeneration.from_pretrained(LLM_MODEL_ID, **mdl_kwargs)
-        log("[LLM] Loaded with Mistral3ForConditionalGeneration")
-    except (ImportError, Exception) as e:
-        log(f"[LLM] Mistral3 class not available ({e}), trying AutoModelForCausalLM...")
-        _llm_model = AutoModelForCausalLM.from_pretrained(LLM_MODEL_ID, **mdl_kwargs)
+    _llm_model = AutoModelForCausalLM.from_pretrained(LLM_MODEL_ID, **mdl_kwargs)
     log("[LLM] Model loaded successfully")
     return _llm_tokenizer, _llm_model
 
@@ -255,8 +255,8 @@ def run_llm(prompt: str, max_new_tokens: int = 256) -> str:
     """Envoie un prompt texte à Mistral Small 3.1 et retourne la réponse."""
     tokenizer, model = _load_llm()
     try:
-        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-        inputs = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True, tokenize=True)
+        messages = [{"role": "user", "content": prompt}]
+        inputs = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
         if isinstance(inputs, torch.Tensor):
             inputs = inputs.to(model.device)
         else:
