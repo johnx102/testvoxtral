@@ -1975,38 +1975,121 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
 
         log(f"[STEREO] Whisper: {len(segments)} segments total ({len(client_segs)} Client, {len(agent_segs)} Agent)")
 
+        # ── Correction Voxtral text-only : fixer les erreurs de mots ────
+        # Whisper a le bon timing mais parfois des mots faux sur l'audio téléphonique.
+        # Voxtral corrige le texte sans toucher aux timestamps ni à la structure.
+        raw_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in segments)
+        correction_prompt = (
+            f"lang:{language or 'fr'} "
+            "Voici la transcription d'un appel téléphonique professionnel.\n"
+            "Corrige UNIQUEMENT les erreurs évidentes de reconnaissance vocale.\n"
+            "Détermine le contexte métier à partir de la conversation et corrige les termes techniques mal reconnus.\n\n"
+            "RÈGLES STRICTES :\n"
+            "• Garde la MÊME structure Agent:/Client: ligne par ligne\n"
+            "• Ne change PAS l'ordre des répliques\n"
+            "• Ne supprime et n'ajoute AUCUNE réplique\n"
+            "• Corrige uniquement les mots visiblement mal reconnus\n"
+            "• Si un mot te semble correct, ne le change pas\n\n"
+            f"Transcription à corriger :\n{raw_transcript}\n\n"
+            "Transcription corrigée :"
+        )
+        try:
+            correction_tokens = min(int(len(raw_transcript) * 1.2), 6000)
+            log(f"[STEREO] Voxtral text correction: sending {len(raw_transcript)} chars...")
+            correction_result = run_voxtral_with_timeout(
+                [{"role": "user", "content": [{"type": "text", "text": correction_prompt}]}],
+                max_new_tokens=correction_tokens, timeout=60
+            )
+            corrected_text = (correction_result.get("text") or "").strip()
+
+            if corrected_text and len(corrected_text) > len(raw_transcript) * 0.5:
+                # Parser le texte corrigé et mettre à jour les segments
+                corrected_lines = [l.strip() for l in corrected_text.split('\n') if l.strip() and ':' in l]
+                if len(corrected_lines) == len(segments):
+                    # Même nombre de lignes = on peut mapper 1:1
+                    for idx, line in enumerate(corrected_lines):
+                        parts = line.split(':', 1)
+                        if len(parts) == 2:
+                            new_text = parts[1].strip()
+                            if new_text:
+                                segments[idx]["text"] = new_text
+                    log(f"[STEREO] Text correction applied: {len(corrected_lines)} lines corrected")
+                else:
+                    log(f"[STEREO] Text correction: line count mismatch ({len(corrected_lines)} vs {len(segments)}), skipping")
+            else:
+                log(f"[STEREO] Text correction: response too short, skipping")
+        except Exception as e_corr:
+            log(f"[STEREO] Text correction failed: {e_corr}, keeping Whisper text")
+
     else:
-        # ── MODE VOXTRAL : per-turn avec energy comparison ────
-        log(f"[STEREO] Using Voxtral per-turn with energy comparison")
+        # ── MODE VOXTRAL : transcription par canal entier ────
+        log(f"[STEREO] Using Voxtral full-channel transcription")
         log(f"[STEREO] Channel mapping: ch0={left_role} (remote), ch1={right_role} (local)")
 
         turns = _build_turns_by_energy(wav_path, left_role, right_role)
-        if not turns:
-            log("[STEREO] No turns → fallback Voxtral Speaker ID")
-            mono_fb = _to_mono_tmp(wav_path)
-            result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
-            if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
-            return result
-
-        channel_map = {left_role: 0, right_role: 1}
         segments = []
 
-        for i, turn in enumerate(turns):
-            speaker = turn["speaker"]
-            channel = channel_map.get(speaker, 0)
-            turn_dur = turn["end"] - turn["start"]
-            turn_audio = _extract_turn_audio_channel(wav_path, turn["start"], turn["end"], channel)
-            if not turn_audio:
+        for role in [left_role, right_role]:
+            channel = 0 if role == left_role else 1
+            role_turns = [(t["start"], t["end"]) for t in turns if t["speaker"] == role]
+            if not role_turns:
                 continue
+
+            total_speech_dur = sum(e - s for s, e in role_turns)
+            log(f"[STEREO] {role}: {len(role_turns)} turns, {total_speech_dur:.1f}s speech → transcribing channel {channel} in full")
+
+            # Extraire les portions de parole du canal
             try:
-                text = _transcribe_turn(turn_audio, language, turn_dur, from_channel=True)
+                audio = AudioSegment.from_file(wav_path)
+                channels = audio.split_to_mono()
+                ch_audio = channels[channel]
+                parts = []
+                for s, e in role_turns:
+                    part = ch_audio[int(s * 1000):int(e * 1000)]
+                    if len(part) > 0:
+                        parts.append(part)
+                        parts.append(AudioSegment.silent(duration=200, frame_rate=ch_audio.frame_rate))
+                if not parts:
+                    continue
+                clean_audio = parts[0]
+                for p in parts[1:]:
+                    clean_audio += p
+                clean_path = os.path.join(tempfile.gettempdir(), f"ch{channel}_full_{uuid.uuid4().hex}.wav")
+                clean_audio.export(clean_path, format="wav")
+                log(f"[STEREO] {role}: extracted {len(clean_audio)/1000:.1f}s speech audio")
+            except Exception as e_ex:
+                log(f"[STEREO] {role}: extraction failed: {e_ex}")
+                continue
+
+            try:
+                full_text = _transcribe_turn(clean_path, language, total_speech_dur, from_channel=True)
             finally:
-                if os.path.exists(turn_audio): os.remove(turn_audio)
-            if text and len(text.split()) >= 1:
-                segments.append({"speaker": speaker, "start": round(turn["start"], 2), "end": round(turn["end"], 2), "text": text, "mood": None})
-                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): {len(text)} chars")
-            else:
-                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty, skipped")
+                if os.path.exists(clean_path): os.remove(clean_path)
+
+            if not full_text or len(full_text.split()) < 2:
+                continue
+
+            full_text = remove_repetitive_loops(full_text, max_repetitions=3)
+            full_text = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]\s*', '', full_text, flags=re.IGNORECASE).strip()
+            log(f"[STEREO] {role}: {len(full_text)} chars transcribed")
+
+            # Distribuer sur les blocs VAD proportionnellement
+            words = full_text.split()
+            total_words = len(words)
+            word_idx = 0
+            for j, (b_start, b_end) in enumerate(role_turns):
+                block_dur = b_end - b_start
+                if j == len(role_turns) - 1:
+                    block_words = words[word_idx:]
+                else:
+                    n_words = max(1, round(total_words * block_dur / total_speech_dur))
+                    n_words = min(n_words, total_words - word_idx)
+                    block_words = words[word_idx:word_idx + n_words]
+                    word_idx += n_words
+                if block_words:
+                    segments.append({"speaker": role, "start": round(b_start, 2), "end": round(b_end, 2), "text": " ".join(block_words), "mood": None})
+
+        segments.sort(key=lambda s: s["start"])
 
     if not segments:
         log("[STEREO] All empty → fallback Voxtral Speaker ID")
