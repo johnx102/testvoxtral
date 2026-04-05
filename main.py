@@ -52,7 +52,8 @@ WHISPER_DEVICE     = os.environ.get("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE    = os.environ.get("WHISPER_COMPUTE", "float16")
 
 # Mistral Small 3.1 (texte only — résumé, sentiment, correction)
-LLM_MODEL_ID       = os.environ.get("LLM_MODEL_ID", "mistralai/Mistral-Nemo-Instruct-2407").strip()
+# Forcé en dur — ne pas utiliser d'env var pour éviter les overrides
+LLM_MODEL_ID       = "mistralai/Mistral-Nemo-Instruct-2407"
 QUANT_MODE         = os.environ.get("QUANT_MODE", "bnb8").lower()
 
 # Sentiment
