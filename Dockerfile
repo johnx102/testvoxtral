@@ -5,14 +5,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    USE_WHISPER_STEREO=1 \
     PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
     TRANSFORMERS_NO_ADVISORY_WARNINGS=1 \
     PYTORCH_JIT=0 \
     TORCH_FORCE_WEIGHTS_ONLY_LOAD=0 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    APP_VERSION=2025-08-23-02 \
+    APP_VERSION=whisper-mistral-v5.0 \
     HF_HOME=/app/.cache/huggingface \
     TORCH_HOME=/app/.cache/torch
 
@@ -31,6 +30,12 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu12
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# Upgrade transformers pour supporter Mistral3Config (>= 4.48)
+RUN pip install --no-cache-dir --upgrade transformers>=4.50.0 accelerate>=1.0.0
+
+# Installer faster-whisper
+RUN pip install --no-cache-dir faster-whisper>=1.0.0
+
 # Fix PyTorch 2.6+ weights_only
 COPY patch_torch_load.py /tmp/patch_torch_load.py
 RUN python3 /tmp/patch_torch_load.py && rm /tmp/patch_torch_load.py
@@ -39,31 +44,23 @@ RUN python3 /tmp/patch_torch_load.py && rm /tmp/patch_torch_load.py
 RUN mkdir -p /app/.cache/huggingface /app/.cache/torch
 
 # Copy app files
-COPY main.py /app/main.py
-COPY warmup.py /app/warmup.py
+COPY main2.py /app/main.py
 
-ENV MODEL_ID="mistralai/Voxtral-Small-24B-2507" \
-    MAX_NEW_TOKENS="512" \
-    TEMPERATURE="0.0" \
-    TOP_P="0.95" \
-    MAX_DURATION_S="1200" \
-    DIAR_MODEL="pyannote/speaker-diarization-3.1" \
+ENV LLM_MODEL_ID="mistralai/Mistral-Small-3.1-24B-Instruct-2503" \
+    WHISPER_MODEL_SIZE="large-v2" \
+    WHISPER_DEVICE="cuda" \
+    WHISPER_COMPUTE="float16" \
+    MAX_DURATION_S="3600" \
     WITH_SUMMARY_DEFAULT="1" \
-    SENTIMENT_MODEL="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli" \
-    SENTIMENT_TYPE="zero-shot" \
     ENABLE_SENTIMENT="1" \
-    SENTIMENT_DEVICE="-1" \
-    LOG_LEVEL="INFO" \
-    QUANT_MODE="torchao"
+    ENABLE_HOLD_MUSIC_DETECTION="1" \
+    QUANT_MODE="torchao" \
+    LOG_LEVEL="INFO"
 # Note : HF_TOKEN est passé via les env vars RunPod au runtime (pas ici)
 
 # ─── Pré-téléchargement des modèles dans l'image ─────────────────────────────
 # HF_TOKEN doit être passé en build arg : --build-arg HF_TOKEN=hf_xxx
 # Dans RunPod : Settings → Build → Environment Variables → HF_TOKEN
-#
-# Le modèle (~48 GB) est stocké dans /app/.cache/huggingface qui fait partie
-# de l'image Docker. Au cold start : chargement disque ~30s, pas de téléchargement.
-# Contrepartie : image plus lourde (~55 GB) et build plus long (~20-30 min).
 
 ARG HF_TOKEN=""
 RUN if [ -n "$HF_TOKEN" ]; then \
@@ -72,22 +69,15 @@ RUN if [ -n "$HF_TOKEN" ]; then \
 import os; \
 os.environ['HF_TOKEN'] = os.environ.get('HF_TOKEN', ''); \
 from huggingface_hub import snapshot_download; \
-print('[BUILD] Downloading Voxtral-Small-24B...'); \
+print('[BUILD] Downloading Mistral Small 3.1 24B...'); \
 snapshot_download( \
-    repo_id='mistralai/Voxtral-Small-24B-2507', \
+    repo_id='mistralai/Mistral-Small-3.1-24B-Instruct-2503', \
     token=os.environ['HF_TOKEN'], \
     ignore_patterns=['*.msgpack', '*.h5', 'flax_model*', 'tf_model*'], \
 ); \
-print('[BUILD] Downloading PyAnnote diarization...'); \
-snapshot_download( \
-    repo_id='pyannote/speaker-diarization-3.1', \
-    token=os.environ['HF_TOKEN'], \
-); \
-print('[BUILD] Downloading PyAnnote segmentation...'); \
-snapshot_download( \
-    repo_id='pyannote/segmentation-3.0', \
-    token=os.environ['HF_TOKEN'], \
-); \
+print('[BUILD] Downloading Whisper large-v2...'); \
+from faster_whisper import WhisperModel; \
+WhisperModel('large-v2', device='cpu', compute_type='int8'); \
 print('[BUILD] All models cached successfully'); \
 " && \
         echo "[BUILD] Modèles pré-téléchargés dans /app/.cache/huggingface"; \
