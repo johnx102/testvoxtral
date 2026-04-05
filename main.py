@@ -226,21 +226,12 @@ def _load_llm():
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
 
-    if QUANT_MODE in ("bnb8", "int8") and torch.cuda.is_available():
+    # INT8 par défaut pour Nemo 12B (meilleure qualité, ~12GB VRAM)
+    if torch.cuda.is_available():
         try:
             from transformers import BitsAndBytesConfig
             mdl_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
             log("[LLM] INT8 BnB config ready")
-        except ImportError:
-            mdl_kwargs["torch_dtype"] = torch.bfloat16
-    elif QUANT_MODE in ("torchao", "bnb4") and torch.cuda.is_available():
-        try:
-            from transformers import BitsAndBytesConfig
-            mdl_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
-            )
-            log("[LLM] INT4 BnB config ready")
         except ImportError:
             mdl_kwargs["torch_dtype"] = torch.bfloat16
     else:
