@@ -46,7 +46,7 @@ RUN mkdir -p /app/.cache/huggingface /app/.cache/torch
 # Copy app files
 COPY main.py /app/main.py
 
-ENV LLM_MODEL_ID="mistralai/Mistral-Small-3.1-24B-Instruct-2503" \
+ENV LLM_MODEL_ID="mistralai/Mistral-Nemo-Instruct-2407" \
     WHISPER_MODEL_SIZE="large-v2" \
     WHISPER_DEVICE="cuda" \
     WHISPER_COMPUTE="float16" \
