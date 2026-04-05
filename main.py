@@ -239,7 +239,13 @@ def _load_llm():
     else:
         mdl_kwargs["torch_dtype"] = torch.bfloat16
 
-    _llm_model = AutoModelForCausalLM.from_pretrained(LLM_MODEL_ID, **mdl_kwargs)
+    # Essayer AutoModelForCausalLM d'abord, sinon AutoModel (pour Mistral3 multimodal)
+    try:
+        _llm_model = AutoModelForCausalLM.from_pretrained(LLM_MODEL_ID, **mdl_kwargs)
+    except ValueError:
+        log("[LLM] AutoModelForCausalLM failed, trying AutoModel...")
+        from transformers import AutoModel
+        _llm_model = AutoModel.from_pretrained(LLM_MODEL_ID, **mdl_kwargs)
     log("[LLM] Model loaded successfully")
     return _llm_tokenizer, _llm_model
 
