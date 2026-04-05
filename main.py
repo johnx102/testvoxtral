@@ -1853,19 +1853,92 @@ def _generate_summary_and_sentiment(transcript: str, language: Optional[str],
         }
 
 
+def _transcribe_channel_whisper_words(wav_path: str, channel: int, speaker: str, language: str = "fr") -> List[Dict]:
+    """
+    Transcrit un canal avec FasterWhisper + word_timestamps.
+    Regroupe les mots en phrases par pauses (>0.8s).
+    Retourne des segments avec timestamps précis.
+    """
+    ch_path = _extract_mono_channel(wav_path, channel)
+    try:
+        model = _load_whisper()
+        if model is None:
+            return []
+
+        segments_raw, info = model.transcribe(
+            ch_path,
+            language=language or "fr",
+            beam_size=5,
+            word_timestamps=True,
+            vad_filter=False,
+        )
+
+        # Collecter tous les mots avec timestamps
+        all_words = []
+        for seg in segments_raw:
+            if seg.words:
+                for w in seg.words:
+                    all_words.append({"word": w.word, "start": w.start, "end": w.end})
+
+        if not all_words:
+            return []
+
+        # Regrouper les mots en phrases par pauses > 0.8s
+        result_segments = []
+        current = {"speaker": speaker, "text": "", "start": all_words[0]["start"], "end": all_words[0]["end"], "mood": None}
+
+        for word in all_words:
+            if current["end"] is not None and word["start"] - current["end"] > 0.8:
+                # Pause détectée → nouvelle phrase
+                if current["text"].strip():
+                    result_segments.append({
+                        "speaker": speaker,
+                        "start": round(current["start"], 2),
+                        "end": round(current["end"], 2),
+                        "text": current["text"].strip(),
+                        "mood": None,
+                    })
+                current = {"speaker": speaker, "text": "", "start": word["start"], "end": None, "mood": None}
+
+            current["text"] += word["word"]
+            current["end"] = word["end"]
+
+        # Dernière phrase
+        if current["text"].strip():
+            result_segments.append({
+                "speaker": speaker,
+                "start": round(current["start"], 2),
+                "end": round(current["end"], 2),
+                "text": current["text"].strip(),
+                "mood": None,
+            })
+
+        # Filtrer hallucinations Whisper
+        WHISPER_HALLUCINATIONS = [
+            "sous-titrage st'", "sous-titres réalisés par", "amara.org",
+            "merci d'avoir regardé", "abonnez-vous à la chaîne",
+        ]
+        result_segments = [s for s in result_segments
+                          if not (len(s["text"].split()) < 30 and
+                                  any(h in s["text"].lower() for h in WHISPER_HALLUCINATIONS))]
+
+        log(f"[WHISPER] {speaker} (ch{channel}): {len(result_segments)} phrases, {sum(len(s['text']) for s in result_segments)} chars")
+        return result_segments
+    finally:
+        if ch_path and ch_path != wav_path and os.path.exists(ch_path):
+            os.remove(ch_path)
+
+
 def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new_tokens: int,
                                   with_summary: bool, call_direction: str = "unknown",
                                   ch0_path: str = None, ch1_path: str = None):
     """
-    MODE STÉRÉO v2 — Attribution par comparaison d'énergie entre canaux :
-    1. VAD sur MONO → capte TOUTE la parole (y compris voix douce)
-    2. Fenêtres 300ms : compare RMS ch0 vs ch1 → canal dominant = speaker (crosstalk-proof)
-    3. Extraction de chaque tour depuis SON CANAL (jamais mono, même pour les tours courts)
-    4. Transcription Voxtral par tour
-    5. Summary + sentiment combinés (1 seul appel Voxtral)
-    Fallback → Voxtral Speaker ID si mono ou canaux vides.
+    MODE STÉRÉO — Transcription par canal complet.
+    - Whisper (USE_WHISPER_STEREO=1) : word_timestamps pour timing précis
+    - Voxtral (USE_WHISPER_STEREO=0) : per-turn avec energy comparison
+    Fallback → Voxtral Speaker ID si mono.
     """
-    log(f"[STEREO] Starting energy-based stereo diarization: direction={call_direction}")
+    log(f"[STEREO] Starting stereo transcription: direction={call_direction}")
     ok, err, est_dur = _validate_audio(wav_path)
     if not ok:
         return {"error": err}
@@ -1878,115 +1951,74 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
 
     log(f"[STEREO] Audio: {info.channels}ch {info.samplerate}Hz {est_dur:.1f}s")
 
-    # ── Mapping canal → rôle ────────────────────────────────────────────────
-    # Asterisk MixMonitor : ch0(left/read) = audio DISTANT, ch1(right/write) = audio LOCAL
-    left_role  = "Client"   # ch0 = partie distante (patient/appelant)
-    right_role = "Agent"    # ch1 = partie locale (cabinet/standard)
-    log(f"[STEREO] Channel mapping: ch0={left_role} (remote), ch1={right_role} (local)")
+    left_role = "Client"
+    right_role = "Agent"
 
-    # ── Étape 1-2 : Construire les tours par comparaison d'énergie ──────────
-    # _build_turns_by_energy gère aussi la détection IVR/attente en interne
-    turns = _build_turns_by_energy(wav_path, left_role, right_role)
-    if not turns:
-        log("[STEREO] No turns → fallback Voxtral Speaker ID")
-        mono_fb = _to_mono_tmp(wav_path)
-        result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
-        if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
-        return result
+    if USE_WHISPER_STEREO:
+        # ── MODE WHISPER : transcription par canal avec word timestamps ────
+        log(f"[STEREO] Using Whisper with word_timestamps for precise timing")
 
-    speakers_found = set(t["speaker"] for t in turns)
-    if len(speakers_found) < 2:
-        log(f"[STEREO] Only {speakers_found} detected → fallback Voxtral Speaker ID")
-        mono_fb = _to_mono_tmp(wav_path)
-        result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
-        if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
-        return result
+        # Transcrire chaque canal séparément avec timestamps mot par mot
+        client_segs = _transcribe_channel_whisper_words(wav_path, 0, left_role, language or "fr")
+        agent_segs = _transcribe_channel_whisper_words(wav_path, 1, right_role, language or "fr")
 
-    turn_counts = {s: sum(1 for t in turns if t["speaker"] == s) for s in speakers_found}
-    log(f"[STEREO] Timeline: {len(turns)} turns ({turn_counts})")
+        # Fusionner et trier par timestamp
+        segments = client_segs + agent_segs
+        segments.sort(key=lambda s: s["start"])
 
-    # ── Étape 3 : Transcrire per-turn avec contexte conversationnel ────────
-    # Chaque tour est transcrit depuis son canal (timing précis).
-    # Les 3 derniers tours sont injectés comme contexte texte dans le prompt
-    # pour que Voxtral comprenne le domaine (cabinet dentaire) et les noms propres.
-    channel_map = {left_role: 0, right_role: 1}
-    segments = []
-    context_history = []  # derniers tours transcrits pour le contexte
+        if not segments:
+            log("[STEREO] Whisper produced no segments → fallback Voxtral Speaker ID")
+            mono_fb = _to_mono_tmp(wav_path)
+            result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
+            if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
+            return result
 
-    for i, turn in enumerate(turns):
-        speaker = turn["speaker"]
-        channel = channel_map.get(speaker, 0)
-        turn_dur = turn["end"] - turn["start"]
+        log(f"[STEREO] Whisper: {len(segments)} segments total ({len(client_segs)} Client, {len(agent_segs)} Agent)")
 
-        turn_audio = _extract_turn_audio_channel(wav_path, turn["start"], turn["end"], channel)
-        if not turn_audio:
-            continue
+    else:
+        # ── MODE VOXTRAL : per-turn avec energy comparison ────
+        log(f"[STEREO] Using Voxtral per-turn with energy comparison")
+        log(f"[STEREO] Channel mapping: ch0={left_role} (remote), ch1={right_role} (local)")
 
-        try:
-            if USE_WHISPER_STEREO:
-                text = _transcribe_turn_whisper(turn_audio, language or "fr")
+        turns = _build_turns_by_energy(wav_path, left_role, right_role)
+        if not turns:
+            log("[STEREO] No turns → fallback Voxtral Speaker ID")
+            mono_fb = _to_mono_tmp(wav_path)
+            result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
+            if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
+            return result
+
+        channel_map = {left_role: 0, right_role: 1}
+        segments = []
+
+        for i, turn in enumerate(turns):
+            speaker = turn["speaker"]
+            channel = channel_map.get(speaker, 0)
+            turn_dur = turn["end"] - turn["start"]
+            turn_audio = _extract_turn_audio_channel(wav_path, turn["start"], turn["end"], channel)
+            if not turn_audio:
+                continue
+            try:
+                text = _transcribe_turn(turn_audio, language, turn_dur, from_channel=True)
+            finally:
+                if os.path.exists(turn_audio): os.remove(turn_audio)
+            if text and len(text.split()) >= 1:
+                segments.append({"speaker": speaker, "start": round(turn["start"], 2), "end": round(turn["end"], 2), "text": text, "mood": None})
+                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): {len(text)} chars")
             else:
-                # Construire le contexte des derniers tours
-                context_text = ""
-                if context_history:
-                    recent = context_history[-3:]  # 3 derniers tours max
-                    context_lines = [f"{c['speaker']}: {c['text']}" for c in recent]
-                    context_text = (
-                        "Contexte de la conversation (cabinet dentaire/médical) :\n"
-                        + "\n".join(context_lines) + "\n\n"
-                    )
-
-                # Prompt avec contexte
-                instruction = (
-                    f"lang:{language or 'fr'} "
-                    f"{context_text}"
-                    "[TRANSCRIBE] Transcris UNIQUEMENT la voix principale. "
-                    "Ignore les voix en arrière-plan, la musique d'attente et les annonces IVR. "
-                    "Conserve les hésitations (euh, bah, alors). "
-                    "Si tu n'entends que du silence, retourne une chaîne vide. "
-                    "N'invente rien."
-                )
-                tokens = max(64, min(int(turn_dur * 10), 2000))
-                timeout_t = min(int(turn_dur * 0.8) + 30, 120)
-                conv = [{"role": "user", "content": [
-                    {"type": "audio", "path": turn_audio},
-                    {"type": "text", "text": instruction}
-                ]}]
-                out = run_voxtral_with_timeout(conv, max_new_tokens=tokens, timeout=timeout_t)
-                text = (out.get("text") or "").strip()
-                text = remove_repetitive_loops(text, max_repetitions=3)
-                text = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold|BIP|Bip|BEEP)\]\s*',
-                              '', text, flags=re.IGNORECASE).strip()
-                text = re.sub(r'^(?:Agent|Client|Speaker\s*\d*)\s*:\s*', '', text, flags=re.IGNORECASE).strip()
-        finally:
-            if os.path.exists(turn_audio):
-                os.remove(turn_audio)
-
-        if text and len(text.split()) >= 1:
-            segments.append({
-                "speaker": speaker,
-                "start": round(turn["start"], 2),
-                "end": round(turn["end"], 2),
-                "text": text,
-                "mood": None,
-            })
-            # Ajouter au contexte pour les prochains tours
-            context_history.append({"speaker": speaker, "text": text})
-            log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): {len(text)} chars")
-        else:
-            log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty, skipped")
+                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty, skipped")
 
     if not segments:
-        log("[STEREO] All turns empty → fallback Voxtral Speaker ID")
+        log("[STEREO] All empty → fallback Voxtral Speaker ID")
         mono_fb = _to_mono_tmp(wav_path)
         result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
         if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
         return result
 
-    # Supprimer les segments dupliqués (annonces en boucle)
+    # Supprimer les doublons
     segments = remove_duplicate_segments(segments)
     if not segments:
-        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée.", "diarization_mode": "stereo_energy"}
+        return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée.", "diarization_mode": "stereo_direct"}
 
     # Fusionner segments consécutifs même speaker
     merged = [segments[0]]
@@ -2004,7 +2036,7 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     result = {
         "segments": merged,
         "transcript": full_transcript,
-        "diarization_mode": "stereo_energy_whisper" if USE_WHISPER_STEREO else "stereo_energy",
+        "diarization_mode": "stereo_whisper_words" if USE_WHISPER_STEREO else "stereo_energy",
         "audio_duration": est_dur,
     }
 
