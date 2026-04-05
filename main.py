@@ -239,13 +239,14 @@ def _load_llm():
     else:
         mdl_kwargs["torch_dtype"] = torch.bfloat16
 
-    # Essayer AutoModelForCausalLM d'abord, sinon AutoModel (pour Mistral3 multimodal)
+    # Mistral Small 3.1 utilise Mistral3ForConditionalGeneration (modèle multimodal)
     try:
+        from transformers import Mistral3ForConditionalGeneration
+        _llm_model = Mistral3ForConditionalGeneration.from_pretrained(LLM_MODEL_ID, **mdl_kwargs)
+        log("[LLM] Loaded with Mistral3ForConditionalGeneration")
+    except (ImportError, Exception) as e:
+        log(f"[LLM] Mistral3 class not available ({e}), trying AutoModelForCausalLM...")
         _llm_model = AutoModelForCausalLM.from_pretrained(LLM_MODEL_ID, **mdl_kwargs)
-    except ValueError:
-        log("[LLM] AutoModelForCausalLM failed, trying AutoModel...")
-        from transformers import AutoModel
-        _llm_model = AutoModel.from_pretrained(LLM_MODEL_ID, **mdl_kwargs)
     log("[LLM] Model loaded successfully")
     return _llm_tokenizer, _llm_model
 
@@ -254,8 +255,8 @@ def run_llm(prompt: str, max_new_tokens: int = 256) -> str:
     """Envoie un prompt texte à Mistral Small 3.1 et retourne la réponse."""
     tokenizer, model = _load_llm()
     try:
-        messages = [{"role": "user", "content": prompt}]
-        inputs = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True)
+        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        inputs = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True, tokenize=True)
         if isinstance(inputs, torch.Tensor):
             inputs = inputs.to(model.device)
         else:
