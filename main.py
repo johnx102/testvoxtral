@@ -473,8 +473,19 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         # ── TRANSCRIPTION ──────────────────────────────────────────────────
         if is_stereo:
             log(f"[HANDLER] Stereo audio → Whisper per-channel with word timestamps")
-            client_segs = _transcribe_channel_whisper(local_path, 0, "Client", language)
-            agent_segs = _transcribe_channel_whisper(local_path, 1, "Agent", language)
+
+            # Skip les canaux détectés comme musique d'attente (pattern RMS, pas juste le ratio)
+            if ENABLE_HOLD_MUSIC_DETECTION and hold_ch0.get("is_hold_music"):
+                log(f"[HANDLER] CH0 (Client) is hold music → skipping Whisper")
+                client_segs = []
+            else:
+                client_segs = _transcribe_channel_whisper(local_path, 0, "Client", language)
+
+            if ENABLE_HOLD_MUSIC_DETECTION and hold_ch1.get("is_hold_music"):
+                log(f"[HANDLER] CH1 (Agent) is hold music → skipping Whisper")
+                agent_segs = []
+            else:
+                agent_segs = _transcribe_channel_whisper(local_path, 1, "Agent", language)
 
             segments = client_segs + agent_segs
             segments.sort(key=lambda s: s["start"])
