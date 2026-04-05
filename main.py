@@ -1905,114 +1905,83 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     turn_counts = {s: sum(1 for t in turns if t["speaker"] == s) for s in speakers_found}
     log(f"[STEREO] Timeline: {len(turns)} turns ({turn_counts})")
 
-    # ── Étape 3 : Transcrire chaque canal EN ENTIER ─────────────────────────
-    # Au lieu de transcrire tour par tour (perte de contexte), on envoie
-    # le canal complet (nettoyé du silence) à Voxtral en un seul appel.
-    # Voxtral a le contexte complet → meilleure reconnaissance des mots.
-    # Puis on distribue le texte sur les blocs VAD par proportion de durée.
+    # ── Étape 3 : Transcrire per-turn avec contexte conversationnel ────────
+    # Chaque tour est transcrit depuis son canal (timing précis).
+    # Les 3 derniers tours sont injectés comme contexte texte dans le prompt
+    # pour que Voxtral comprenne le domaine (cabinet dentaire) et les noms propres.
     channel_map = {left_role: 0, right_role: 1}
     segments = []
+    context_history = []  # derniers tours transcrits pour le contexte
 
-    for role in [left_role, right_role]:
-        channel = channel_map[role]
-        # Collecter tous les blocs VAD de ce speaker
-        role_turns = [(t["start"], t["end"]) for t in turns if t["speaker"] == role]
-        if not role_turns:
+    for i, turn in enumerate(turns):
+        speaker = turn["speaker"]
+        channel = channel_map.get(speaker, 0)
+        turn_dur = turn["end"] - turn["start"]
+
+        turn_audio = _extract_turn_audio_channel(wav_path, turn["start"], turn["end"], channel)
+        if not turn_audio:
             continue
 
-        total_speech_dur = sum(e - s for s, e in role_turns)
-        log(f"[STEREO] {role}: {len(role_turns)} turns, {total_speech_dur:.1f}s speech → transcribing channel {channel} in full")
-
-        # Extraire uniquement les portions de parole du canal (sans silence)
-        # et les concaténer en un seul audio
         try:
-            audio = AudioSegment.from_file(wav_path)
-            if audio.channels > 1:
-                channels = audio.split_to_mono()
-                ch_audio = channels[channel]
-            else:
-                ch_audio = audio
-
-            parts = []
-            for s, e in role_turns:
-                part = ch_audio[int(s * 1000):int(e * 1000)]
-                if len(part) > 0:
-                    parts.append(part)
-                    # 200ms de silence entre les blocs pour que Voxtral respire
-                    parts.append(AudioSegment.silent(duration=200, frame_rate=ch_audio.frame_rate))
-
-            if not parts:
-                continue
-
-            clean_audio = parts[0]
-            for p in parts[1:]:
-                clean_audio += p
-
-            clean_dur = len(clean_audio) / 1000.0
-            clean_path = os.path.join(tempfile.gettempdir(), f"ch{channel}_full_{uuid.uuid4().hex}.wav")
-            clean_audio.export(clean_path, format="wav")
-            log(f"[STEREO] {role}: extracted {clean_dur:.1f}s speech audio")
-        except Exception as e_extract:
-            log(f"[STEREO] {role}: extraction failed: {e_extract}")
-            continue
-
-        # Transcrire le canal complet en un seul appel Voxtral
-        try:
-            tokens = max(256, min(int(total_speech_dur * 10), 12000))
-            timeout = min(int(total_speech_dur * 0.7) + 60, 600)
-
             if USE_WHISPER_STEREO:
-                full_text = _transcribe_turn_whisper(clean_path, language or "fr")
+                text = _transcribe_turn_whisper(turn_audio, language or "fr")
             else:
-                full_text = _transcribe_turn(clean_path, language, total_speech_dur, from_channel=True)
+                # Construire le contexte des derniers tours
+                context_text = ""
+                if context_history:
+                    recent = context_history[-3:]  # 3 derniers tours max
+                    context_lines = [f"{c['speaker']}: {c['text']}" for c in recent]
+                    context_text = (
+                        "Contexte de la conversation (cabinet dentaire/médical) :\n"
+                        + "\n".join(context_lines) + "\n\n"
+                    )
+
+                # Prompt avec contexte
+                instruction = (
+                    f"lang:{language or 'fr'} "
+                    f"{context_text}"
+                    "[TRANSCRIBE] Transcris UNIQUEMENT la voix principale. "
+                    "Ignore les voix en arrière-plan, la musique d'attente et les annonces IVR. "
+                    "Conserve les hésitations (euh, bah, alors). "
+                    "Si tu n'entends que du silence, retourne une chaîne vide. "
+                    "N'invente rien."
+                )
+                tokens = max(64, min(int(turn_dur * 10), 2000))
+                timeout_t = min(int(turn_dur * 0.8) + 30, 120)
+                conv = [{"role": "user", "content": [
+                    {"type": "audio", "path": turn_audio},
+                    {"type": "text", "text": instruction}
+                ]}]
+                out = run_voxtral_with_timeout(conv, max_new_tokens=tokens, timeout=timeout_t)
+                text = (out.get("text") or "").strip()
+                text = remove_repetitive_loops(text, max_repetitions=3)
+                text = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold|BIP|Bip|BEEP)\]\s*',
+                              '', text, flags=re.IGNORECASE).strip()
+                text = re.sub(r'^(?:Agent|Client|Speaker\s*\d*)\s*:\s*', '', text, flags=re.IGNORECASE).strip()
         finally:
-            if os.path.exists(clean_path):
-                os.remove(clean_path)
+            if os.path.exists(turn_audio):
+                os.remove(turn_audio)
 
-        if not full_text or len(full_text.split()) < 2:
-            log(f"[STEREO] {role}: empty transcription, skipping")
-            continue
-
-        # Nettoyage
-        full_text = remove_repetitive_loops(full_text, max_repetitions=3)
-        full_text = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]\s*', '', full_text, flags=re.IGNORECASE).strip()
-
-        log(f"[STEREO] {role}: {len(full_text)} chars transcribed")
-
-        # Distribuer le texte sur les blocs VAD par proportion de durée
-        words = full_text.split()
-        total_words = len(words)
-        word_idx = 0
-
-        for j, (b_start, b_end) in enumerate(role_turns):
-            block_dur = b_end - b_start
-            if j == len(role_turns) - 1:
-                # Dernier bloc : tous les mots restants
-                block_words = words[word_idx:]
-            else:
-                n_words = max(1, round(total_words * block_dur / total_speech_dur))
-                n_words = min(n_words, total_words - word_idx)
-                block_words = words[word_idx:word_idx + n_words]
-                word_idx += n_words
-
-            if block_words:
-                segments.append({
-                    "speaker": role,
-                    "start": round(b_start, 2),
-                    "end": round(b_end, 2),
-                    "text": " ".join(block_words),
-                    "mood": None,
-                })
+        if text and len(text.split()) >= 1:
+            segments.append({
+                "speaker": speaker,
+                "start": round(turn["start"], 2),
+                "end": round(turn["end"], 2),
+                "text": text,
+                "mood": None,
+            })
+            # Ajouter au contexte pour les prochains tours
+            context_history.append({"speaker": speaker, "text": text})
+            log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {turn['start']:.1f}-{turn['end']:.1f}s): {len(text)} chars")
+        else:
+            log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty, skipped")
 
     if not segments:
-        log("[STEREO] All channels empty → fallback Voxtral Speaker ID")
+        log("[STEREO] All turns empty → fallback Voxtral Speaker ID")
         mono_fb = _to_mono_tmp(wav_path)
         result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
         if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
         return result
-
-    # Trier par timestamp (les segments des deux canaux sont intercalés)
-    segments.sort(key=lambda s: s["start"])
 
     # Supprimer les segments dupliqués (annonces en boucle)
     segments = remove_duplicate_segments(segments)
@@ -2028,83 +1997,6 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
             prev["end"] = seg["end"]
         else:
             merged.append(seg)
-
-    log(f"[STEREO] Raw segments: {len(merged)} (before cleanup)")
-
-    # ── Étape 4b : Relecture Voxtral — reconstituer le dialogue propre ────
-    # La distribution proportionnelle casse les phrases. On envoie le transcript brut
-    # à Voxtral (texte only, pas audio) pour qu'il reconstitue un dialogue cohérent.
-    raw_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in merged if s.get("text"))
-
-    cleanup_prompt = (
-        f"lang:{language or 'fr'} "
-        "Voici la transcription brute d'un appel téléphonique dans un cabinet dentaire/médical. "
-        "Les phrases sont fragmentées et mal découpées entre Agent et Client.\n\n"
-        "REFORMATE ce dialogue en recollant les phrases coupées et en attribuant correctement chaque réplique.\n"
-        "- L'Agent est le secrétariat/cabinet qui répond ou appelle\n"
-        "- Le Client est le patient/appelant\n"
-        "- Reconstitue les phrases complètes (recolle les fragments)\n"
-        "- Garde le texte MOT POUR MOT, ne change aucun mot\n"
-        "- Une ligne par prise de parole : Agent: ... ou Client: ...\n\n"
-        f"Transcript brut:\n{raw_transcript}\n\n"
-        "Dialogue reformaté:"
-    )
-
-    try:
-        cleanup_tokens = min(int(len(raw_transcript) * 1.2), 4000)
-        log(f"[STEREO] Cleanup: sending {len(raw_transcript)} chars for reorganization...")
-        cleanup_result = run_voxtral_with_timeout(
-            [{"role": "user", "content": [{"type": "text", "text": cleanup_prompt}]}],
-            max_new_tokens=cleanup_tokens, timeout=60
-        )
-        cleaned_text = (cleanup_result.get("text") or "").strip()
-
-        if cleaned_text and len(cleaned_text) > len(raw_transcript) * 0.3:
-            # Parser le dialogue nettoyé en segments
-            cleaned_segments = []
-            for line in cleaned_text.split('\n'):
-                line = line.strip()
-                if not line or ':' not in line:
-                    continue
-                parts = line.split(':', 1)
-                if len(parts) != 2:
-                    continue
-                speaker_raw = parts[0].strip()
-                text_part = parts[1].strip()
-                if not text_part:
-                    continue
-                # Normaliser le speaker
-                if any(w in speaker_raw.lower() for w in ['agent', 'secrétaire', 'cabinet']):
-                    speaker = "Agent"
-                elif any(w in speaker_raw.lower() for w in ['client', 'patient', 'appelant']):
-                    speaker = "Client"
-                else:
-                    speaker = speaker_raw
-                if speaker in ["Agent", "Client"]:
-                    cleaned_segments.append({"speaker": speaker, "text": text_part, "mood": None})
-
-            if len(cleaned_segments) >= 2:
-                # Redistribuer les timestamps proportionnellement
-                total_words_cleaned = sum(len(s["text"].split()) for s in cleaned_segments)
-                total_dur = merged[-1]["end"] - merged[0]["start"] if merged else est_dur
-                start_time = merged[0]["start"] if merged else 0.0
-                current_t = start_time
-
-                for i_seg, seg in enumerate(cleaned_segments):
-                    word_count = len(seg["text"].split())
-                    seg_dur = (word_count / total_words_cleaned) * total_dur if total_words_cleaned > 0 else 1.0
-                    seg["start"] = round(current_t, 2)
-                    seg["end"] = round(current_t + seg_dur, 2)
-                    current_t += seg_dur
-
-                merged = cleaned_segments
-                log(f"[STEREO] Cleanup: reorganized into {len(merged)} segments")
-            else:
-                log(f"[STEREO] Cleanup: failed to parse ({len(cleaned_segments)} segments), keeping raw")
-        else:
-            log(f"[STEREO] Cleanup: response too short or empty, keeping raw")
-    except Exception as e_cleanup:
-        log(f"[STEREO] Cleanup failed: {e_cleanup}, keeping raw segments")
 
     log(f"[STEREO] Final: {len(merged)} segments")
 
