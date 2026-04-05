@@ -1905,111 +1905,131 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
     turn_counts = {s: sum(1 for t in turns if t["speaker"] == s) for s in speakers_found}
     log(f"[STEREO] Timeline: {len(turns)} turns ({turn_counts})")
 
-    # ── Étape 3 : Transcrire chaque tour depuis SON CANAL ─────────────────
-    # Chaque canal contient UN speaker — on transcrit toujours, sans filtrer.
-    # Le VAD mono a déjà validé qu'il y a de la parole dans ces régions.
+    # ── Étape 3 : Transcrire chaque canal EN ENTIER ─────────────────────────
+    # Au lieu de transcrire tour par tour (perte de contexte), on envoie
+    # le canal complet (nettoyé du silence) à Voxtral en un seul appel.
+    # Voxtral a le contexte complet → meilleure reconnaissance des mots.
+    # Puis on distribue le texte sur les blocs VAD par proportion de durée.
     channel_map = {left_role: 0, right_role: 1}
     segments = []
 
-    # Textes qui sont clairement des hallucinations (prompt echo, exemples, artefacts)
-    HALLUCINATION_PATTERNS = [
-        "[transcribe]", "transcris uniquement", "voix principale",
-        "ignore les voix", "ignore les annonces",
-        "conserve les hésitations", "n'invente rien",
-        "cabinet dentaire dupont",  # exemple du prompt mono
-        "rendez-vous pour un détartrage",  # exemple du prompt mono
-    ]
-
-    i = 0
-    while i < len(turns):
-        turn = turns[i]
-        speaker = turn["speaker"]
-        channel = channel_map.get(speaker, 0)
-
-        # --- Batching : regrouper tours courts consécutifs du même speaker ---
-        batch_end = i
-        batch_dur = turn["end"] - turn["start"]
-        while (batch_end + 1 < len(turns)
-               and turns[batch_end + 1]["speaker"] == speaker
-               and turns[batch_end + 1]["end"] - turn["start"] < 8.0  # max 8s de batch
-               and turns[batch_end + 1]["end"] - turns[batch_end + 1]["start"] < 2.0):
-            batch_end += 1
-            batch_dur = turns[batch_end]["end"] - turn["start"]
-
-        batch_start_t = turn["start"]
-        batch_end_t = turns[batch_end]["end"]
-        batch_count = batch_end - i + 1
-        actual_dur = batch_end_t - batch_start_t
-
-        # Padding léger pour les tours courts (max 0.5s de chaque côté)
-        # Trop de padding = Voxtral reçoit du silence et hallucine/répète le prompt
-        if actual_dur < 2.0:
-            padding = min(0.5, (2.0 - actual_dur) / 2.0)
-            extract_start = max(0, batch_start_t - padding)
-            extract_end = batch_end_t + padding
-        else:
-            extract_start = batch_start_t
-            extract_end = batch_end_t
-
-        turn_audio = _extract_turn_audio_channel(wav_path, extract_start, extract_end, channel)
-        if not turn_audio:
-            i = batch_end + 1
+    for role in [left_role, right_role]:
+        channel = channel_map[role]
+        # Collecter tous les blocs VAD de ce speaker
+        role_turns = [(t["start"], t["end"]) for t in turns if t["speaker"] == role]
+        if not role_turns:
             continue
 
+        total_speech_dur = sum(e - s for s, e in role_turns)
+        log(f"[STEREO] {role}: {len(role_turns)} turns, {total_speech_dur:.1f}s speech → transcribing channel {channel} in full")
+
+        # Extraire uniquement les portions de parole du canal (sans silence)
+        # et les concaténer en un seul audio
         try:
-            if USE_WHISPER_STEREO:
-                text = _transcribe_turn_whisper(turn_audio, language or "fr")
+            audio = AudioSegment.from_file(wav_path)
+            if audio.channels > 1:
+                channels = audio.split_to_mono()
+                ch_audio = channels[channel]
             else:
-                text = _transcribe_turn(turn_audio, language, batch_end_t - batch_start_t, from_channel=True)
+                ch_audio = audio
+
+            parts = []
+            for s, e in role_turns:
+                part = ch_audio[int(s * 1000):int(e * 1000)]
+                if len(part) > 0:
+                    parts.append(part)
+                    # 200ms de silence entre les blocs pour que Voxtral respire
+                    parts.append(AudioSegment.silent(duration=200, frame_rate=ch_audio.frame_rate))
+
+            if not parts:
+                continue
+
+            clean_audio = parts[0]
+            for p in parts[1:]:
+                clean_audio += p
+
+            clean_dur = len(clean_audio) / 1000.0
+            clean_path = os.path.join(tempfile.gettempdir(), f"ch{channel}_full_{uuid.uuid4().hex}.wav")
+            clean_audio.export(clean_path, format="wav")
+            log(f"[STEREO] {role}: extracted {clean_dur:.1f}s speech audio")
+        except Exception as e_extract:
+            log(f"[STEREO] {role}: extraction failed: {e_extract}")
+            continue
+
+        # Transcrire le canal complet en un seul appel Voxtral
+        try:
+            tokens = max(256, min(int(total_speech_dur * 10), 12000))
+            timeout = min(int(total_speech_dur * 0.7) + 60, 600)
+
+            if USE_WHISPER_STEREO:
+                full_text = _transcribe_turn_whisper(clean_path, language or "fr")
+            else:
+                full_text = _transcribe_turn(clean_path, language, total_speech_dur, from_channel=True)
         finally:
-            if os.path.exists(turn_audio):
-                os.remove(turn_audio)
+            if os.path.exists(clean_path):
+                os.remove(clean_path)
 
-        if text and len(text.split()) >= 1:
-            # --- Filtre : uniquement les hallucinations de prompt (echo/exemple) ---
-            text_lower = text.lower()
-            is_hallucination = any(p in text_lower for p in HALLUCINATION_PATTERNS)
-            if is_hallucination:
-                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {batch_start_t:.1f}-{batch_end_t:.1f}s): prompt echo '{text[:50]}', skipped")
+        if not full_text or len(full_text.split()) < 2:
+            log(f"[STEREO] {role}: empty transcription, skipping")
+            continue
 
-            if not is_hallucination:
+        # Nettoyage
+        full_text = remove_repetitive_loops(full_text, max_repetitions=3)
+        full_text = re.sub(r'\[(?:Musique|Silence|Music|Silent|Attente|Hold)\]\s*', '', full_text, flags=re.IGNORECASE).strip()
+
+        log(f"[STEREO] {role}: {len(full_text)} chars transcribed")
+
+        # Distribuer le texte sur les blocs VAD par proportion de durée
+        words = full_text.split()
+        total_words = len(words)
+        word_idx = 0
+
+        for j, (b_start, b_end) in enumerate(role_turns):
+            block_dur = b_end - b_start
+            if j == len(role_turns) - 1:
+                # Dernier bloc : tous les mots restants
+                block_words = words[word_idx:]
+            else:
+                n_words = max(1, round(total_words * block_dur / total_speech_dur))
+                n_words = min(n_words, total_words - word_idx)
+                block_words = words[word_idx:word_idx + n_words]
+                word_idx += n_words
+
+            if block_words:
                 segments.append({
-                    "speaker": speaker,
-                    "start": round(batch_start_t, 2),
-                    "end": round(batch_end_t, 2),
-                    "text": text,
+                    "speaker": role,
+                    "start": round(b_start, 2),
+                    "end": round(b_end, 2),
+                    "text": " ".join(block_words),
                     "mood": None,
                 })
-                batch_label = f" (batch {batch_count})" if batch_count > 1 else ""
-                log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker} {batch_start_t:.1f}-{batch_end_t:.1f}s): {len(text)} chars{batch_label}")
-        else:
-            log(f"[STEREO] Turn {i+1}/{len(turns)} ({speaker}): empty, skipped")
-
-        i = batch_end + 1
 
     if not segments:
-        log("[STEREO] All turns empty → fallback Voxtral Speaker ID")
+        log("[STEREO] All channels empty → fallback Voxtral Speaker ID")
         mono_fb = _to_mono_tmp(wav_path)
         result = diarize_with_voxtral_speaker_id(mono_fb, language, max_new_tokens, with_summary, call_direction)
         if mono_fb != wav_path and os.path.exists(mono_fb): os.remove(mono_fb)
         return result
 
-    # ── Étape 4 : Supprimer les segments dupliqués (annonces en boucle) ────
+    # Trier par timestamp (les segments des deux canaux sont intercalés)
+    segments.sort(key=lambda s: s["start"])
+
+    # Supprimer les segments dupliqués (annonces en boucle)
     segments = remove_duplicate_segments(segments)
     if not segments:
         return {"segments": [], "transcript": "", "summary": "Aucune conversation détectée.", "diarization_mode": "stereo_energy"}
 
-    # ── Étape 5 : Fusionner segments consécutifs même speaker ───────────────
+    # Fusionner segments consécutifs même speaker
     merged = [segments[0]]
     for seg in segments[1:]:
         prev = merged[-1]
         if prev["speaker"] == seg["speaker"]:
             prev["text"] = prev["text"].rstrip() + " " + seg["text"].lstrip()
-            prev["end"]  = seg["end"]
+            prev["end"] = seg["end"]
         else:
             merged.append(seg)
 
-    log(f"[STEREO] Final: {len(merged)} segments (from {len(turns)} turns)")
+    log(f"[STEREO] Final: {len(merged)} segments")
 
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in merged if s.get("text"))
     result = {
