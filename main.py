@@ -2029,6 +2029,83 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         else:
             merged.append(seg)
 
+    log(f"[STEREO] Raw segments: {len(merged)} (before cleanup)")
+
+    # ── Étape 4b : Relecture Voxtral — reconstituer le dialogue propre ────
+    # La distribution proportionnelle casse les phrases. On envoie le transcript brut
+    # à Voxtral (texte only, pas audio) pour qu'il reconstitue un dialogue cohérent.
+    raw_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in merged if s.get("text"))
+
+    cleanup_prompt = (
+        f"lang:{language or 'fr'} "
+        "Voici la transcription brute d'un appel téléphonique dans un cabinet dentaire/médical. "
+        "Les phrases sont fragmentées et mal découpées entre Agent et Client.\n\n"
+        "REFORMATE ce dialogue en recollant les phrases coupées et en attribuant correctement chaque réplique.\n"
+        "- L'Agent est le secrétariat/cabinet qui répond ou appelle\n"
+        "- Le Client est le patient/appelant\n"
+        "- Reconstitue les phrases complètes (recolle les fragments)\n"
+        "- Garde le texte MOT POUR MOT, ne change aucun mot\n"
+        "- Une ligne par prise de parole : Agent: ... ou Client: ...\n\n"
+        f"Transcript brut:\n{raw_transcript}\n\n"
+        "Dialogue reformaté:"
+    )
+
+    try:
+        cleanup_tokens = min(int(len(raw_transcript) * 1.2), 4000)
+        log(f"[STEREO] Cleanup: sending {len(raw_transcript)} chars for reorganization...")
+        cleanup_result = run_voxtral_with_timeout(
+            [{"role": "user", "content": [{"type": "text", "text": cleanup_prompt}]}],
+            max_new_tokens=cleanup_tokens, timeout=60
+        )
+        cleaned_text = (cleanup_result.get("text") or "").strip()
+
+        if cleaned_text and len(cleaned_text) > len(raw_transcript) * 0.3:
+            # Parser le dialogue nettoyé en segments
+            cleaned_segments = []
+            for line in cleaned_text.split('\n'):
+                line = line.strip()
+                if not line or ':' not in line:
+                    continue
+                parts = line.split(':', 1)
+                if len(parts) != 2:
+                    continue
+                speaker_raw = parts[0].strip()
+                text_part = parts[1].strip()
+                if not text_part:
+                    continue
+                # Normaliser le speaker
+                if any(w in speaker_raw.lower() for w in ['agent', 'secrétaire', 'cabinet']):
+                    speaker = "Agent"
+                elif any(w in speaker_raw.lower() for w in ['client', 'patient', 'appelant']):
+                    speaker = "Client"
+                else:
+                    speaker = speaker_raw
+                if speaker in ["Agent", "Client"]:
+                    cleaned_segments.append({"speaker": speaker, "text": text_part, "mood": None})
+
+            if len(cleaned_segments) >= 2:
+                # Redistribuer les timestamps proportionnellement
+                total_words_cleaned = sum(len(s["text"].split()) for s in cleaned_segments)
+                total_dur = merged[-1]["end"] - merged[0]["start"] if merged else est_dur
+                start_time = merged[0]["start"] if merged else 0.0
+                current_t = start_time
+
+                for i_seg, seg in enumerate(cleaned_segments):
+                    word_count = len(seg["text"].split())
+                    seg_dur = (word_count / total_words_cleaned) * total_dur if total_words_cleaned > 0 else 1.0
+                    seg["start"] = round(current_t, 2)
+                    seg["end"] = round(current_t + seg_dur, 2)
+                    current_t += seg_dur
+
+                merged = cleaned_segments
+                log(f"[STEREO] Cleanup: reorganized into {len(merged)} segments")
+            else:
+                log(f"[STEREO] Cleanup: failed to parse ({len(cleaned_segments)} segments), keeping raw")
+        else:
+            log(f"[STEREO] Cleanup: response too short or empty, keeping raw")
+    except Exception as e_cleanup:
+        log(f"[STEREO] Cleanup failed: {e_cleanup}, keeping raw segments")
+
     log(f"[STEREO] Final: {len(merged)} segments")
 
     full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in merged if s.get("text"))
@@ -2039,14 +2116,14 @@ def diarize_with_stereo_channels(wav_path: str, language: Optional[str], max_new
         "audio_duration": est_dur,
     }
 
-    # ── Étape 6 : Summary (même fonction que mono — résultats meilleurs) ────
+    # ── Étape 5 : Summary (même fonction que mono) ────
     if with_summary:
         log("[STEREO] Generating summary...")
         result["summary"] = select_best_summary_approach(full_transcript, duration_seconds=est_dur)
 
-    # ── Étape 7 : Sentiment (même analyse que mono — Voxtral sur le texte) ──
+    # ── Étape 6 : Sentiment Client uniquement ──
     if ENABLE_SENTIMENT:
-        log("[STEREO] Analyzing sentiment by speaker...")
+        log("[STEREO] Analyzing sentiment...")
         speaker_sentiments = analyze_sentiment_by_speaker(merged)
         if speaker_sentiments:
             mood_overall, mood_by_speaker, client_mood = _attach_sentiment(merged, speaker_sentiments)
