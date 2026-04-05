@@ -44,7 +44,7 @@ RUN python3 /tmp/patch_torch_load.py && rm /tmp/patch_torch_load.py
 RUN mkdir -p /app/.cache/huggingface /app/.cache/torch
 
 # Copy app files
-COPY main2.py /app/main.py
+COPY main.py /app/main.py
 
 ENV LLM_MODEL_ID="mistralai/Mistral-Small-3.1-24B-Instruct-2503" \
     WHISPER_MODEL_SIZE="large-v2" \
