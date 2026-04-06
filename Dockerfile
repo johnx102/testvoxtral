@@ -67,35 +67,37 @@ ENV LLM_MODEL_ID="mistralai/Ministral-8B-Instruct-2410" \
 # Note : HF_TOKEN est passé via les env vars RunPod au runtime (pas ici)
 
 # ─── Pré-téléchargement des modèles dans l'image ─────────────────────────────
-# HF_TOKEN doit être passé en build arg : --build-arg HF_TOKEN=hf_xxx
-# Dans RunPod : Settings → Build → Environment Variables → HF_TOKEN
-#
-# Les modèles (~17 GB) sont stockés dans /app/.cache/huggingface qui fait partie
-# de l'image Docker. Au cold start : chargement disque ~7-10s, pas de téléchargement.
+# Le script preload_models.py fait un diagnostic complet des env vars au build,
+# tente plusieurs noms de token, et télécharge les modèles si possible.
+# Si aucun token n'est trouvé, il sort proprement (exit 0) → le build continue
+# et les modèles seront téléchargés au 1er cold start.
 
 ARG HF_TOKEN=""
-RUN if [ -n "$HF_TOKEN" ]; then \
-        echo "[BUILD] HF_TOKEN trouvé (${#HF_TOKEN} chars) — pré-téléchargement des modèles..." && \
-        HF_TOKEN=$HF_TOKEN python3 -c " \
-import os; \
-os.environ['HF_TOKEN'] = os.environ.get('HF_TOKEN', ''); \
-from huggingface_hub import snapshot_download; \
-print('[BUILD] Downloading Ministral 8B Instruct 2410...'); \
-snapshot_download( \
-    repo_id='mistralai/Ministral-8B-Instruct-2410', \
-    token=os.environ['HF_TOKEN'], \
-    ignore_patterns=['*.msgpack', '*.h5', 'flax_model*', 'tf_model*', 'consolidated*', 'original/*'], \
-); \
-print('[BUILD] Downloading Whisper large-v2...'); \
-from faster_whisper import WhisperModel; \
-WhisperModel('large-v2', device='cpu', compute_type='int8'); \
-print('[BUILD] All models cached successfully'); \
-" && \
-        echo "[BUILD] Modèles pré-téléchargés dans /app/.cache/huggingface" && \
-        du -sh /app/.cache/huggingface; \
-    else \
-        echo "[BUILD] Pas de HF_TOKEN — les modèles seront téléchargés au premier cold start"; \
-        echo "[BUILD] Pour pré-cacher : ajouter HF_TOKEN dans RunPod Build Settings"; \
-    fi
+ARG HUGGING_FACE_HUB_TOKEN=""
+ARG HUGGINGFACE_HUB_TOKEN=""
+ARG HF_ACCESS_TOKEN=""
+ARG HUGGINGFACE_TOKEN=""
+ARG HUGGING_FACE_TOKEN=""
+ARG HF_API_TOKEN=""
+ARG HUGGINGFACEHUB_API_TOKEN=""
+# CACHE_BUST : changer pour forcer le re-run du step preload
+ARG CACHE_BUST="2026-04-06-v6-diagnostic"
+
+COPY preload_models.py /tmp/preload_models.py
+RUN echo "[BUILD] CACHE_BUST=$CACHE_BUST" && \
+    HF_TOKEN="$HF_TOKEN" \
+    HUGGING_FACE_HUB_TOKEN="$HUGGING_FACE_HUB_TOKEN" \
+    HUGGINGFACE_HUB_TOKEN="$HUGGINGFACE_HUB_TOKEN" \
+    HF_ACCESS_TOKEN="$HF_ACCESS_TOKEN" \
+    HUGGINGFACE_TOKEN="$HUGGINGFACE_TOKEN" \
+    HUGGING_FACE_TOKEN="$HUGGING_FACE_TOKEN" \
+    HF_API_TOKEN="$HF_API_TOKEN" \
+    HUGGINGFACEHUB_API_TOKEN="$HUGGINGFACEHUB_API_TOKEN" \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    PRELOAD_LLM_MODEL="mistralai/Ministral-8B-Instruct-2410" \
+    PRELOAD_WHISPER_MODEL="large-v2" \
+    python3 /tmp/preload_models.py && \
+    rm /tmp/preload_models.py && \
+    (du -sh /app/.cache/huggingface 2>/dev/null || echo "[BUILD] No preloaded cache")
 
 ENTRYPOINT ["python", "-u", "main.py"]
