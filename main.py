@@ -54,7 +54,14 @@ WHISPER_COMPUTE    = os.environ.get("WHISPER_COMPUTE", "float16")
 # Mistral Small 3.1 (texte only — résumé, sentiment, correction)
 # Forcé en dur — ne pas utiliser d'env var pour éviter les overrides
 LLM_MODEL_ID       = "mistralai/Mistral-Nemo-Instruct-2407"
-QUANT_MODE         = os.environ.get("QUANT_MODE", "bnb4").lower()
+_RAW_QUANT_MODE    = os.environ.get("QUANT_MODE", "bnb4").lower().strip()
+# Valeurs valides uniquement — tout le reste (torchao, auto, empty, ...) → bnb4 par défaut
+_VALID_QUANT_MODES = {"bnb4", "int4", "nf4", "bnb8", "int8", "bf16", "bfloat16"}
+if _RAW_QUANT_MODE not in _VALID_QUANT_MODES:
+    print(f"[CONFIG] QUANT_MODE='{_RAW_QUANT_MODE}' non reconnu → fallback 'bnb4'", flush=True)
+    QUANT_MODE = "bnb4"
+else:
+    QUANT_MODE = _RAW_QUANT_MODE
 
 # Sentiment
 ENABLE_SENTIMENT   = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
