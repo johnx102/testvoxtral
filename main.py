@@ -677,7 +677,12 @@ def detect_hold_music(audio_path: str) -> Dict[str, Any]:
 # =============================================================================
 # DEDUPLICATION
 # =============================================================================
-def remove_duplicate_segments(segments: List[Dict], similarity_threshold: float = 0.7) -> List[Dict]:
+def remove_duplicate_segments(segments: List[Dict], similarity_threshold: float = 0.85) -> List[Dict]:
+    """Supprime les segments dupliqués (boucles Whisper) en respectant 2 règles :
+    - Ne dédupplique JAMAIS entre speakers différents (Agent et Client peuvent dire les mêmes mots)
+    - N'agit que sur des segments d'au moins 4 mots (sinon trop de faux positifs sur 'oui oui')
+    - Seuil de similarité 0.85 (au lieu de 0.7) pour être plus strict
+    """
     if len(segments) <= 1:
         return segments
     def text_similarity(a, b):
@@ -686,16 +691,25 @@ def remove_duplicate_segments(segments: List[Dict], similarity_threshold: float 
         if not words_a or not words_b: return 0.0
         return len(words_a & words_b) / max(len(words_a), len(words_b))
 
-    seen, cleaned = [], []
+    # Indexer par speaker : on dédupplique au sein d'un même speaker uniquement
+    seen_by_speaker: Dict[str, List[str]] = {}
+    cleaned = []
     for seg in segments:
         text = seg.get("text", "").strip()
-        if not text: continue
-        if any(text_similarity(text, s) >= similarity_threshold for s in seen):
+        if not text:
+            continue
+        speaker = seg.get("speaker", "")
+        # Ne dédupplique que les segments significatifs (≥ 4 mots)
+        if len(text.split()) < 4:
+            cleaned.append(seg)
+            continue
+        seen_list = seen_by_speaker.setdefault(speaker, [])
+        if any(text_similarity(text, s) >= similarity_threshold for s in seen_list):
             continue
         cleaned.append(seg)
-        seen.append(text)
+        seen_list.append(text)
     if len(cleaned) < len(segments):
-        log(f"[DEDUP] Removed {len(segments) - len(cleaned)} duplicate segments")
+        log(f"[DEDUP] Removed {len(segments) - len(cleaned)} duplicate segments (within-speaker only)")
     return cleaned
 
 
@@ -707,37 +721,38 @@ HOLD_MUSIC_LABEL = "Annonce musicale / musique d'attente"
 
 def _is_repetitive_announcement(text: str, duration: float) -> bool:
     """Détecte si un texte ressemble à une annonce IVR répétée (ex: 'Veuillez patienter' × 10).
-    Heuristiques :
-    - Texte long (>20 mots) avec < 30% de mots uniques (forte répétition)
-    - OU une sous-chaîne de 6+ mots apparaît ≥ 3 fois
-    - OU durée > 3 min avec < 80 mots uniques (débit anormalement bas)
+    Conditions strictes pour éviter les faux positifs sur conversations naturelles :
+    - Durée minimum : 2 min (les vraies annonces durent ≥ 2-3 min)
+    - Au moins 50 mots de texte
+    - ET (ratio mots uniques < 20% OU n-gram de 8 mots répété ≥ 4 fois)
     """
-    if not text or duration < 60:  # Pas d'annonce pour les appels courts
+    if not text or duration < 120:  # Pas d'annonce pour les appels < 2 min
         return False
+
     # Nettoyer : retirer "..." et ponctuations
     clean = re.sub(r"[.\!?,;:\-\"\'\(\)]+", " ", text.lower())
     clean = re.sub(r"\s+", " ", clean).strip()
     words = clean.split()
-    if len(words) < 20:
+    if len(words) < 50:
         return False
 
     unique_ratio = len(set(words)) / len(words)
 
-    # Cas 1 : trop peu de mots uniques
-    if unique_ratio < 0.30:
+    # Critère 1 : ratio mots uniques très bas (< 20%)
+    if unique_ratio < 0.20:
         return True
 
-    # Cas 2 : débit anormal (long appel, très peu de contenu réel)
-    if duration >= 180 and len(set(words)) < 80:
-        return True
-
-    # Cas 3 : n-gram de 6 mots répété ≥ 3 fois
-    if len(words) >= 30:
+    # Critère 2 : n-gram de 8 mots répété ≥ 4 fois (signature claire d'annonce IVR bouclée)
+    if len(words) >= 40:
         from collections import Counter
-        ngrams = [" ".join(words[i:i+6]) for i in range(len(words) - 5)]
+        ngrams = [" ".join(words[i:i+8]) for i in range(len(words) - 7)]
         most_common = Counter(ngrams).most_common(1)
-        if most_common and most_common[0][1] >= 3:
+        if most_common and most_common[0][1] >= 4:
             return True
+
+    # Critère 3 : durée très longue (>5 min) avec très peu de vocabulaire
+    if duration >= 300 and len(set(words)) < 60:
+        return True
 
     return False
 
@@ -966,11 +981,14 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         log(f"[HANDLER] Final: {len(merged)} segments")
 
-        # Détection d'annonce IVR répétée (ex: "Veuillez patienter" × 10)
-        full_text_for_check = " ".join(s.get("text", "") for s in merged)
-        if _is_repetitive_announcement(full_text_for_check, est_dur):
-            log(f"[HANDLER] Repetitive announcement detected ({len(full_text_for_check)} chars) → hold music response")
-            return _build_hold_music_response(est_dur, "stereo_repetitive_announcement")
+        # Détection d'annonce IVR répétée — UNIQUEMENT si monologue (1 seul speaker)
+        # Une vraie conversation a 2 speakers, ce n'est pas une annonce.
+        speakers_present = set(s.get("speaker") for s in merged if s.get("text"))
+        if len(speakers_present) <= 1:
+            full_text_for_check = " ".join(s.get("text", "") for s in merged)
+            if _is_repetitive_announcement(full_text_for_check, est_dur):
+                log(f"[HANDLER] Repetitive announcement detected ({len(full_text_for_check)} chars, monologue) → hold music response")
+                return _build_hold_music_response(est_dur, "stereo_repetitive_announcement")
 
         full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in merged if s.get("text"))
 
