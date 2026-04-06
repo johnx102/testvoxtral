@@ -74,15 +74,28 @@ ENV LLM_MODEL_ID="mistralai/Ministral-8B-Instruct-2410" \
 # ⚠ Supprime QUANT_MODE des env vars RunPod Settings pour que la valeur de l'image s'applique
 
 # ─── Pré-téléchargement des modèles dans l'image ─────────────────────────────
-# HF_TOKEN doit être passé en build arg : --build-arg HF_TOKEN=hf_xxx
-# Dans RunPod : Settings → Build → Environment Variables → HF_TOKEN
-# Si HF_TOKEN absent : les modèles seront téléchargés au premier cold start (pas d'erreur build)
+# RunPod peut passer le token sous différents noms → on accepte plusieurs variantes.
+# Sur build local : docker build --build-arg HF_TOKEN=hf_xxx ...
+# Sur RunPod : ajoute HF_TOKEN dans les Build Environment Variables (pas Runtime)
 
 ARG HF_TOKEN=""
+ARG HUGGING_FACE_HUB_TOKEN=""
+ARG HF_ACCESS_TOKEN=""
+ARG HUGGINGFACE_TOKEN=""
+# CACHE_BUST : à changer pour forcer le rebuild de la couche preload
+# (ex: nouveau timestamp, ou nouvelle version). Important si la précédente était cached sans token.
+ARG CACHE_BUST="2026-04-06-v3"
+
 COPY preload_models.py /tmp/preload_models.py
-RUN if [ -n "$HF_TOKEN" ]; then \
-        echo "[BUILD] HF_TOKEN trouvé — lancement du pré-téléchargement..." && \
-        HF_TOKEN="$HF_TOKEN" \
+RUN CACHE_BUST_VALUE="$CACHE_BUST" && \
+    EFFECTIVE_HF_TOKEN="${HF_TOKEN}" && \
+    [ -z "$EFFECTIVE_HF_TOKEN" ] && EFFECTIVE_HF_TOKEN="${HUGGING_FACE_HUB_TOKEN}" || true ; \
+    [ -z "$EFFECTIVE_HF_TOKEN" ] && EFFECTIVE_HF_TOKEN="${HF_ACCESS_TOKEN}" || true ; \
+    [ -z "$EFFECTIVE_HF_TOKEN" ] && EFFECTIVE_HF_TOKEN="${HUGGINGFACE_TOKEN}" || true ; \
+    echo "[BUILD] CACHE_BUST=$CACHE_BUST_VALUE" && \
+    if [ -n "$EFFECTIVE_HF_TOKEN" ]; then \
+        echo "[BUILD] Token HF trouvé (${#EFFECTIVE_HF_TOKEN} chars) — pré-téléchargement..." && \
+        HF_TOKEN="$EFFECTIVE_HF_TOKEN" \
         HF_HUB_ENABLE_HF_TRANSFER=1 \
         PRELOAD_LLM_MODEL="mistralai/Ministral-8B-Instruct-2410" \
         PRELOAD_WHISPER_MODEL="large-v2" \
@@ -90,7 +103,8 @@ RUN if [ -n "$HF_TOKEN" ]; then \
         du -sh /app/.cache/huggingface && \
         rm /tmp/preload_models.py ; \
     else \
-        echo "[BUILD] ⚠ Pas de HF_TOKEN — modèles téléchargés au premier cold start" && \
+        echo "[BUILD] ⚠ Aucun token HF trouvé (HF_TOKEN, HUGGING_FACE_HUB_TOKEN, HF_ACCESS_TOKEN, HUGGINGFACE_TOKEN tous vides)" && \
+        echo "[BUILD] ⚠ Les modèles seront téléchargés au 1er cold start (+40s)" && \
         rm /tmp/preload_models.py ; \
     fi
 
