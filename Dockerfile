@@ -339,15 +339,15 @@ def generate_summary(transcript: str, duration_seconds: float = 0) -> str:
     if not transcript or len(transcript.split()) < 10:
         return "Conversation très brève."
 
-    if duration_seconds <= 180:   max_tokens = 50
-    elif duration_seconds <= 600: max_tokens = 70
-    else:                         max_tokens = 90
+    if duration_seconds <= 180:   max_tokens = 70
+    elif duration_seconds <= 600: max_tokens = 90
+    else:                         max_tokens = 110
 
     prompt = (
-        "Résume cette conversation téléphonique en UNE SEULE phrase courte (max 25 mots). "
+        "Résume cette conversation téléphonique en 1 ou 2 phrases courtes (max 40 mots au total). "
         "Dis uniquement l'essentiel : qui appelle, pour quoi, et la conclusion. "
-        "Pas d'introduction, pas de reformulation, juste le fait principal.\n\n"
-        f"Conversation:\n{transcript[:3000]}\n\nRésumé en une phrase:"
+        "Pas d'introduction, pas de reformulation inutile, va droit au but.\n\n"
+        f"Conversation:\n{transcript[:3000]}\n\nRésumé court:"
     )
 
     summary = run_llm(prompt, max_new_tokens=max_tokens)
