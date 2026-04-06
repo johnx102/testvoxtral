@@ -127,6 +127,18 @@ def _extract_mono_channel(wav_path: str, channel: int) -> str:
 # =============================================================================
 # WHISPER — Transcription
 # =============================================================================
+def _whisper_is_cached() -> bool:
+    """Vérifie si le modèle Whisper CTranslate2 est dans le cache HF."""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        from huggingface_hub.constants import _CACHED_NO_EXIST
+        repo_id = f"Systran/faster-whisper-{WHISPER_MODEL_SIZE}"
+        path = try_to_load_from_cache(repo_id, "model.bin")
+        return path is not None and path is not _CACHED_NO_EXIST
+    except Exception:
+        return False
+
+
 def _load_whisper():
     global _whisper_model
     if _whisper_model is not None:
@@ -134,7 +146,16 @@ def _load_whisper():
     try:
         from faster_whisper import WhisperModel
         log(f"[WHISPER] Loading model: {WHISPER_MODEL_SIZE} (device={WHISPER_DEVICE}, compute={WHISPER_COMPUTE})")
-        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE)
+        # local_files_only=True si cache présent → skip HEAD requests HF (~2-3s)
+        local_only = _whisper_is_cached()
+        if local_only:
+            log("[WHISPER] Cache détecté → local_files_only")
+        _whisper_model = WhisperModel(
+            WHISPER_MODEL_SIZE,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE,
+            local_files_only=local_only,
+        )
         log("[WHISPER] Model loaded successfully")
         return _whisper_model
     except Exception as e:
@@ -142,10 +163,23 @@ def _load_whisper():
         return None
 
 
-def _detect_hold_regions_in_channel(audio_np, sr: int, window_s: float = 3.0, hop_s: float = 1.5) -> List[Tuple[float, float]]:
-    """Détecte les zones (start_s, end_s) de musique d'attente / silence dans un canal.
-    Fenêtre glissante : RMS stable + speech_ratio bas = hold music.
-    Retourne les régions fusionnées."""
+def _detect_hold_regions_in_channel(
+    audio_np,
+    sr: int,
+    window_s: float = 5.0,
+    hop_s: float = 2.5,
+    min_region_s: float = 10.0,
+    speech_ratio_threshold: float = 0.03,
+) -> List[Tuple[float, float]]:
+    """Détecte les zones (start_s, end_s) de musique d'attente / silence prolongé.
+
+    Critères stricts pour éviter les faux positifs sur les pauses naturelles d'une conversation :
+    - Fenêtre 5s, hop 2.5s
+    - Speech ratio < 3% (très strict, vraie absence de parole)
+    - Durée minimale après fusion : 10s (une pause normale dans un dialogue dure 2-5s)
+
+    Une pause normale d'écoute dans une conversation NE doit PAS être considérée comme hold.
+    """
     import numpy as np
     win = int(window_s * sr)
     hop = int(hop_s * sr)
@@ -155,6 +189,11 @@ def _detect_hold_regions_in_channel(audio_np, sr: int, window_s: float = 3.0, ho
     frame_len = int(0.030 * sr)
     frame_hop = int(0.010 * sr)
 
+    # Énergie absolue de l'audio entier (référence pour distinguer silence vs hold music)
+    global_peak = float(np.max(np.abs(audio_np))) if len(audio_np) > 0 else 0.0
+    if global_peak < 1e-6:
+        return [(0.0, len(audio_np) / sr)]
+
     regions_raw: List[Tuple[float, float]] = []
     for i in range(0, len(audio_np) - win + 1, hop):
         chunk = audio_np[i:i + win]
@@ -162,28 +201,35 @@ def _detect_hold_regions_in_channel(audio_np, sr: int, window_s: float = 3.0, ho
         if n_frames < 10:
             continue
         rms = np.array([np.sqrt(np.mean(chunk[j*frame_hop:j*frame_hop+frame_len]**2)) for j in range(n_frames)])
-        peak = np.max(np.abs(chunk))
-        if peak < 1e-6:
+        local_peak = float(np.max(np.abs(chunk)))
+
+        # Seuil critique : on compare le pic local au pic global du canal
+        # Si le pic local < 5% du pic global → silence/musique très calme
+        if local_peak < 0.05 * global_peak:
             is_hold = True
         else:
-            rms_norm = rms / peak
+            rms_norm = rms / local_peak
             threshold = float(np.median(rms_norm)) + 1.5 * float(np.std(rms_norm))
             speech_ratio = float(np.sum(rms_norm > threshold)) / len(rms_norm)
-            is_hold = speech_ratio < HOLD_MUSIC_SPEECH_RATIO_SOFT
+            is_hold = speech_ratio < speech_ratio_threshold
+
         if is_hold:
             regions_raw.append((i / sr, (i + win) / sr))
 
     if not regions_raw:
         return []
 
-    # Fusionner les régions qui se chevauchent ou sont proches (< 1s d'écart)
+    # Fusionner les régions adjacentes (< 1s d'écart)
     merged: List[Tuple[float, float]] = []
     for start, end in regions_raw:
         if merged and start - merged[-1][1] < 1.0:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
             merged.append((start, end))
-    return merged
+
+    # Filtrer : ne garder que les régions ≥ min_region_s
+    filtered = [(s, e) for s, e in merged if (e - s) >= min_region_s]
+    return filtered
 
 
 def _mute_audio_regions(audio_np, sr: int, regions: List[Tuple[float, float]]):
@@ -228,6 +274,8 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             return []
 
         # vad_filter=True : saute les silences (majeure cause d'hallucinations Whisper)
+        # min_silence_duration_ms=1000 : ne coupe que les silences ≥ 1s (préserve les pauses naturelles)
+        # speech_pad_ms=400 : marge de 400ms autour de chaque zone de parole
         # condition_on_previous_text=False : évite les boucles d'hallucination
         # temperature=0 : déterministe, moins de variations créatives
         segments_raw, info = model.transcribe(
@@ -236,7 +284,11 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             beam_size=5,
             word_timestamps=True,
             vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 200},
+            vad_parameters={
+                "min_silence_duration_ms": 1000,
+                "speech_pad_ms": 400,
+                "threshold": 0.35,
+            },
             condition_on_previous_text=False,
             temperature=0.0,
             compression_ratio_threshold=2.4,
@@ -827,6 +879,20 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             if both_mostly_hold or one_full_hold_other_mostly:
                 log(f"[HANDLER] Audio dominé par hold/silence (ch0={hold_coverage_ch0*100:.0f}%, ch1={hold_coverage_ch1*100:.0f}%) → hold music response")
                 return _build_hold_music_response(est_dur, "stereo_hold_dominant")
+
+            # Décider si on applique le cross-mute :
+            # - Si UN seul canal est globalement hold music → cross-mute OK (cas typique : client en attente)
+            # - Si LES DEUX ont des hold regions sans qu'aucun soit globalement hold → conversation
+            #   normale avec pauses, on ne mute PAS (sinon on coupe des paroles légitimes)
+            apply_cross_mute = (
+                hold_ch0.get("is_hold_music") or hold_ch1.get("is_hold_music")
+                or hold_coverage_ch0 >= 0.50 or hold_coverage_ch1 >= 0.50
+            )
+            if not apply_cross_mute:
+                if hold_regions_ch0 or hold_regions_ch1:
+                    log(f"[HANDLER] Conversation bidirectionnelle (ch0={hold_coverage_ch0*100:.0f}%, ch1={hold_coverage_ch1*100:.0f}%) → cross-mute désactivé")
+                hold_regions_ch0 = []
+                hold_regions_ch1 = []
 
             # Skip les canaux détectés comme entièrement musique d'attente
             if ENABLE_HOLD_MUSIC_DETECTION and hold_ch0.get("is_hold_music"):
