@@ -54,7 +54,7 @@ RUN python3 /tmp/patch_torch_load.py && rm /tmp/patch_torch_load.py
 RUN mkdir -p /app/.cache/huggingface /app/.cache/torch
 
 # Copy app files
-COPY main2.py /app/main.py
+COPY main.py /app/main.py
 
 # ─── Variables d'environnement par défaut ────────────────────────────────────
 # QUANT_MODE : bnb4 (INT4 NF4, ~7GB VRAM, rapide) | bnb8 (INT8, ~12GB, lent) | bf16 (~24GB, très rapide)
