@@ -54,7 +54,7 @@ WHISPER_COMPUTE    = os.environ.get("WHISPER_COMPUTE", "float16")
 # Mistral Small 3.1 (texte only — résumé, sentiment, correction)
 # Forcé en dur — ne pas utiliser d'env var pour éviter les overrides
 LLM_MODEL_ID       = "mistralai/Mistral-Nemo-Instruct-2407"
-QUANT_MODE         = os.environ.get("QUANT_MODE", "bnb8").lower()
+QUANT_MODE         = os.environ.get("QUANT_MODE", "bnb4").lower()
 
 # Sentiment
 ENABLE_SENTIMENT   = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
@@ -227,16 +227,31 @@ def _load_llm():
     if HF_TOKEN:
         mdl_kwargs["token"] = HF_TOKEN
 
-    # INT8 par défaut pour Nemo 12B (meilleure qualité, ~12GB VRAM)
-    if torch.cuda.is_available():
-        try:
-            from transformers import BitsAndBytesConfig
-            mdl_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-            log("[LLM] INT8 BnB config ready")
-        except ImportError:
-            mdl_kwargs["torch_dtype"] = torch.bfloat16
+    # Mode de quantization configurable via QUANT_MODE env var :
+    #   "bf16"  → bfloat16 natif (le plus rapide, nécessite ~24GB VRAM pour Nemo 12B)
+    #   "bnb8"  → INT8 BitsAndBytes (~12GB VRAM, ~3× plus lent en inférence)
+    #   "bnb4"  → INT4 NF4 (~7GB VRAM, qualité un peu dégradée)
+    quant = QUANT_MODE.lower()
+    if torch.cuda.is_available() and quant in ("bnb8", "int8"):
+        from transformers import BitsAndBytesConfig
+        mdl_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        log("[LLM] INT8 BnB config ready")
+    elif torch.cuda.is_available() and quant in ("bnb4", "int4", "nf4"):
+        from transformers import BitsAndBytesConfig
+        mdl_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+        )
+        log("[LLM] INT4 NF4 BnB config ready")
     else:
         mdl_kwargs["torch_dtype"] = torch.bfloat16
+        # Flash Attention 2 si disponible (gain 20-40% sur long contexte)
+        try:
+            import flash_attn  # noqa: F401
+            mdl_kwargs["attn_implementation"] = "flash_attention_2"
+            log("[LLM] bfloat16 + flash_attention_2")
+        except ImportError:
+            log("[LLM] bfloat16 (no flash-attn)")
 
     _llm_model = AutoModelForCausalLM.from_pretrained(LLM_MODEL_ID, **mdl_kwargs)
     log("[LLM] Model loaded successfully")
