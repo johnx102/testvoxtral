@@ -66,38 +66,24 @@ ENV LLM_MODEL_ID="mistralai/Ministral-8B-Instruct-2410" \
     LOG_LEVEL="INFO"
 # Note : HF_TOKEN est passé via les env vars RunPod au runtime (pas ici)
 
-# ─── Pré-téléchargement des modèles dans l'image ─────────────────────────────
-# Le script preload_models.py fait un diagnostic complet des env vars au build,
-# tente plusieurs noms de token, et télécharge les modèles si possible.
-# Si aucun token n'est trouvé, il sort proprement (exit 0) → le build continue
-# et les modèles seront téléchargés au 1er cold start.
+# ─── Pré-téléchargement des modèles dans l'image (optionnel) ─────────────────
+# RunPod Serverless ne propage PAS les Runtime Env Vars vers le build Docker.
+# → Pour pré-cacher les modèles dans l'image, il faut soit :
+#   1) Build local : docker build --build-arg HF_TOKEN=hf_xxx ...
+#   2) BuildKit secret : docker build --secret id=hf_token,env=HF_TOKEN ...
+# Sans token → le script sort en exit 0, les modèles sont téléchargés au 1er
+# cold start, et FlashBoot prend le snapshot pour les cold starts suivants (~1s).
 
 ARG HF_TOKEN=""
 ARG HUGGING_FACE_HUB_TOKEN=""
-ARG HUGGINGFACE_HUB_TOKEN=""
-ARG HF_ACCESS_TOKEN=""
-ARG HUGGINGFACE_TOKEN=""
-ARG HUGGING_FACE_TOKEN=""
-ARG HF_API_TOKEN=""
-ARG HUGGINGFACEHUB_API_TOKEN=""
-# CACHE_BUST : changer pour forcer le re-run du step preload
-ARG CACHE_BUST="2026-04-06-v6-diagnostic"
 
 COPY preload_models.py /tmp/preload_models.py
-RUN echo "[BUILD] CACHE_BUST=$CACHE_BUST" && \
-    HF_TOKEN="$HF_TOKEN" \
+RUN HF_TOKEN="$HF_TOKEN" \
     HUGGING_FACE_HUB_TOKEN="$HUGGING_FACE_HUB_TOKEN" \
-    HUGGINGFACE_HUB_TOKEN="$HUGGINGFACE_HUB_TOKEN" \
-    HF_ACCESS_TOKEN="$HF_ACCESS_TOKEN" \
-    HUGGINGFACE_TOKEN="$HUGGINGFACE_TOKEN" \
-    HUGGING_FACE_TOKEN="$HUGGING_FACE_TOKEN" \
-    HF_API_TOKEN="$HF_API_TOKEN" \
-    HUGGINGFACEHUB_API_TOKEN="$HUGGINGFACEHUB_API_TOKEN" \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     PRELOAD_LLM_MODEL="mistralai/Ministral-8B-Instruct-2410" \
     PRELOAD_WHISPER_MODEL="large-v2" \
     python3 /tmp/preload_models.py && \
-    rm /tmp/preload_models.py && \
-    (du -sh /app/.cache/huggingface 2>/dev/null || echo "[BUILD] No preloaded cache")
+    rm /tmp/preload_models.py
 
 ENTRYPOINT ["python", "-u", "main.py"]
