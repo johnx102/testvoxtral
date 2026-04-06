@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTORCH_JIT=0 \
     TORCH_FORCE_WEIGHTS_ONLY_LOAD=0 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    APP_VERSION=whisper-mistral-v5.1 \
+    APP_VERSION=whisper-ministral8b-v5.2 \
     HF_HOME=/app/.cache/huggingface \
     TRANSFORMERS_CACHE=/app/.cache/huggingface \
     TORCH_HOME=/app/.cache/torch
@@ -57,9 +57,9 @@ RUN mkdir -p /app/.cache/huggingface /app/.cache/torch
 COPY main.py /app/main.py
 
 # ─── Variables d'environnement par défaut ────────────────────────────────────
-# QUANT_MODE : bnb4 (INT4 NF4, ~7GB VRAM, rapide) | bnb8 (INT8, ~12GB, lent) | bf16 (~24GB, très rapide)
-# ⚠ Sur RTX 4090 24GB : bnb4 recommandé
-ENV LLM_MODEL_ID="mistralai/Mistral-Nemo-Instruct-2407" \
+# QUANT_MODE : bf16 (~16GB VRAM, le plus rapide) | bnb8 (~8GB, lent) | bnb4 (~5GB, qualité moindre)
+# ⚠ Ministral 8B bf16 = ~16GB, tient sur RTX 4090 24GB avec Whisper (~3GB)
+ENV LLM_MODEL_ID="mistralai/Ministral-8B-Instruct-2410" \
     WHISPER_MODEL_SIZE="large-v2" \
     WHISPER_DEVICE="cuda" \
     WHISPER_COMPUTE="float16" \
@@ -68,7 +68,7 @@ ENV LLM_MODEL_ID="mistralai/Mistral-Nemo-Instruct-2407" \
     ENABLE_SENTIMENT="1" \
     ENABLE_HOLD_MUSIC_DETECTION="1" \
     ENABLE_TRANSCRIPT_CORRECTION="1" \
-    QUANT_MODE="bnb4" \
+    QUANT_MODE="bf16" \
     LOG_LEVEL="INFO"
 # Note : HF_TOKEN est passé via les env vars RunPod au runtime (pas ici)
 # ⚠ Supprime QUANT_MODE des env vars RunPod Settings pour que la valeur de l'image s'applique
@@ -76,89 +76,25 @@ ENV LLM_MODEL_ID="mistralai/Mistral-Nemo-Instruct-2407" \
 # ─── Pré-téléchargement des modèles dans l'image ─────────────────────────────
 # HF_TOKEN doit être passé en build arg : --build-arg HF_TOKEN=hf_xxx
 # Dans RunPod : Settings → Build → Environment Variables → HF_TOKEN
+# Si HF_TOKEN absent : les modèles seront téléchargés au premier cold start (pas d'erreur build)
 
 ARG HF_TOKEN=""
+COPY preload_models.py /tmp/preload_models.py
 RUN if [ -n "$HF_TOKEN" ]; then \
-        echo "[BUILD] HF_TOKEN trouvé — pré-téléchargement des modèles..." && \
-        HF_TOKEN=$HF_TOKEN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c "\
-import os; \
-os.environ['HF_HOME'] = '/app/.cache/huggingface'; \
-from huggingface_hub import snapshot_download; \
-print('[BUILD] Downloading Mistral Nemo 12B (text-only)...'); \
-snapshot_download( \
-    repo_id='mistralai/Mistral-Nemo-Instruct-2407', \
-    token=os.environ['HF_TOKEN'], \
-    cache_dir='/app/.cache/huggingface/hub', \
-    ignore_patterns=['*.msgpack', '*.h5', 'flax_model*', 'tf_model*', 'consolidated*', 'original/*'], \
-); \
-print('[BUILD] Downloading Whisper large-v2 (CTranslate2)...'); \
-from faster_whisper import WhisperModel; \
-m = WhisperModel('large-v2', device='cpu', compute_type='int8', download_root='/app/.cache/huggingface/faster-whisper'); \
-del m; \
-print('[BUILD] All models cached successfully'); \
-" && \
-        echo "[BUILD] Modèles pré-téléchargés dans /app/.cache/huggingface" && \
-        du -sh /app/.cache/huggingface; \
+        echo "[BUILD] HF_TOKEN trouvé — lancement du pré-téléchargement..." && \
+        HF_TOKEN="$HF_TOKEN" \
+        HF_HUB_ENABLE_HF_TRANSFER=1 \
+        PRELOAD_LLM_MODEL="mistralai/Ministral-8B-Instruct-2410" \
+        PRELOAD_WHISPER_MODEL="large-v2" \
+        python3 /tmp/preload_models.py && \
+        du -sh /app/.cache/huggingface && \
+        rm /tmp/preload_models.py ; \
     else \
-        echo "[BUILD] ⚠ Pas de HF_TOKEN — les modèles seront téléchargés au premier cold start"; \
-        echo "[BUILD] Pour pré-cacher : ajouter HF_TOKEN dans RunPod Build Settings"; \
-        exit 1; \
+        echo "[BUILD] ⚠ Pas de HF_TOKEN — modèles téléchargés au premier cold start" && \
+        rm /tmp/preload_models.py ; \
     fi
 
 # Forcer faster-whisper à utiliser le cache local au runtime
 ENV HF_HUB_CACHE=/app/.cache/huggingface/hub
-
-ENTRYPOINT ["python", "-u", "main.py"]
-RUN pip install --no-cache-dir faster-whisper>=1.0.0
-
-# Fix PyTorch 2.6+ weights_only
-COPY patch_torch_load.py /tmp/patch_torch_load.py
-RUN python3 /tmp/patch_torch_load.py && rm /tmp/patch_torch_load.py
-
-# Créer les dossiers de cache DANS l'image
-RUN mkdir -p /app/.cache/huggingface /app/.cache/torch
-
-# Copy app files
-COPY main.py /app/main.py
-
-ENV LLM_MODEL_ID="mistralai/Mistral-Small-3.1-24B-Instruct-2503" \
-    WHISPER_MODEL_SIZE="large-v2" \
-    WHISPER_DEVICE="cuda" \
-    WHISPER_COMPUTE="float16" \
-    MAX_DURATION_S="3600" \
-    WITH_SUMMARY_DEFAULT="1" \
-    ENABLE_SENTIMENT="1" \
-    ENABLE_HOLD_MUSIC_DETECTION="1" \
-    QUANT_MODE="torchao" \
-    LOG_LEVEL="INFO"
-# Note : HF_TOKEN est passé via les env vars RunPod au runtime (pas ici)
-
-# ─── Pré-téléchargement des modèles dans l'image ─────────────────────────────
-# HF_TOKEN doit être passé en build arg : --build-arg HF_TOKEN=hf_xxx
-# Dans RunPod : Settings → Build → Environment Variables → HF_TOKEN
-
-ARG HF_TOKEN=""
-RUN if [ -n "$HF_TOKEN" ]; then \
-        echo "[BUILD] HF_TOKEN trouvé — pré-téléchargement des modèles..." && \
-        HF_TOKEN=$HF_TOKEN python3 -c " \
-import os; \
-os.environ['HF_TOKEN'] = os.environ.get('HF_TOKEN', ''); \
-from huggingface_hub import snapshot_download; \
-print('[BUILD] Downloading Mistral Small 3.1 24B...'); \
-snapshot_download( \
-    repo_id='mistralai/Mistral-Small-3.1-24B-Instruct-2503', \
-    token=os.environ['HF_TOKEN'], \
-    ignore_patterns=['*.msgpack', '*.h5', 'flax_model*', 'tf_model*'], \
-); \
-print('[BUILD] Downloading Whisper large-v2...'); \
-from faster_whisper import WhisperModel; \
-WhisperModel('large-v2', device='cpu', compute_type='int8'); \
-print('[BUILD] All models cached successfully'); \
-" && \
-        echo "[BUILD] Modèles pré-téléchargés dans /app/.cache/huggingface"; \
-    else \
-        echo "[BUILD] Pas de HF_TOKEN — les modèles seront téléchargés au premier cold start"; \
-        echo "[BUILD] Pour pré-cacher : ajouter HF_TOKEN dans RunPod Build Settings"; \
-    fi
 
 ENTRYPOINT ["python", "-u", "main.py"]
