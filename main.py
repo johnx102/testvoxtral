@@ -276,21 +276,78 @@ def run_llm(prompt: str, max_new_tokens: int = 256) -> str:
 
 
 # =============================================================================
+# CORRECTION DU TRANSCRIPT
+# =============================================================================
+ENABLE_TRANSCRIPT_CORRECTION = os.environ.get("ENABLE_TRANSCRIPT_CORRECTION", "1") == "1"
+
+def correct_transcript(transcript: str) -> str:
+    """Corrige les erreurs de reconnaissance Whisper via Mistral.
+    Préserve STRICTEMENT le format ligne par ligne 'Speaker: texte'.
+    Retourne le transcript corrigé ou l'original en cas d'échec."""
+    if not transcript or len(transcript.split()) < 5:
+        return transcript
+
+    original_lines = [l for l in transcript.split("\n") if l.strip()]
+    n_lines = len(original_lines)
+
+    prompt = (
+        "Tu es un correcteur de transcription téléphonique française. "
+        "Corrige UNIQUEMENT les erreurs de reconnaissance vocale évidentes en utilisant le contexte "
+        "(ex: cabinet dentaire → 'désertage'/'détertraite' = 'détartrage', 'centre d'entraînement' = 'centre dentaire', noms propres mal orthographiés, etc.).\n"
+        "RÈGLES STRICTES :\n"
+        f"- Garde EXACTEMENT {n_lines} lignes, dans le même ordre\n"
+        "- Garde le préfixe 'Agent:' ou 'Client:' au début de chaque ligne\n"
+        "- Ne reformule pas, ne résume pas, ne supprime rien\n"
+        "- Change uniquement les mots manifestement mal transcrits\n"
+        "- Garde la ponctuation et les hésitations naturelles\n\n"
+        f"Transcript original :\n{transcript[:4000]}\n\n"
+        "Transcript corrigé (même nombre de lignes, même format) :"
+    )
+
+    # Budget tokens large : approx 1 token/char pour français
+    max_tok = min(1024, max(256, len(transcript) // 2))
+    corrected = run_llm(prompt, max_new_tokens=max_tok)
+
+    if not corrected:
+        log("[CORRECT] LLM returned empty → keeping original")
+        return transcript
+
+    corrected_lines = [l.strip() for l in corrected.split("\n") if l.strip()]
+    # Garder uniquement les lignes qui commencent par Agent: ou Client:
+    corrected_lines = [l for l in corrected_lines if l.startswith("Agent:") or l.startswith("Client:")]
+
+    if len(corrected_lines) != n_lines:
+        log(f"[CORRECT] Line count mismatch ({len(corrected_lines)} vs {n_lines}) → keeping original")
+        return transcript
+
+    # Vérifier que les speakers correspondent
+    for i, (orig, corr) in enumerate(zip(original_lines, corrected_lines)):
+        orig_sp = orig.split(":", 1)[0]
+        corr_sp = corr.split(":", 1)[0]
+        if orig_sp != corr_sp:
+            log(f"[CORRECT] Speaker mismatch at line {i} → keeping original")
+            return transcript
+
+    log(f"[CORRECT] Transcript corrected ({n_lines} lines)")
+    return "\n".join(corrected_lines)
+
+
+# =============================================================================
 # RÉSUMÉ
 # =============================================================================
 def generate_summary(transcript: str, duration_seconds: float = 0) -> str:
     if not transcript or len(transcript.split()) < 10:
         return "Conversation très brève."
 
-    if duration_seconds <= 120:   max_tokens = 72
-    elif duration_seconds <= 300: max_tokens = 96
-    elif duration_seconds <= 600: max_tokens = 128
-    else:                         max_tokens = 160
+    if duration_seconds <= 180:   max_tokens = 70
+    elif duration_seconds <= 600: max_tokens = 90
+    else:                         max_tokens = 110
 
     prompt = (
-        f"Résume cette conversation téléphonique en 1-2 phrases simples et claires. "
-        f"Dis juste l'essentiel : qui appelle pourquoi, et ce qui va se passer. "
-        f"Sois direct et naturel.\n\nConversation:\n{transcript[:3000]}"
+        "Résume cette conversation téléphonique en 1 ou 2 phrases courtes (max 40 mots au total). "
+        "Dis uniquement l'essentiel : qui appelle, pour quoi, et la conclusion. "
+        "Pas d'introduction, pas de reformulation inutile, va droit au but.\n\n"
+        f"Conversation:\n{transcript[:3000]}\n\nRésumé court:"
     )
 
     summary = run_llm(prompt, max_new_tokens=max_tokens)
@@ -530,6 +587,20 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         log(f"[HANDLER] Final: {len(merged)} segments")
 
         full_transcript = "\n".join(f"{s['speaker']}: {s['text']}" for s in merged if s.get("text"))
+
+        # ── CORRECTION DU TRANSCRIPT ───────────────────────────────────────
+        if ENABLE_TRANSCRIPT_CORRECTION and full_transcript:
+            log("[HANDLER] Correcting transcript...")
+            corrected_transcript = correct_transcript(full_transcript)
+            if corrected_transcript != full_transcript:
+                # Réappliquer les corrections aux segments (ligne à ligne, même ordre)
+                corrected_lines = [l.strip() for l in corrected_transcript.split("\n") if l.strip()]
+                seg_with_text = [s for s in merged if s.get("text")]
+                if len(corrected_lines) == len(seg_with_text):
+                    for seg, line in zip(seg_with_text, corrected_lines):
+                        if ":" in line:
+                            seg["text"] = line.split(":", 1)[1].strip()
+                full_transcript = corrected_transcript
 
         result = {
             "segments": merged,
