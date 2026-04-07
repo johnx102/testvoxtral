@@ -339,7 +339,7 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             temperature=0.0,
             compression_ratio_threshold=2.0,
             log_prob_threshold=-1.0,
-            no_speech_threshold=0.6,
+            no_speech_threshold=0.5,
             # ANTI-HALLUCINATION : si Whisper produit du texte alors qu'il y a > 3s
             # de silence VAD-détecté entre, c'est probablement une hallucination → ignorer
             # (3s = compromis entre filtrer les boucles et garder les vraies pauses entre phrases)
@@ -434,6 +434,45 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
         result_segments = [s for s in result_segments if not _is_hallucination(s["text"])]
         if before_filter != len(result_segments):
             log(f"[WHISPER] Filtered {before_filter - len(result_segments)} hallucinated segments on {speaker}")
+
+        # Filtrer les répétitions de segments courts (≤ 4 mots) qui apparaissent
+        # plusieurs fois sur le même canal — ce sont des hallucinations classiques
+        # de Whisper qui s'accroche à un mot et le répète (ex: "Christophe" × 6).
+        # On garde la PREMIÈRE occurrence (peut être légitime), on supprime les suivantes.
+        # Exception : les fillers communs (oui, non, ok, d'accord...) sont gardés.
+        FILLERS = {
+            "oui", "non", "ok", "d'accord", "voilà", "ah", "euh", "hum",
+            "merci", "bonjour", "au revoir", "bonne journée", "bien sûr",
+            "exactement", "tout à fait", "absolument", "d'accord.", "oui.",
+            "non.", "merci.", "au revoir.", "bonjour.", "ok.", "voilà.",
+        }
+        from collections import Counter
+        short_text_counts: Counter = Counter()
+        for s in result_segments:
+            t = (s.get("text") or "").strip().lower()
+            words = t.split()
+            if 1 <= len(words) <= 4:
+                # Ignorer les fillers (peuvent légitimement se répéter)
+                if t in FILLERS or all(w.strip(".,!?") in FILLERS for w in words):
+                    continue
+                short_text_counts[t] += 1
+        repeated_texts = {text for text, count in short_text_counts.items() if count >= 3}
+
+        if repeated_texts:
+            seen_repeated: set = set()
+            new_segments = []
+            removed = 0
+            for s in result_segments:
+                t = (s.get("text") or "").strip().lower()
+                if t in repeated_texts:
+                    if t in seen_repeated:
+                        removed += 1
+                        continue
+                    seen_repeated.add(t)
+                new_segments.append(s)
+            if removed > 0:
+                log(f"[WHISPER] Filtered {removed} repeated short segments on {speaker} (kept first occurrence): {sorted(repeated_texts)}")
+            result_segments = new_segments
 
         log(f"[WHISPER] {speaker} (ch{channel}): {len(result_segments)} phrases, {sum(len(s['text']) for s in result_segments)} chars")
         return result_segments
