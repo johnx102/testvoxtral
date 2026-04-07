@@ -55,7 +55,7 @@ DEBUG_WHISPER_RAW = os.environ.get("DEBUG_WHISPER_RAW", "0") == "1"
 ENABLE_AUDIO_ENHANCEMENT = os.environ.get("ENABLE_AUDIO_ENHANCEMENT", "1") == "1"
 
 # Whisper
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v2")
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v3")
 WHISPER_DEVICE     = os.environ.get("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE    = os.environ.get("WHISPER_COMPUTE", "float16")
 
@@ -127,13 +127,13 @@ def _enhance_audio_for_whisper(wav_path: str) -> str:
     Pourquoi : sur les enregistrements téléphoniques, le client peut parler loin
     du combiné au début (voix faible) puis se rapprocher (voix forte). Whisper
     rate alors les premières phrases. La compression dynamique réduit l'écart
-    entre passages calmes et forts, et la normalisation booste l'ensemble.
+    entre passages calmes et forts.
 
-    Pipeline en 2 passes :
-    - 1) Compression dynamique agressive (threshold=-25dB, ratio=6:1) : relève
-         fortement les voix faibles tout en limitant les pics
-    - 2) Normalisation (pic à -0.5 dB)
-    - 3) Gain supplémentaire +3dB pour booster encore le signal
+    Compromis validé sur audio Marc/Schreiber 145s :
+    - compression 4:1 threshold -20dB : booste les voix faibles SANS amplifier
+      excessivement le bruit (qui produirait des hallucinations)
+    - normalize headroom 0.5 : pic à -0.5 dB
+    - PAS de gain supplémentaire (testé +3dB → trop d'hallucinations)
 
     Si pydub n'est pas dispo ou erreur → retourne le fichier original.
     """
@@ -141,12 +141,10 @@ def _enhance_audio_for_whisper(wav_path: str) -> str:
         from pydub import AudioSegment
         from pydub.effects import normalize, compress_dynamic_range
         audio = AudioSegment.from_wav(wav_path)
-        # Compression agressive : booste fortement les voix faibles
-        audio = compress_dynamic_range(audio, threshold=-25.0, ratio=6.0, attack=5.0, release=50.0)
+        # Compression modérée : booste les voix faibles sans saturer le bruit
+        audio = compress_dynamic_range(audio, threshold=-20.0, ratio=4.0, attack=5.0, release=50.0)
         # Normalisation : ramène le pic à -0.5 dB
         audio = normalize(audio, headroom=0.5)
-        # Gain supplémentaire : +3 dB pour pousser un peu plus
-        audio = audio + 3
         out_path = wav_path.replace(".wav", "_enhanced.wav")
         if out_path == wav_path:
             out_path = wav_path + ".enhanced.wav"
@@ -375,7 +373,7 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
         if model is None:
             return []
 
-        # Config Whisper de production (anti-hallucination + sensible aux voix faibles)
+        # Config Whisper de production (anti-hallucination)
         segments_raw, info = model.transcribe(
             ch_path_for_whisper,
             language=language,
@@ -385,13 +383,13 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             vad_parameters={
                 "min_silence_duration_ms": 1000,
                 "speech_pad_ms": 500,
-                "threshold": 0.25,    # 0.30 → 0.25 : plus permissif pour les voix faibles
+                "threshold": 0.30,
             },
             condition_on_previous_text=False,
             temperature=0.0,
             compression_ratio_threshold=2.0,
             log_prob_threshold=-1.0,
-            no_speech_threshold=0.40, # 0.45 → 0.40 : récupère un peu plus de speech
+            no_speech_threshold=0.45,
             # 4s = compromis pour ne pas rejeter les bribes isolées en début/fin
             hallucination_silence_threshold=4.0,
         )
@@ -810,25 +808,44 @@ def analyze_sentiment(text: str) -> Dict[str, Any]:
     if not text or not text.strip():
         return {"label_en": "neutral", "label_fr": "neutre", "confidence": 0.5}
 
+    # Prompt qui distingue le TON (attitude) du SUJET (problème évoqué).
+    # Un client qui appelle pour une urgence/douleur reste "neutre" si l'échange
+    # est poli. "mauvais" est réservé aux clients EXPLICITEMENT mécontents du
+    # service (pas du problème).
     prompt = (
-        "Analyse le ressenti de cette conversation téléphonique.\n"
-        "Réponds par UN SEUL MOT : bon, neutre, ou mauvais\n"
-        "- bon : échange poli et cordial, demande traitée\n"
-        "- neutre : échange bref, ton froid ou distant\n"
-        "- mauvais : mécontentement, plainte, frustration\n\n"
-        f"Conversation : {text[:1500]}"
+        "Tu analyses le TON ÉMOTIONNEL d'une conversation téléphonique entre un client et un agent.\n"
+        "Concentre-toi sur l'ATTITUDE du client envers l'agent, PAS sur le sujet de l'appel.\n\n"
+        "Réponds par UN SEUL MOT : bon, neutre, ou mauvais\n\n"
+        "Définitions strictes :\n"
+        "- bon : le client est chaleureux, remercie sincèrement, exprime de la satisfaction\n"
+        "- neutre : conversation factuelle, polie, sans émotion forte (CAS LE PLUS FRÉQUENT)\n"
+        "- mauvais : le client est AGRESSIF, INSULTE, MENACE, ou se PLAINT EXPLICITEMENT du service ou de l'agent\n\n"
+        "⚠ RÈGLE IMPORTANTE : un client qui appelle pour un PROBLÈME (douleur, urgence, "
+        "panne, dent cassée, etc.) reste 'neutre' si la conversation est polie. "
+        "Le mot 'mauvais' est réservé aux clients qui se plaignent activement DU SERVICE "
+        "ou qui sont irrespectueux. Exprimer une douleur n'est PAS être mécontent.\n\n"
+        "Exemples :\n"
+        "- Client: 'J'ai mal aux dents, c'est urgent' + Agent répond poliment + Client: 'Merci' → neutre\n"
+        "- Client: 'Vous m'avez fait attendre 30 min, c'est inadmissible !' → mauvais\n"
+        "- Client: 'Bonjour, je voudrais un rdv' + échange normal → neutre\n"
+        "- Client: 'Super, merci beaucoup, vous êtes adorable !' → bon\n\n"
+        f"Conversation à analyser :\n{text[:1500]}\n\n"
+        "Ton (un seul mot) :"
     )
 
     response = run_llm(prompt, max_new_tokens=16).strip().lower()
     log(f"[SENTIMENT] LLM response: '{response}'")
 
-    if "mauvais" in response or "insatisf" in response or "négatif" in response:
+    # Note : on est strict sur "mauvais" — il faut que le mot soit clairement présent
+    # (pas juste "négatif" qui peut s'appliquer au sujet)
+    if "mauvais" in response:
         return {"label_en": "negative", "label_fr": "mauvais", "confidence": 0.75,
                 "scores": {"negative": 0.75, "neutral": 0.20, "positive": 0.05}}
-    elif "bon" in response or "satisf" in response or "positif" in response:
+    elif "bon" in response and "bonne" not in response:
         return {"label_en": "positive", "label_fr": "bon", "confidence": 0.80,
                 "scores": {"negative": 0.05, "neutral": 0.15, "positive": 0.80}}
     else:
+        # Par défaut : neutre (cas le plus fréquent en téléphonie pro)
         return {"label_en": "neutral", "label_fr": "neutre", "confidence": 0.70,
                 "scores": {"negative": 0.15, "neutral": 0.70, "positive": 0.15}}
 
