@@ -332,18 +332,18 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             vad_filter=True,
             vad_parameters={
                 "min_silence_duration_ms": 1000,
-                "speech_pad_ms": 400,
-                "threshold": 0.35,
+                "speech_pad_ms": 500,    # +100ms de marge pour ne pas couper les amorces
+                "threshold": 0.30,       # plus permissif pour capter les bribes au début
             },
             condition_on_previous_text=False,
             temperature=0.0,
             compression_ratio_threshold=2.0,
             log_prob_threshold=-1.0,
-            no_speech_threshold=0.5,
-            # ANTI-HALLUCINATION : si Whisper produit du texte alors qu'il y a > 3s
+            no_speech_threshold=0.45,    # 0.5 → 0.45 : récupère plus de speech
+            # ANTI-HALLUCINATION : si Whisper produit du texte alors qu'il y a > 4s
             # de silence VAD-détecté entre, c'est probablement une hallucination → ignorer
-            # (3s = compromis entre filtrer les boucles et garder les vraies pauses entre phrases)
-            hallucination_silence_threshold=3.0,
+            # (4s = moins agressif que 3s, pour ne pas rejeter les bribes isolées en début/fin)
+            hallucination_silence_threshold=4.0,
         )
 
         all_words = []
@@ -456,22 +456,31 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
                 if t in FILLERS or all(w.strip(".,!?") in FILLERS for w in words):
                     continue
                 short_text_counts[t] += 1
-        repeated_texts = {text for text, count in short_text_counts.items() if count >= 3}
 
-        if repeated_texts:
-            seen_repeated: set = set()
+        # Hallucination forte (≥5 répétitions du même texte court) → tout supprimer
+        # car c'est manifestement une hallucination Whisper qui s'accroche à un mot
+        strong_hallucinations = {text for text, count in short_text_counts.items() if count >= 5}
+        # Hallucination modérée (3-4 répétitions) → garder la 1re occurrence (peut être légitime)
+        moderate_repeated = {text for text, count in short_text_counts.items() if 3 <= count < 5}
+
+        if strong_hallucinations or moderate_repeated:
+            seen_moderate: set = set()
             new_segments = []
             removed = 0
             for s in result_segments:
                 t = (s.get("text") or "").strip().lower()
-                if t in repeated_texts:
-                    if t in seen_repeated:
+                if t in strong_hallucinations:
+                    removed += 1
+                    continue  # supprimer TOUTES les occurrences
+                if t in moderate_repeated:
+                    if t in seen_moderate:
                         removed += 1
                         continue
-                    seen_repeated.add(t)
+                    seen_moderate.add(t)
                 new_segments.append(s)
             if removed > 0:
-                log(f"[WHISPER] Filtered {removed} repeated short segments on {speaker} (kept first occurrence): {sorted(repeated_texts)}")
+                log(f"[WHISPER] Filtered {removed} repeated short segments on {speaker} "
+                    f"(strong: {sorted(strong_hallucinations)}, moderate: {sorted(moderate_repeated)})")
             result_segments = new_segments
 
         log(f"[WHISPER] {speaker} (ch{channel}): {len(result_segments)} phrases, {sum(len(s['text']) for s in result_segments)} chars")
@@ -917,16 +926,16 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     with_summary   = bool(inp.get("with_summary", WITH_SUMMARY_DEFAULT))
 
     # Déterminer la direction de l'appel
+    # Règle simple : un fichier dont le nom commence par "out-" ou "out_" est sortant,
+    # tous les autres sont entrants par défaut (jamais "unknown").
     call_direction = (inp.get("call_direction") or "").lower().strip()
     if call_direction not in ("inbound", "outbound"):
-        audio_url = inp.get("audio_url") or ""
+        audio_url = inp.get("audio_url") or inp.get("file_path") or ""
         filename = audio_url.split("/")[-1].lower()
-        if filename.startswith("in-") or filename.startswith("in_"):
-            call_direction = "inbound"
-        elif filename.startswith("out-") or filename.startswith("out_"):
+        if filename.startswith("out-") or filename.startswith("out_"):
             call_direction = "outbound"
         else:
-            call_direction = "unknown"
+            call_direction = "inbound"
 
     log(f"[HANDLER] language={language}, direction={call_direction}, summary={with_summary}")
 
