@@ -985,9 +985,13 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 hold_regions_ch0 = []
                 hold_regions_ch1 = []
 
-            # Skip les canaux détectés comme entièrement musique d'attente
-            if ENABLE_HOLD_MUSIC_DETECTION and hold_ch0.get("is_hold_music"):
-                log(f"[HANDLER] CH0 (Client) is hold music → skipping Whisper")
+            # Skip un canal UNIQUEMENT s'il est quasi-entièrement hold music (≥ 95%).
+            # Sinon on le transcrit quand même : Whisper a son propre VAD qui sautera
+            # les zones de musique/silence, et on garde les vraies paroles s'il y en a.
+            FULL_HOLD_THRESHOLD = 0.95
+
+            if ENABLE_HOLD_MUSIC_DETECTION and hold_coverage_ch0 >= FULL_HOLD_THRESHOLD:
+                log(f"[HANDLER] CH0 (Client) is dominantly hold music ({hold_coverage_ch0*100:.0f}%) → skipping Whisper")
                 client_segs = []
             else:
                 # Pendant que l'agent est en hold music, muter ch0 (pas de conv)
@@ -996,8 +1000,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     mute_regions=hold_regions_ch1 or None,
                 )
 
-            if ENABLE_HOLD_MUSIC_DETECTION and hold_ch1.get("is_hold_music"):
-                log(f"[HANDLER] CH1 (Agent) is hold music → skipping Whisper")
+            if ENABLE_HOLD_MUSIC_DETECTION and hold_coverage_ch1 >= FULL_HOLD_THRESHOLD:
+                log(f"[HANDLER] CH1 (Agent) is dominantly hold music ({hold_coverage_ch1*100:.0f}%) → skipping Whisper")
                 agent_segs = []
             else:
                 # Pendant que le client est en hold music, muter ch1 (agent ne parle pas au client)
@@ -1045,11 +1049,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         # Dedup
         segments = remove_duplicate_segments(segments)
 
-        # Fusionner segments consécutifs même speaker
+        # Fusionner segments consécutifs même speaker, MAIS uniquement s'ils sont
+        # proches dans le temps (gap < 2.5s). Préserve les pauses naturelles et
+        # évite de fusionner toute une longue suite de phrases en un seul gros bloc.
+        MERGE_MAX_GAP_S = 2.5
         merged = [segments[0]]
         for seg in segments[1:]:
             prev = merged[-1]
-            if prev["speaker"] == seg["speaker"]:
+            gap = float(seg.get("start", 0)) - float(prev.get("end", 0))
+            if prev["speaker"] == seg["speaker"] and gap < MERGE_MAX_GAP_S:
                 prev["text"] = prev["text"].rstrip() + " " + seg["text"].lstrip()
                 prev["end"] = seg["end"]
             else:
