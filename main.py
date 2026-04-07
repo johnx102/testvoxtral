@@ -340,6 +340,10 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             compression_ratio_threshold=2.0,
             log_prob_threshold=-1.0,
             no_speech_threshold=0.6,
+            # ANTI-HALLUCINATION : si Whisper produit du texte alors qu'il y a > 2s
+            # de silence VAD-détecté, c'est probablement une hallucination → ignorer
+            # (ce paramètre est recommandé par https://github.com/openai/whisper/discussions/2378)
+            hallucination_silence_threshold=2.0,
         )
 
         all_words = []
