@@ -1,53 +1,12 @@
 #!/usr/bin/env python3
 """Pré-téléchargement des modèles dans /app/.cache/huggingface au build Docker.
-Version diagnostique : log toutes les env vars pertinentes pour identifier
-comment RunPod passe (ou non) le token au build.
+- Si un HF_TOKEN est passé via build arg → télécharge les modèles dans l'image
+- Sinon → exit 0, les modèles seront téléchargés au 1er cold start (FlashBoot)
 """
 import os
 import sys
 
-print("=" * 70)
-print("[PRELOAD] === DIAGNOSTIC ENV VARS (build context) ===")
-print("=" * 70)
-
-# 1) Scanner toutes les env vars qui contiennent HF, HUGG, TOKEN, KEY, SECRET
-relevant_keys = []
-for key in sorted(os.environ.keys()):
-    key_upper = key.upper()
-    if any(pattern in key_upper for pattern in ("HF", "HUGG", "TOKEN", "KEY", "SECRET")):
-        value = os.environ[key]
-        # Masquer la valeur : montrer longueur + 4 premiers chars
-        if value:
-            preview = value[:4] + "..." + f"({len(value)} chars)"
-        else:
-            preview = "(empty)"
-        print(f"[PRELOAD]   {key} = {preview}")
-        relevant_keys.append(key)
-
-if not relevant_keys:
-    print("[PRELOAD]   (aucune variable HF/HUGG/TOKEN/KEY/SECRET trouvée)")
-
-# 2) Chercher les secrets BuildKit éventuels
-print("[PRELOAD] === BUILDKIT SECRETS ===")
-for secret_path in [
-    "/run/secrets/hf_token",
-    "/run/secrets/HF_TOKEN",
-    "/run/secrets/HUGGING_FACE_HUB_TOKEN",
-    "/run/secrets/hugging_face_token",
-]:
-    if os.path.exists(secret_path):
-        try:
-            with open(secret_path) as f:
-                content = f.read().strip()
-            print(f"[PRELOAD]   {secret_path} exists, {len(content)} chars")
-        except Exception as e:
-            print(f"[PRELOAD]   {secret_path} exists but unreadable: {e}")
-    else:
-        print(f"[PRELOAD]   {secret_path} (not found)")
-
-print("=" * 70)
-
-# 3) Essayer plusieurs noms de variable pour trouver le token
+# Essayer plusieurs noms de variable pour trouver le token
 HF_TOKEN = ""
 token_source = None
 for candidate in [
@@ -58,7 +17,6 @@ for candidate in [
     "HUGGINGFACE_TOKEN",
     "HF_API_TOKEN",
     "HUGGING_FACE_TOKEN",
-    "RUNPOD_HF_TOKEN",
     "HUGGINGFACEHUB_API_TOKEN",
 ]:
     val = os.environ.get(candidate, "").strip()
@@ -67,7 +25,7 @@ for candidate in [
         token_source = candidate
         break
 
-# 4) Fallback : lire depuis BuildKit secrets
+# Fallback : BuildKit secrets
 if not HF_TOKEN:
     for secret_path in ["/run/secrets/hf_token", "/run/secrets/HF_TOKEN"]:
         if os.path.exists(secret_path):
@@ -81,15 +39,14 @@ if not HF_TOKEN:
                 pass
 
 if not HF_TOKEN:
-    print("[PRELOAD] ❌ Aucun token trouvé dans aucune variable/secret connue")
-    print("[PRELOAD] ℹ Les modèles seront téléchargés au 1er cold start")
-    print("[PRELOAD] ℹ Skipping preload (build continue sans pré-cache)")
-    sys.exit(0)  # Exit 0 pour que le build continue
+    print("[PRELOAD] ⚠ Pas de HF_TOKEN au build → modèles téléchargés au 1er cold start")
+    print("[PRELOAD] ⚠ (FlashBoot prendra le snapshot après le 1er cold start, ~1s ensuite)")
+    sys.exit(0)
 
-print(f"[PRELOAD] ✅ Token trouvé via: {token_source} ({len(HF_TOKEN)} chars)")
+print(f"[PRELOAD] ✅ Token trouvé via {token_source} ({len(HF_TOKEN)} chars)")
 
 LLM_MODEL = os.environ.get("PRELOAD_LLM_MODEL", "mistralai/Ministral-8B-Instruct-2410")
-WHISPER_MODEL = os.environ.get("PRELOAD_WHISPER_MODEL", "large-v2")
+WHISPER_MODEL = os.environ.get("PRELOAD_WHISPER_MODEL", "bofenghuang-french")
 CACHE_DIR = "/app/.cache/huggingface/hub"
 
 print(f"[PRELOAD] LLM: {LLM_MODEL}")
@@ -115,18 +72,30 @@ except Exception as e:
     # Ne pas faire échouer le build — le modèle sera téléchargé au runtime
     sys.exit(0)
 
-# 6) Whisper via faster-whisper
+# 6) Whisper
 print(f"[PRELOAD] Downloading Whisper {WHISPER_MODEL}...")
 try:
-    from faster_whisper import WhisperModel
-    m = WhisperModel(
-        WHISPER_MODEL,
-        device="cpu",
-        compute_type="int8",
-        download_root="/app/.cache/huggingface/faster-whisper",
-    )
-    del m
-    print(f"[PRELOAD] ✅ Whisper {WHISPER_MODEL} downloaded successfully")
+    if WHISPER_MODEL.lower() in ("bofenghuang-french", "french", "fr-distil"):
+        # Cas spécial : modèle bofenghuang français distillé
+        # On télécharge uniquement le sous-dossier ctranslate2/
+        from huggingface_hub import snapshot_download as hf_snapshot
+        hf_snapshot(
+            repo_id="bofenghuang/whisper-large-v3-french-distil-dec16",
+            local_dir="/app/.cache/whisper-french-distil-dec16",
+            allow_patterns="ctranslate2/*",
+        )
+        print(f"[PRELOAD] ✅ Whisper bofenghuang french distil dec16 downloaded successfully")
+    else:
+        # Cas standard : faster-whisper télécharge depuis Systran
+        from faster_whisper import WhisperModel
+        m = WhisperModel(
+            WHISPER_MODEL,
+            device="cpu",
+            compute_type="int8",
+            download_root="/app/.cache/huggingface/faster-whisper",
+        )
+        del m
+        print(f"[PRELOAD] ✅ Whisper {WHISPER_MODEL} downloaded successfully")
 except Exception as e:
     print(f"[PRELOAD] ❌ ERROR downloading Whisper: {type(e).__name__}: {e}")
     sys.exit(0)
