@@ -340,10 +340,10 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             compression_ratio_threshold=2.0,
             log_prob_threshold=-1.0,
             no_speech_threshold=0.6,
-            # ANTI-HALLUCINATION : si Whisper produit du texte alors qu'il y a > 2s
-            # de silence VAD-détecté, c'est probablement une hallucination → ignorer
-            # (ce paramètre est recommandé par https://github.com/openai/whisper/discussions/2378)
-            hallucination_silence_threshold=2.0,
+            # ANTI-HALLUCINATION : si Whisper produit du texte alors qu'il y a > 3s
+            # de silence VAD-détecté entre, c'est probablement une hallucination → ignorer
+            # (3s = compromis entre filtrer les boucles et garder les vraies pauses entre phrases)
+            hallucination_silence_threshold=3.0,
         )
 
         all_words = []
@@ -404,10 +404,19 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             t = text.lower().strip()
             if not t:
                 return True
+            # 0) Segment composé uniquement de ponctuation/espaces (faster-whisper
+            # marque les hallucinations détectées par hallucination_silence_threshold
+            # avec un texte type "..." ou "... ...")
+            if not re.search(r"[a-zàâäéèêëïîôöùûüÿç0-9]", t):
+                return True
             # 1) Marqueur d'hallucination connue (toute taille)
             if any(h in t for h in WHISPER_HALLUCINATIONS):
                 return True
             words = t.split()
+            # 1bis) Tous les "mots" ne sont que des points/ponctuation
+            content_words = [w for w in words if re.search(r"[a-zàâäéèêëïîôöùûüÿç0-9]", w)]
+            if len(content_words) == 0:
+                return True
             if len(words) >= 6:
                 from collections import Counter
                 c = Counter(words)
@@ -1054,6 +1063,18 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 seg["text"] = _compress_internal_repetitions(before)
                 if seg["text"] != before:
                     log(f"[COMPRESS] {seg.get('speaker')}: {len(before)} → {len(seg['text'])} chars")
+
+        # Filtrer les segments vides ou ne contenant que de la ponctuation
+        # (faster-whisper avec hallucination_silence_threshold marque les hallucinations
+        # par un texte "..." qu'il faut éliminer définitivement)
+        before_clean = len(merged)
+        merged = [
+            s for s in merged
+            if s.get("text", "").strip()
+            and re.search(r"[a-zàâäéèêëïîôöùûüÿç0-9]", s["text"], re.IGNORECASE)
+        ]
+        if len(merged) != before_clean:
+            log(f"[CLEAN] Removed {before_clean - len(merged)} empty/dots-only segments")
 
         log(f"[HANDLER] Final: {len(merged)} segments")
 
