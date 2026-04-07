@@ -46,6 +46,10 @@ HF_TOKEN           = os.environ.get("HF_TOKEN", "").strip()
 MAX_DURATION_S     = int(os.environ.get("MAX_DURATION_S", "3600"))
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
+# Debug Whisper : log les segments bruts AVANT tous nos filtres post-process.
+# Activé en permanence pour identifier les phrases manquantes/hallucinées.
+DEBUG_WHISPER_RAW = True
+
 # Whisper
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v2")
 WHISPER_DEVICE     = os.environ.get("WHISPER_DEVICE", "cuda")
@@ -324,26 +328,33 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
         # speech_pad_ms=400 : marge de 400ms autour de chaque zone de parole
         # condition_on_previous_text=False : évite les boucles d'hallucination
         # temperature=0 : déterministe, moins de variations créatives
+        # MODE DEBUG : Whisper transcrit TOUT sans filtre VAD ni anti-hallucination,
+        # pour qu'on puisse voir dans les logs DEBUG_WHISPER_RAW où sont les phrases.
+        # Les boucles évidentes restent filtrées via compression_ratio_threshold.
+        # Les filtres post-process (_is_hallucination, etc.) restent actifs et nettoient
+        # les hallucinations dans le résultat final.
         segments_raw, info = model.transcribe(
             ch_path,
             language=language,
             beam_size=5,
             word_timestamps=True,
-            vad_filter=True,
-            vad_parameters={
-                "min_silence_duration_ms": 1000,
-                "speech_pad_ms": 500,    # +100ms de marge pour ne pas couper les amorces
-                "threshold": 0.30,       # plus permissif pour capter les bribes au début
-            },
+            vad_filter=False,                # ← désactivé : Whisper voit toute l'audio
             condition_on_previous_text=False,
             temperature=0.0,
-            compression_ratio_threshold=2.0,
+            compression_ratio_threshold=2.4, # défaut OpenAI : ne rejette que les VRAIES boucles
             log_prob_threshold=-1.0,
-            no_speech_threshold=0.45,    # 0.5 → 0.45 : récupère plus de speech
-            # ANTI-HALLUCINATION : 4s = compromis pour ne pas rejeter les bribes
-            # isolées en début/fin (typique des conversations téléphoniques)
-            hallucination_silence_threshold=4.0,
+            no_speech_threshold=0.2,         # ← très permissif : presque rien rejeté comme silence
+            # hallucination_silence_threshold désactivé en debug (None = pas de filtre Whisper interne)
         )
+
+        # Si DEBUG_WHISPER_RAW : matérialiser le generator pour pouvoir logger
+        # le texte brut de Whisper avant nos filtres post-process
+        if DEBUG_WHISPER_RAW:
+            segments_raw = list(segments_raw)
+            log(f"[DEBUG_WHISPER_RAW] {speaker} (ch{channel}) — {len(segments_raw)} segment(s) bruts:")
+            for idx, seg in enumerate(segments_raw):
+                text = (seg.text or '').strip()
+                log(f"[DEBUG_WHISPER_RAW]   #{idx} [{seg.start:.2f}s → {seg.end:.2f}s] {text!r}")
 
         all_words = []
         for seg in segments_raw:
@@ -352,6 +363,8 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
                     all_words.append({"word": w.word, "start": w.start, "end": w.end})
 
         if not all_words:
+            if DEBUG_WHISPER_RAW:
+                log(f"[DEBUG_WHISPER_RAW] {speaker} (ch{channel}) — aucun mot extrait, return []")
             return []
 
         # Regrouper par pauses > 0.8s
@@ -430,6 +443,15 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             return False
 
         before_filter = len(result_segments)
+        if DEBUG_WHISPER_RAW:
+            log(f"[DEBUG_WHISPER_RAW] {speaker} (ch{channel}) — segments après regroupement par pauses ({before_filter}):")
+            for idx, s in enumerate(result_segments):
+                log(f"[DEBUG_WHISPER_RAW]   #{idx} [{s['start']}s → {s['end']}s] {s['text']!r}")
+        # Logger les segments rejetés par _is_hallucination
+        if DEBUG_WHISPER_RAW:
+            for s in result_segments:
+                if _is_hallucination(s["text"]):
+                    log(f"[DEBUG_WHISPER_RAW]   ❌ REJETÉ par _is_hallucination [{s['start']}s] {s['text']!r}")
         result_segments = [s for s in result_segments if not _is_hallucination(s["text"])]
         if before_filter != len(result_segments):
             log(f"[WHISPER] Filtered {before_filter - len(result_segments)} hallucinated segments on {speaker}")
