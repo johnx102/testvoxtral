@@ -129,8 +129,11 @@ def _enhance_audio_for_whisper(wav_path: str) -> str:
     rate alors les premières phrases. La compression dynamique réduit l'écart
     entre passages calmes et forts, et la normalisation booste l'ensemble.
 
-    - compress_dynamic_range(threshold=-20dB, ratio=4:1) : booste les voix faibles
-    - normalize(headroom=0.5) : ramène le pic à -0.5 dB sans clipping
+    Pipeline en 2 passes :
+    - 1) Compression dynamique agressive (threshold=-25dB, ratio=6:1) : relève
+         fortement les voix faibles tout en limitant les pics
+    - 2) Normalisation (pic à -0.5 dB)
+    - 3) Gain supplémentaire +3dB pour booster encore le signal
 
     Si pydub n'est pas dispo ou erreur → retourne le fichier original.
     """
@@ -138,10 +141,12 @@ def _enhance_audio_for_whisper(wav_path: str) -> str:
         from pydub import AudioSegment
         from pydub.effects import normalize, compress_dynamic_range
         audio = AudioSegment.from_wav(wav_path)
-        # Compression : réduit l'écart dynamique → relève les voix faibles
-        audio = compress_dynamic_range(audio, threshold=-20.0, ratio=4.0, attack=5.0, release=50.0)
-        # Normalisation : pic à -0.5 dB
+        # Compression agressive : booste fortement les voix faibles
+        audio = compress_dynamic_range(audio, threshold=-25.0, ratio=6.0, attack=5.0, release=50.0)
+        # Normalisation : ramène le pic à -0.5 dB
         audio = normalize(audio, headroom=0.5)
+        # Gain supplémentaire : +3 dB pour pousser un peu plus
+        audio = audio + 3
         out_path = wav_path.replace(".wav", "_enhanced.wav")
         if out_path == wav_path:
             out_path = wav_path + ".enhanced.wav"
@@ -370,7 +375,7 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
         if model is None:
             return []
 
-        # Config Whisper de production (anti-hallucination)
+        # Config Whisper de production (anti-hallucination + sensible aux voix faibles)
         segments_raw, info = model.transcribe(
             ch_path_for_whisper,
             language=language,
@@ -380,13 +385,13 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             vad_parameters={
                 "min_silence_duration_ms": 1000,
                 "speech_pad_ms": 500,
-                "threshold": 0.30,
+                "threshold": 0.25,    # 0.30 → 0.25 : plus permissif pour les voix faibles
             },
             condition_on_previous_text=False,
             temperature=0.0,
             compression_ratio_threshold=2.0,
             log_prob_threshold=-1.0,
-            no_speech_threshold=0.45,
+            no_speech_threshold=0.40, # 0.45 → 0.40 : récupère un peu plus de speech
             # 4s = compromis pour ne pas rejeter les bribes isolées en début/fin
             hallucination_silence_threshold=4.0,
         )
