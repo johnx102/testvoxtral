@@ -47,8 +47,12 @@ MAX_DURATION_S     = int(os.environ.get("MAX_DURATION_S", "3600"))
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
 
 # Debug Whisper : log les segments bruts AVANT tous nos filtres post-process.
-# Activé en permanence pour identifier les phrases manquantes/hallucinées.
-DEBUG_WHISPER_RAW = True
+# Désactivé par défaut. Activer avec DEBUG_WHISPER_RAW=1 si besoin.
+DEBUG_WHISPER_RAW = os.environ.get("DEBUG_WHISPER_RAW", "0") == "1"
+
+# Audio enhancement : normalise + compresse dynamiquement chaque canal avant Whisper.
+# Booste les voix faibles (ex: client loin du combiné) sans amplifier le bruit.
+ENABLE_AUDIO_ENHANCEMENT = os.environ.get("ENABLE_AUDIO_ENHANCEMENT", "1") == "1"
 
 # Whisper
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "large-v2")
@@ -116,6 +120,37 @@ def _validate_audio(path: str) -> Tuple[bool, str, float]:
         return True, "", duration
     except Exception as e:
         return False, f"Format audio non reconnu: {e}", 0.0
+
+def _enhance_audio_for_whisper(wav_path: str) -> str:
+    """Normalise et compresse dynamiquement un fichier WAV mono pour aider Whisper.
+
+    Pourquoi : sur les enregistrements téléphoniques, le client peut parler loin
+    du combiné au début (voix faible) puis se rapprocher (voix forte). Whisper
+    rate alors les premières phrases. La compression dynamique réduit l'écart
+    entre passages calmes et forts, et la normalisation booste l'ensemble.
+
+    - compress_dynamic_range(threshold=-20dB, ratio=4:1) : booste les voix faibles
+    - normalize(headroom=0.5) : ramène le pic à -0.5 dB sans clipping
+
+    Si pydub n'est pas dispo ou erreur → retourne le fichier original.
+    """
+    try:
+        from pydub import AudioSegment
+        from pydub.effects import normalize, compress_dynamic_range
+        audio = AudioSegment.from_wav(wav_path)
+        # Compression : réduit l'écart dynamique → relève les voix faibles
+        audio = compress_dynamic_range(audio, threshold=-20.0, ratio=4.0, attack=5.0, release=50.0)
+        # Normalisation : pic à -0.5 dB
+        audio = normalize(audio, headroom=0.5)
+        out_path = wav_path.replace(".wav", "_enhanced.wav")
+        if out_path == wav_path:
+            out_path = wav_path + ".enhanced.wav"
+        audio.export(out_path, format="wav")
+        return out_path
+    except Exception as e:
+        log(f"[ENHANCE] Audio enhancement failed: {e} (using original)")
+        return wav_path
+
 
 def _extract_mono_channel(wav_path: str, channel: int) -> str:
     import soundfile as sf
@@ -318,33 +353,42 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
     else:
         ch_path = _extract_mono_channel(wav_path, channel)
 
+    # Audio enhancement : normalise + compresse pour booster les voix faibles
+    # (utile quand le client est loin du combiné au début de l'appel)
+    enhanced_path = None
+    if ENABLE_AUDIO_ENHANCEMENT:
+        enhanced_path = _enhance_audio_for_whisper(ch_path)
+        if enhanced_path != ch_path:
+            ch_path_for_whisper = enhanced_path
+        else:
+            ch_path_for_whisper = ch_path
+    else:
+        ch_path_for_whisper = ch_path
+
     try:
         model = _load_whisper()
         if model is None:
             return []
 
-        # vad_filter=True : saute les silences (majeure cause d'hallucinations Whisper)
-        # min_silence_duration_ms=1000 : ne coupe que les silences ≥ 1s (préserve les pauses naturelles)
-        # speech_pad_ms=400 : marge de 400ms autour de chaque zone de parole
-        # condition_on_previous_text=False : évite les boucles d'hallucination
-        # temperature=0 : déterministe, moins de variations créatives
-        # MODE DEBUG : Whisper transcrit TOUT sans filtre VAD ni anti-hallucination,
-        # pour qu'on puisse voir dans les logs DEBUG_WHISPER_RAW où sont les phrases.
-        # Les boucles évidentes restent filtrées via compression_ratio_threshold.
-        # Les filtres post-process (_is_hallucination, etc.) restent actifs et nettoient
-        # les hallucinations dans le résultat final.
+        # Config Whisper de production (anti-hallucination)
         segments_raw, info = model.transcribe(
-            ch_path,
+            ch_path_for_whisper,
             language=language,
             beam_size=5,
             word_timestamps=True,
-            vad_filter=False,                # ← désactivé : Whisper voit toute l'audio
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": 1000,
+                "speech_pad_ms": 500,
+                "threshold": 0.30,
+            },
             condition_on_previous_text=False,
             temperature=0.0,
-            compression_ratio_threshold=2.4, # défaut OpenAI : ne rejette que les VRAIES boucles
+            compression_ratio_threshold=2.0,
             log_prob_threshold=-1.0,
-            no_speech_threshold=0.2,         # ← très permissif : presque rien rejeté comme silence
-            # hallucination_silence_threshold désactivé en debug (None = pas de filtre Whisper interne)
+            no_speech_threshold=0.45,
+            # 4s = compromis pour ne pas rejeter les bribes isolées en début/fin
+            hallucination_silence_threshold=4.0,
         )
 
         # Si DEBUG_WHISPER_RAW : matérialiser le generator pour pouvoir logger
@@ -509,6 +553,9 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
     finally:
         if ch_path and ch_path != wav_path and os.path.exists(ch_path):
             os.remove(ch_path)
+        if enhanced_path and enhanced_path != ch_path and enhanced_path != wav_path \
+                and os.path.exists(enhanced_path):
+            os.remove(enhanced_path)
 
 
 def _transcribe_mono_whisper(wav_path: str, language: str = "fr") -> str:
