@@ -54,7 +54,7 @@ RUN mkdir -p /app/.cache/huggingface /app/.cache/torch
 COPY main.py /app/main.py
 
 ENV LLM_MODEL_ID="mistralai/Ministral-8B-Instruct-2410" \
-    WHISPER_MODEL_SIZE="large-v2" \
+    WHISPER_MODEL_SIZE="bofenghuang-french" \
     WHISPER_DEVICE="cuda" \
     WHISPER_COMPUTE="float16" \
     MAX_DURATION_S="3600" \
@@ -82,7 +82,7 @@ RUN HF_TOKEN="$HF_TOKEN" \
     HUGGING_FACE_HUB_TOKEN="$HUGGING_FACE_HUB_TOKEN" \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     PRELOAD_LLM_MODEL="mistralai/Ministral-8B-Instruct-2410" \
-    PRELOAD_WHISPER_MODEL="large-v2" \
+    PRELOAD_WHISPER_MODEL="bofenghuang-french" \
     python3 /tmp/preload_models.py && \
     rm /tmp/preload_models.py
 
