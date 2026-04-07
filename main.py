@@ -163,6 +163,52 @@ def _load_whisper():
         return None
 
 
+def _compress_internal_repetitions(text: str) -> str:
+    """Compresse les répétitions consécutives DANS un texte (boucles Whisper).
+    Cherche des séquences de 1 à 10 mots qui se répètent ≥ 2 fois immédiatement
+    après et garde une seule occurrence.
+
+    Exemples :
+    - "abc abc abc def" → "abc def"
+    - "il faut qu'on l'accueille et il faut qu'on l'accueille et ... × 19" → "il faut qu'on l'accueille et"
+    - "Monsieur le ministre. Monsieur le ministre. Monsieur le ministre." → "Monsieur le ministre."
+    """
+    if not text:
+        return text
+    words = text.split()
+    if len(words) < 4:
+        return text
+
+    # Itérer par taille de séquence décroissante (10 → 1)
+    # Décroissant pour attraper d'abord les longues séquences puis les courtes
+    for seq_len in range(10, 0, -1):
+        if len(words) < 2 * seq_len:
+            continue
+        new_words = []
+        i = 0
+        while i < len(words):
+            seq = words[i:i + seq_len]
+            if len(seq) < seq_len:
+                new_words.extend(seq)
+                break
+            # Compter combien de fois cette séquence se répète immédiatement après
+            j = i + seq_len
+            count = 1
+            while j + seq_len <= len(words) and words[j:j + seq_len] == seq:
+                count += 1
+                j += seq_len
+            if count >= 2:
+                # Garder UNE seule occurrence et avancer
+                new_words.extend(seq)
+                i = j
+            else:
+                new_words.append(words[i])
+                i += 1
+        words = new_words
+
+    return " ".join(words)
+
+
 def _detect_hold_regions_in_channel(
     audio_np,
     sr: int,
@@ -291,7 +337,7 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             },
             condition_on_previous_text=False,
             temperature=0.0,
-            compression_ratio_threshold=2.4,
+            compression_ratio_threshold=2.0,
             log_prob_threshold=-1.0,
             no_speech_threshold=0.6,
         )
@@ -309,22 +355,32 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
         result_segments = []
         current = {"speaker": speaker, "text": "", "start": all_words[0]["start"], "end": all_words[0]["end"], "mood": None}
 
+        def _finalize_current(cur):
+            """Crée un segment à partir du buffer current, après compression des répétitions."""
+            raw_text = cur["text"].strip()
+            if not raw_text:
+                return None
+            compressed = _compress_internal_repetitions(raw_text)
+            return {
+                "speaker": speaker,
+                "start": round(cur["start"], 2),
+                "end": round(cur["end"], 2),
+                "text": compressed,
+                "mood": None,
+            }
+
         for word in all_words:
             if current["end"] is not None and word["start"] - current["end"] > 0.8:
-                if current["text"].strip():
-                    result_segments.append({
-                        "speaker": speaker, "start": round(current["start"], 2),
-                        "end": round(current["end"], 2), "text": current["text"].strip(), "mood": None,
-                    })
+                seg = _finalize_current(current)
+                if seg:
+                    result_segments.append(seg)
                 current = {"speaker": speaker, "text": "", "start": word["start"], "end": None, "mood": None}
             current["text"] += word["word"]
             current["end"] = word["end"]
 
-        if current["text"].strip():
-            result_segments.append({
-                "speaker": speaker, "start": round(current["start"], 2),
-                "end": round(current["end"], 2), "text": current["text"].strip(), "mood": None,
-            })
+        seg = _finalize_current(current)
+        if seg:
+            result_segments.append(seg)
 
         # Filtrer hallucinations Whisper (phrases fréquemment inventées)
         WHISPER_HALLUCINATIONS = [
@@ -335,22 +391,29 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             "merci de votre attention", "n'hésitez pas à",
             "musique entraînante", "musique douce", "[musique]", "[rires]",
             "thank you for watching", "please subscribe",
+            # Hallucinations fréquentes Whisper français sur du bruit / arabe / accent
+            "monsieur le ministre", "ministre de l'éducation",
+            "premier ministre", "président de la république",
+            "le journal de", "vingt heures", "france info", "france inter",
         ]
         def _is_hallucination(text: str) -> bool:
             t = text.lower().strip()
             if not t:
                 return True
-            # Segment très court répété ou contenant un marqueur
-            if len(t.split()) < 40 and any(h in t for h in WHISPER_HALLUCINATIONS):
+            # 1) Marqueur d'hallucination connue (toute taille)
+            if any(h in t for h in WHISPER_HALLUCINATIONS):
                 return True
-            # Segment qui répète le même mot/phrase (boucle Whisper)
             words = t.split()
             if len(words) >= 6:
-                # Si plus de 60% des mots sont identiques → boucle
                 from collections import Counter
                 c = Counter(words)
                 most_common_count = c.most_common(1)[0][1]
-                if most_common_count / len(words) > 0.6:
+                # 2) Boucle de mot unique : >55% des mots sont identiques
+                if most_common_count / len(words) > 0.55:
+                    return True
+                # 3) Vocabulaire pauvre : ratio mots uniques < 35%
+                unique_ratio = len(set(words)) / len(words)
+                if len(words) >= 10 and unique_ratio < 0.35:
                     return True
             return False
 
@@ -978,6 +1041,15 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 prev["end"] = seg["end"]
             else:
                 merged.append(seg)
+
+        # Compresser les répétitions internes dans chaque segment mergé
+        # (rattrape les boucles créées par la fusion de segments adjacents identiques)
+        for seg in merged:
+            if seg.get("text"):
+                before = seg["text"]
+                seg["text"] = _compress_internal_repetitions(before)
+                if seg["text"] != before:
+                    log(f"[COMPRESS] {seg.get('speaker')}: {len(before)} → {len(seg['text'])} chars")
 
         log(f"[HANDLER] Final: {len(merged)} segments")
 
