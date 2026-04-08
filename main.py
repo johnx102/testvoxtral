@@ -699,7 +699,7 @@ def run_llm(prompt: str, max_new_tokens: int = 256) -> str:
 # =============================================================================
 ENABLE_TRANSCRIPT_CORRECTION = os.environ.get("ENABLE_TRANSCRIPT_CORRECTION", "1") == "1"
 
-CORRECT_CHUNK_SIZE = int(os.environ.get("CORRECT_CHUNK_SIZE", "10"))
+CORRECT_CHUNK_SIZE = int(os.environ.get("CORRECT_CHUNK_SIZE", "15"))
 
 
 def _correct_chunk(chunk_lines: List[str]) -> Optional[List[str]]:
