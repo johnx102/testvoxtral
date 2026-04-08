@@ -698,6 +698,10 @@ def run_llm(prompt: str, max_new_tokens: int = 256) -> str:
 # CORRECTION DU TRANSCRIPT
 # =============================================================================
 ENABLE_TRANSCRIPT_CORRECTION = os.environ.get("ENABLE_TRANSCRIPT_CORRECTION", "1") == "1"
+# Skip la correction LLM si le transcript dépasse cette taille (en chars).
+# Pourquoi : sur les longs transcripts, le LLM corrige peu (Whisper a plus de
+# contexte → meilleur résultat) et le coût en temps est élevé (~10s/1000 chars).
+CORRECT_MAX_CHARS = int(os.environ.get("CORRECT_MAX_CHARS", "3000"))
 
 CORRECT_CHUNK_SIZE = int(os.environ.get("CORRECT_CHUNK_SIZE", "15"))
 
@@ -838,24 +842,37 @@ def analyze_sentiment(text: str) -> Dict[str, Any]:
     # Prompt qui distingue le TON (attitude) du SUJET (problème évoqué).
     # Un client qui appelle pour une urgence/douleur reste "neutre" si l'échange
     # est poli. "mauvais" est réservé aux clients EXPLICITEMENT mécontents du
-    # service (pas du problème).
+    # service. "bon" couvre les échanges réussis et conviviaux (pas seulement les
+    # remerciements effusifs).
     prompt = (
-        "Tu analyses le TON ÉMOTIONNEL d'une conversation téléphonique entre un client et un agent.\n"
-        "Concentre-toi sur l'ATTITUDE du client envers l'agent, PAS sur le sujet de l'appel.\n\n"
+        "Tu analyses le TON ÉMOTIONNEL d'une conversation téléphonique entre un client et un agent d'un cabinet dentaire.\n"
+        "Concentre-toi sur l'ATTITUDE du client envers l'agent et l'ISSUE de l'appel, PAS sur le sujet médical.\n\n"
         "Réponds par UN SEUL MOT : bon, neutre, ou mauvais\n\n"
-        "Définitions strictes :\n"
-        "- bon : le client est chaleureux, remercie sincèrement, exprime de la satisfaction\n"
-        "- neutre : conversation factuelle, polie, sans émotion forte (CAS LE PLUS FRÉQUENT)\n"
-        "- mauvais : le client est AGRESSIF, INSULTE, MENACE, ou se PLAINT EXPLICITEMENT du service ou de l'agent\n\n"
-        "⚠ RÈGLE IMPORTANTE : un client qui appelle pour un PROBLÈME (douleur, urgence, "
-        "panne, dent cassée, etc.) reste 'neutre' si la conversation est polie. "
-        "Le mot 'mauvais' est réservé aux clients qui se plaignent activement DU SERVICE "
-        "ou qui sont irrespectueux. Exprimer une douleur n'est PAS être mécontent.\n\n"
-        "Exemples :\n"
-        "- Client: 'J'ai mal aux dents, c'est urgent' + Agent répond poliment + Client: 'Merci' → neutre\n"
-        "- Client: 'Vous m'avez fait attendre 30 min, c'est inadmissible !' → mauvais\n"
-        "- Client: 'Bonjour, je voudrais un rdv' + échange normal → neutre\n"
-        "- Client: 'Super, merci beaucoup, vous êtes adorable !' → bon\n\n"
+        "Définitions :\n"
+        "- bon : le client repart SATISFAIT (sa demande a été traitée OU il manifeste de la chaleur, "
+        "remerciements appuyés, ton convivial, complicité avec l'agent, soulagement). Au moins UN signe positif clair.\n"
+        "- neutre : conversation factuelle/polie sans émotion marquée, OU demande non aboutie sans énervement, "
+        "OU échange très bref. C'est le cas par défaut quand rien ne penche vraiment d'un côté.\n"
+        "- mauvais : le client est AGRESSIF, INSULTE, MENACE, ou se PLAINT EXPLICITEMENT du service ou de l'agent.\n\n"
+        "⚠ RÈGLE 1 : un client qui appelle pour un PROBLÈME (douleur, urgence, dent cassée) reste 'neutre' "
+        "si la conversation est polie. Exprimer une douleur N'EST PAS être mécontent.\n\n"
+        "⚠ RÈGLE 2 : un client poli dont la demande est SATISFAITE (rdv pris, info reçue, problème résolu) "
+        "et qui remercie en partant peut être 'bon', surtout s'il y a un ton chaleureux ou plusieurs remerciements.\n\n"
+        "Exemples 'bon' :\n"
+        "- Client obtient son rdv + 'Super, merci beaucoup, à bientôt !' → bon\n"
+        "- 'Ah, c'est très gentil, merci à vous, bonne journée !' (ton chaleureux) → bon\n"
+        "- 'Parfait, vous me sauvez' + remerciements → bon\n"
+        "- Client soulagé d'avoir une réponse + remerciements appuyés → bon\n"
+        "- Échange convivial avec rires ou complicité → bon\n\n"
+        "Exemples 'neutre' :\n"
+        "- 'J'ai mal aux dents, c'est urgent' + agent répond + 'Merci, au revoir' → neutre\n"
+        "- 'Bonjour, je voudrais un rdv' + 'D'accord, c'est noté' + 'OK merci' → neutre\n"
+        "- 'Vous n'avez rien avant 3 semaines ? D'accord, je rappellerai' (déçu mais poli) → neutre\n"
+        "- Échange court 'Bonjour - Au revoir' → neutre\n\n"
+        "Exemples 'mauvais' :\n"
+        "- 'Vous m'avez fait attendre 30 min, c'est inadmissible !' → mauvais\n"
+        "- 'Ça fait 3 fois que j'appelle, c'est scandaleux' → mauvais\n"
+        "- 'Vous êtes incompétents' → mauvais\n\n"
         f"Conversation à analyser :\n{text[:1500]}\n\n"
         "Ton (un seul mot) :"
     )
@@ -1043,13 +1060,28 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     with_summary   = bool(inp.get("with_summary", WITH_SUMMARY_DEFAULT))
 
     # Déterminer la direction de l'appel
-    # Règle simple : un fichier dont le nom commence par "out-" ou "out_" est sortant,
-    # tous les autres sont entrants par défaut (jamais "unknown").
+    # Règle : un fichier dont le nom commence par "out" est sortant, tous les
+    # autres sont entrants. On vérifie aussi si "out-" ou "out_" apparaît n'importe
+    # où dans le filename (ex: q-701-out-xxx.wav).
     call_direction = (inp.get("call_direction") or "").lower().strip()
     if call_direction not in ("inbound", "outbound"):
         audio_url = inp.get("audio_url") or inp.get("file_path") or ""
         filename = audio_url.split("/")[-1].lower()
-        if filename.startswith("out-") or filename.startswith("out_"):
+        # Log de debug pour comprendre les filenames qu'on reçoit
+        log(f"[DIRECTION] audio_url={audio_url[:200]} filename={filename}")
+        # Détection souple : "out-" ou "out_" au début OU dans le nom
+        if (
+            filename.startswith("out-")
+            or filename.startswith("out_")
+            or filename.startswith("out.")
+            or filename.startswith("out ")
+            or "/out-" in audio_url.lower()
+            or "/out_" in audio_url.lower()
+            or "-out-" in filename
+            or "_out_" in filename
+            or "-out." in filename
+            or "_out." in filename
+        ):
             call_direction = "outbound"
         else:
             call_direction = "inbound"
@@ -1264,10 +1296,16 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # ── CORRECTION DU TRANSCRIPT ───────────────────────────────────────
         # On ne corrige que si le transcript vaut la peine :
-        # - au moins 3 segments OU 200 chars (sinon c'est court, peu d'erreurs probables)
+        # - au moins 3 segments OU 200 chars (sinon c'est trop court, peu d'erreurs probables)
+        # - PAS plus que CORRECT_MAX_CHARS (sinon coût LLM trop élevé pour bénéfice faible)
         n_chars_transcript = len(full_transcript)
         n_segs_text = sum(1 for s in merged if s.get("text"))
-        if ENABLE_TRANSCRIPT_CORRECTION and full_transcript and (n_segs_text >= 3 or n_chars_transcript >= 200):
+        if not ENABLE_TRANSCRIPT_CORRECTION or not full_transcript:
+            pass
+        elif n_chars_transcript > CORRECT_MAX_CHARS:
+            log(f"[HANDLER] Correction skippée (transcript trop long : {n_chars_transcript} chars > {CORRECT_MAX_CHARS} max)")
+            corrected_transcript = full_transcript  # pas de correction
+        elif n_segs_text >= 3 or n_chars_transcript >= 200:
             log(f"[HANDLER] Correcting transcript ({n_segs_text} segs, {n_chars_transcript} chars)...")
             corrected_transcript = correct_transcript(full_transcript)
             if corrected_transcript != full_transcript:
