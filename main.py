@@ -1029,11 +1029,25 @@ def generate_summary(transcript: str, duration_seconds: float = 0) -> str:
     elif duration_seconds <= 600: max_tokens = 90
     else:                         max_tokens = 110
 
+    # Stratégie de troncature :
+    #  - Appel ≤ 15 min : on passe TOUT le transcript au LLM (Ministral 8B a 128k
+    #    de contexte, il avale large). C'est le cas typique (>95% des appels).
+    #  - Appel > 15 min : on garde la tête (2500 chars = qui appelle, pour quoi)
+    #    et la queue (2500 chars = conclusion, accord, RDV pris). Le milieu est
+    #    sacrifié car c'est généralement la partie la moins informative pour un
+    #    résumé court de 1-2 phrases.
+    if duration_seconds <= 900:
+        transcript_for_summary = transcript
+    else:
+        head = transcript[:2500]
+        tail = transcript[-2500:]
+        transcript_for_summary = f"{head}\n[... milieu de conversation omis ...]\n{tail}"
+
     prompt = (
         "Résume cette conversation téléphonique en 1 ou 2 phrases courtes (max 40 mots au total). "
         "Dis uniquement l'essentiel : qui appelle, pour quoi, et la conclusion. "
         "Pas d'introduction, pas de reformulation inutile, va droit au but.\n\n"
-        f"Conversation:\n{transcript[:3000]}\n\nRésumé court:"
+        f"Conversation:\n{transcript_for_summary}\n\nRésumé court:"
     )
 
     summary = run_llm(prompt, max_new_tokens=max_tokens)
