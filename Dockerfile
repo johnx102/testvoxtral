@@ -40,8 +40,13 @@ RUN pip install --no-cache-dir --upgrade transformers accelerate bitsandbytes hf
 RUN pip install --no-cache-dir faster-whisper
 
 # Flash Attention 2 (gain 20-40% sur génération, best-effort)
-RUN pip install --no-cache-dir flash-attn --no-build-isolation || \
-    echo "[BUILD] flash-attn install skipped"
+# On force l'utilisation d'un wheel précompilé (--only-binary) pour éviter la
+# compilation depuis source qui peut prendre 30-60 min et faire timeout le build.
+# Si aucun wheel n'est disponible pour cette combinaison torch/cuda/python →
+# l'install échoue silencieusement et le code Python utilise le fallback (bf16
+# sans flash-attn, ~20% plus lent mais fonctionnel).
+RUN timeout 300 pip install --no-cache-dir --only-binary=flash-attn flash-attn 2>&1 || \
+    echo "[BUILD] flash-attn install skipped (no wheel or timeout — code will fallback)"
 
 # Fix PyTorch 2.6+ weights_only
 COPY patch_torch_load.py /tmp/patch_torch_load.py
