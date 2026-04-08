@@ -364,11 +364,12 @@ def _detect_loop_regions(
     sr: int,
     min_loop_s: float = 15.0,
     max_loop_s: float = 90.0,
-    global_threshold: float = 0.92,
-    per_second_threshold: float = 0.94,
-    min_region_s: float = 8.0,
+    global_threshold: float = 0.95,
+    per_second_threshold: float = 0.96,
+    min_region_s: float = 10.0,
     silence_energy_ratio: float = 0.10,
     min_active_seconds: int = 25,
+    min_coverage_ratio: float = 0.40,
 ) -> Tuple[List[Tuple[float, float]], float, float]:
     """Détecte les RÉGIONS temporelles où un canal contient une annonce IVR ou
     musique en boucle, via auto-similarité spectrale.
@@ -533,6 +534,19 @@ def _detect_loop_regions(
 
     # Filtrer les régions trop courtes
     regions = [(s, e) for s, e in regions if (e - s) >= min_region_s]
+
+    # Garde-fou final : la couverture totale des régions détectées doit être ≥
+    # min_coverage_ratio de la durée du canal. Une vraie annonce IVR couvre
+    # typiquement 60-100% du canal (le client est en attente longtemps), tandis
+    # qu'un faux positif sur conversation normale ne couvre qu'une petite partie
+    # (juste quelques secondes où le motif spectral est par hasard cohérent).
+    if regions:
+        total_coverage = sum(e - s for s, e in regions)
+        channel_duration = n_sec  # 1 vector par seconde
+        coverage_ratio = total_coverage / channel_duration if channel_duration > 0 else 0
+        if coverage_ratio < min_coverage_ratio:
+            # Couverture trop faible → c'est très probablement un faux positif
+            return ([], float(best_k), float(best_score))
 
     return (regions, float(best_k), float(best_score))
 
