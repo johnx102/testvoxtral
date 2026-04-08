@@ -362,11 +362,13 @@ def _mute_audio_regions(audio_np, sr: int, regions: List[Tuple[float, float]]):
 def _detect_loop_regions(
     audio_np,
     sr: int,
-    min_loop_s: float = 8.0,
+    min_loop_s: float = 15.0,
     max_loop_s: float = 90.0,
-    global_threshold: float = 0.88,
-    per_second_threshold: float = 0.92,
-    min_region_s: float = 5.0,
+    global_threshold: float = 0.92,
+    per_second_threshold: float = 0.94,
+    min_region_s: float = 8.0,
+    silence_energy_ratio: float = 0.10,
+    min_active_seconds: int = 25,
 ) -> Tuple[List[Tuple[float, float]], float, float]:
     """Détecte les RÉGIONS temporelles où un canal contient une annonce IVR ou
     musique en boucle, via auto-similarité spectrale.
@@ -436,13 +438,39 @@ def _detect_loop_regions(
         return ([], 0.0, 0.0)
 
     sec_vectors = log_bands[: n_sec * frames_per_sec].reshape(n_sec, frames_per_sec, n_bands).mean(axis=1)
+
+    # ── Filtrage des secondes silencieuses ─────────────────────────────────
+    # Sans ce filtre, l'algorithme est leurré par les longues plages de silence :
+    # toutes les secondes silencieuses ont des vecteurs quasi-identiques (faible
+    # énergie, spectre plat) → cosine similarity ≈ 1.0 → faux pic sur n'importe
+    # quelle période. On marque "active" chaque seconde dont l'énergie dépasse
+    # 10% du pic du canal, et on EXCLUT les paires impliquant une seconde silencieuse
+    # quand on calcule les diagonales.
+    sec_energy = np.zeros(n_sec, dtype=np.float32)
+    samples_per_sec = sr
+    for t in range(n_sec):
+        s_idx = t * samples_per_sec
+        e_idx = min(s_idx + samples_per_sec, len(audio_np))
+        if e_idx > s_idx:
+            chunk = audio_np[s_idx:e_idx]
+            sec_energy[t] = float(np.sqrt(np.mean(chunk * chunk)))
+    energy_peak = float(np.max(sec_energy)) if len(sec_energy) > 0 else 0.0
+    if energy_peak < 1e-6:
+        return ([], 0.0, 0.0)
+    active_mask = sec_energy >= (silence_energy_ratio * energy_peak)
+    n_active = int(np.sum(active_mask))
+    if n_active < min_active_seconds:
+        # Pas assez de contenu non-silencieux pour conclure à une boucle
+        return ([], 0.0, 0.0)
+
     norms = np.linalg.norm(sec_vectors, axis=1, keepdims=True) + 1e-9
     sec_vectors = sec_vectors / norms
 
     # Self-similarity matrix
     sim = sec_vectors @ sec_vectors.T  # (n_sec, n_sec)
 
-    # Recherche meilleure période k
+    # Recherche meilleure période k — on calcule la moyenne UNIQUEMENT sur les
+    # paires (t, t+k) où LES DEUX secondes sont actives (non-silencieuses)
     min_k = max(int(min_loop_s), 5)
     max_k = min(int(max_loop_s), n_sec - 5)
     if max_k <= min_k:
@@ -451,10 +479,14 @@ def _detect_loop_regions(
     best_score = 0.0
     best_k = 0
     for k in range(min_k, max_k + 1):
-        diag = np.diagonal(sim, offset=k)
-        if len(diag) < 5:
+        # Indices t pour lesquels t et t+k sont tous deux actifs
+        valid = active_mask[: n_sec - k] & active_mask[k:]
+        n_valid = int(np.sum(valid))
+        # Exiger au moins 8 paires actives (sinon on s'appuie sur trop peu de données)
+        if n_valid < 8:
             continue
-        score = float(np.mean(diag))
+        diag = np.diagonal(sim, offset=k)
+        score = float(np.mean(diag[valid]))
         if score > best_score:
             best_score = score
             best_k = k
@@ -463,14 +495,17 @@ def _detect_loop_regions(
     if best_score < global_threshold or best_k == 0:
         return ([], float(best_k), float(best_score))
 
-    # Pour chaque seconde, vérifier si elle est dans une zone qui boucle
-    # Une seconde est "in-loop" si sa similarité avec t±k (ou t±2k) dépasse le seuil
+    # Pour chaque seconde ACTIVE, vérifier si elle est dans une zone qui boucle.
+    # Les secondes silencieuses ne sont jamais "in-loop" (même si elles ressemblent
+    # à d'autres secondes silencieuses, ce n'est pas une vraie boucle d'annonce).
     in_loop = np.zeros(n_sec, dtype=bool)
     for t in range(n_sec):
+        if not active_mask[t]:
+            continue
         candidates = []
         for offset in (best_k, -best_k, 2 * best_k, -2 * best_k):
             tt = t + offset
-            if 0 <= tt < n_sec:
+            if 0 <= tt < n_sec and active_mask[tt]:
                 candidates.append(sim[t, tt])
         if candidates and max(candidates) >= per_second_threshold:
             in_loop[t] = True
