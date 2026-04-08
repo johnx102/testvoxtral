@@ -68,6 +68,21 @@ WHISPER_CT2_PATH   = WHISPER_LOCAL_DIR + "/ctranslate2"
 WHISPER_DEVICE     = os.environ.get("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE    = os.environ.get("WHISPER_COMPUTE", "float16")
 
+# Initial prompt Whisper : sert de "vocabulaire de biais" pour orienter le décodage.
+# Quand Whisper hésite entre 2 mots qui sonnent pareils, il privilégie ceux du prompt.
+# Couvre les domaines : téléphonie pro, médical, dentaire, commercial/vente.
+# Override possible via env var WHISPER_INITIAL_PROMPT pour les clients spécialisés.
+WHISPER_DEFAULT_PROMPT = (
+    "Conversation téléphonique professionnelle en français entre un client et un agent. "
+    "Cabinet médical ou dentaire, secrétaire, accueil, prise de rendez-vous. "
+    "Vocabulaire courant : bonjour, madame, monsieur, docteur, médecin, patient, "
+    "rendez-vous, urgence, douleur, dent, dent de sagesse, prothèse dentaire, "
+    "détartrage, ordonnance, mutuelle, devis, facture, commande, livraison, tarif, "
+    "paiement, client, assistante, joignable, rappeler, message, répondeur, "
+    "merci, au revoir, bonne journée, à bientôt."
+)
+WHISPER_INITIAL_PROMPT = os.environ.get("WHISPER_INITIAL_PROMPT", "").strip() or WHISPER_DEFAULT_PROMPT
+
 # LLM texte (résumé, sentiment, correction)
 # Forcé en dur — ne pas utiliser d'env var pour éviter les overrides
 LLM_MODEL_ID       = "mistralai/Ministral-8B-Instruct-2410"
@@ -344,11 +359,156 @@ def _mute_audio_regions(audio_np, sr: int, regions: List[Tuple[float, float]]):
     return audio_np
 
 
+def _detect_loop_regions(
+    audio_np,
+    sr: int,
+    min_loop_s: float = 8.0,
+    max_loop_s: float = 90.0,
+    global_threshold: float = 0.88,
+    per_second_threshold: float = 0.92,
+    min_region_s: float = 5.0,
+) -> Tuple[List[Tuple[float, float]], float, float]:
+    """Détecte les RÉGIONS temporelles où un canal contient une annonce IVR ou
+    musique en boucle, via auto-similarité spectrale.
+
+    Méthode (numpy-only, ~0.5-1s pour 5min audio) :
+      1. STFT magnitude (frames 50ms, hop 25ms)
+      2. Réduction à 24 bandes log-fréquence
+      3. Aggrégation par seconde → 1 vecteur log-spectral / seconde (normalisé L2)
+      4. Self-similarity matrix cosinus
+      5. Recherche de la meilleure période k (8s..90s) sur diagonales décalées
+      6. Pour chaque seconde t, marquage "in-loop" si sim(t, t±k) ≥ seuil
+      7. Fusion en régions contiguës ≥ min_region_s
+
+    Une vraie conversation a un contenu spectral qui varie constamment → aucune
+    diagonale décalée n'atteint un haut score. Une annonce qui boucle (ou de la
+    musique d'attente) crée un pic net sur une diagonale = signature.
+
+    Returns (regions, best_period_s, global_loop_score)
+    """
+    import numpy as np
+
+    if audio_np is None or len(audio_np) < int(sr * min_loop_s * 2.5):
+        return ([], 0.0, 0.0)
+
+    peak = float(np.max(np.abs(audio_np)))
+    if peak < 1e-4:
+        return ([], 0.0, 0.0)
+
+    # STFT
+    frame_len = int(0.050 * sr)
+    hop = int(0.025 * sr)
+    n_fft = 1024 if sr >= 16000 else 512
+    n_frames = 1 + (len(audio_np) - frame_len) // hop
+    if n_frames < 80:
+        return ([], 0.0, 0.0)
+
+    try:
+        window = np.hanning(frame_len).astype(np.float32)
+        audio_f = np.ascontiguousarray(audio_np, dtype=np.float32)
+        frames = np.lib.stride_tricks.as_strided(
+            audio_f,
+            shape=(n_frames, frame_len),
+            strides=(audio_f.strides[0] * hop, audio_f.strides[0]),
+        )
+        frames_w = frames * window
+        spec = np.abs(np.fft.rfft(frames_w, n=n_fft, axis=1))
+    except Exception:
+        return ([], 0.0, 0.0)
+
+    # Réduction en 24 bandes log-fréquence
+    n_bins = spec.shape[1]
+    n_bands = 24
+    freqs = np.linspace(0, sr / 2, n_bins)
+    f_max = max(sr / 2 - 1, 200)
+    log_edges = np.geomspace(80, f_max, n_bands + 1)
+    bands = np.zeros((n_frames, n_bands), dtype=np.float32)
+    for i in range(n_bands):
+        mask = (freqs >= log_edges[i]) & (freqs < log_edges[i + 1])
+        if mask.any():
+            bands[:, i] = spec[:, mask].mean(axis=1)
+    log_bands = np.log1p(bands)
+
+    # Vecteur log-spectral / seconde
+    frames_per_sec = int(round(1.0 / 0.025))
+    n_sec = n_frames // frames_per_sec
+    if n_sec < int(min_loop_s * 2.5):
+        return ([], 0.0, 0.0)
+
+    sec_vectors = log_bands[: n_sec * frames_per_sec].reshape(n_sec, frames_per_sec, n_bands).mean(axis=1)
+    norms = np.linalg.norm(sec_vectors, axis=1, keepdims=True) + 1e-9
+    sec_vectors = sec_vectors / norms
+
+    # Self-similarity matrix
+    sim = sec_vectors @ sec_vectors.T  # (n_sec, n_sec)
+
+    # Recherche meilleure période k
+    min_k = max(int(min_loop_s), 5)
+    max_k = min(int(max_loop_s), n_sec - 5)
+    if max_k <= min_k:
+        return ([], 0.0, 0.0)
+
+    best_score = 0.0
+    best_k = 0
+    for k in range(min_k, max_k + 1):
+        diag = np.diagonal(sim, offset=k)
+        if len(diag) < 5:
+            continue
+        score = float(np.mean(diag))
+        if score > best_score:
+            best_score = score
+            best_k = k
+
+    # Si même la meilleure diagonale est faible → pas de boucle
+    if best_score < global_threshold or best_k == 0:
+        return ([], float(best_k), float(best_score))
+
+    # Pour chaque seconde, vérifier si elle est dans une zone qui boucle
+    # Une seconde est "in-loop" si sa similarité avec t±k (ou t±2k) dépasse le seuil
+    in_loop = np.zeros(n_sec, dtype=bool)
+    for t in range(n_sec):
+        candidates = []
+        for offset in (best_k, -best_k, 2 * best_k, -2 * best_k):
+            tt = t + offset
+            if 0 <= tt < n_sec:
+                candidates.append(sim[t, tt])
+        if candidates and max(candidates) >= per_second_threshold:
+            in_loop[t] = True
+
+    # Fusion en régions (autoriser de petits trous ≤ 2s à l'intérieur d'une zone)
+    regions: List[Tuple[float, float]] = []
+    t = 0
+    while t < n_sec:
+        if in_loop[t]:
+            start = t
+            gap = 0
+            end = t
+            while t < n_sec:
+                if in_loop[t]:
+                    end = t
+                    gap = 0
+                else:
+                    gap += 1
+                    if gap > 2:
+                        break
+                t += 1
+            regions.append((float(start), float(end + 1)))  # +1 pour inclure la dernière sec
+        else:
+            t += 1
+
+    # Filtrer les régions trop courtes
+    regions = [(s, e) for s, e in regions if (e - s) >= min_region_s]
+
+    return (regions, float(best_k), float(best_score))
+
+
 def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, language: str = "fr",
-                                  mute_regions: Optional[List[Tuple[float, float]]] = None) -> List[Dict]:
+                                  mute_regions: Optional[List[Tuple[float, float]]] = None,
+                                  initial_prompt: Optional[str] = None) -> List[Dict]:
     """Transcrit un canal avec FasterWhisper + word_timestamps. Regroupe par pauses.
     Si mute_regions est fourni, les zones correspondantes sont mises à zéro avant transcription
-    (utile pour skipper ce que dit l'agent pendant que le client est en hold music)."""
+    (utile pour skipper ce que dit l'agent pendant que le client est en hold music).
+    Si initial_prompt est fourni, override le prompt par défaut WHISPER_INITIAL_PROMPT."""
     # Si on doit muter des zones, on génère un fichier WAV temporaire masqué
     if mute_regions:
         import soundfile as sf
@@ -384,11 +544,16 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             return []
 
         # Config Whisper de production (anti-hallucination)
+        # initial_prompt : oriente le décodage vers le vocabulaire métier (téléphonie
+        # pro, médical, dentaire, commercial). Quand Whisper hésite entre 2 mots
+        # phonétiquement proches, il privilégie ceux du prompt.
+        prompt_to_use = initial_prompt or WHISPER_INITIAL_PROMPT
         segments_raw, info = model.transcribe(
             ch_path_for_whisper,
             language=language,
             beam_size=5,
             word_timestamps=True,
+            initial_prompt=prompt_to_use,
             vad_filter=True,
             vad_parameters={
                 "min_silence_duration_ms": 1000,
@@ -975,6 +1140,103 @@ def remove_duplicate_segments(segments: List[Dict], similarity_threshold: float 
 # HELPERS RÉPONSE
 # =============================================================================
 HOLD_MUSIC_LABEL = "Annonce musicale / musique d'attente"
+ON_HOLD_LABEL = "Appel mis en attente, sans réponse"
+
+
+def _segments_look_like_ivr_loop(segments: List[Dict]) -> bool:
+    """Détecte si une liste de segments d'un canal correspond à une annonce IVR
+    répétée en boucle (cabinet dentaire d'accueil typique).
+
+    Critères convergents :
+    - Au moins 5 segments générés
+    - Marqueurs typiques d'annonce dans au moins 50% des segments
+      (ex: "Bienvenue au", "Notre cabinet", "Pour les premières", "Vous pouvez également",
+      "Nous pratiquons", "veuillez patienter", "votre appel a été", "Merci de patienter")
+    - OU répétition forte des mêmes phrases (ratio mots uniques < 35%)
+    """
+    if not segments or len(segments) < 5:
+        return False
+
+    IVR_MARKERS = [
+        "bienvenue",
+        "veuillez patienter",
+        "veuillez rester en ligne",
+        "votre appel a été",
+        "votre appel est",
+        "écourter agréablement",
+        "nous pratiquons",
+        "notre cabinet",
+        "nos horaires",
+        "nous vous invitons",
+        "rendez-vous en ligne",
+        "doctolib",
+        "soins dentaires",
+        "implantologie",
+        "parodontologie",
+        "rendez-vous d'urgence",
+        "premières consultations",
+        "merci de patienter",
+        "tous nos conseillers",
+        "tous nos collaborateurs",
+        "veuillez ne pas quitter",
+        "nous allons vous répondre",
+        "écoutez attentivement",
+        "tapez 1",
+        "tapez 2",
+    ]
+
+    n_total = len(segments)
+    n_ivr = 0
+    all_words = []
+    for s in segments:
+        text = (s.get("text") or "").lower()
+        if any(marker in text for marker in IVR_MARKERS):
+            n_ivr += 1
+        # Pour le calcul du ratio mots uniques
+        cleaned = re.sub(r"[^\w\s]", " ", text)
+        all_words.extend(cleaned.split())
+
+    ivr_ratio = n_ivr / n_total
+
+    # Critère 1 : >= 50% des segments contiennent un marqueur IVR
+    if ivr_ratio >= 0.5:
+        return True
+
+    # Critère 2 : vocabulaire très pauvre (< 35% mots uniques) sur >= 30 mots
+    if len(all_words) >= 30:
+        unique_ratio = len(set(all_words)) / len(all_words)
+        if unique_ratio < 0.35 and ivr_ratio >= 0.3:
+            return True
+
+    return False
+
+
+def _build_on_hold_response(duration: float, diarization_mode: str) -> Dict[str, Any]:
+    """Réponse standard quand l'appel a été mis en attente sans jamais être traité
+    (annonce IVR en boucle côté agent, client n'a parlé à personne)."""
+    neutral_mood = {
+        "label_en": "neutral", "label_fr": "neutre", "confidence": 0.5,
+        "scores": {"negative": 0.2, "neutral": 0.6, "positive": 0.2},
+    }
+    segment = {
+        "speaker": "System",
+        "start": 0.0,
+        "end": round(duration, 2),
+        "text": ON_HOLD_LABEL,
+        "mood": neutral_mood,
+    }
+    return {
+        "task": "transcribe_diarized",
+        "segments": [segment],
+        "transcript": f"System: {ON_HOLD_LABEL}",
+        "summary": ON_HOLD_LABEL,
+        "diarization_mode": diarization_mode,
+        "audio_duration": round(duration, 2),
+        "on_hold_detected": True,
+        "mood_overall": neutral_mood,
+        "mood_client": neutral_mood,
+        "mood_by_speaker": {"System": neutral_mood},
+    }
 
 
 def _is_repetitive_announcement(text: str, duration: float) -> bool:
@@ -1058,6 +1320,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
     language       = inp.get("language") or "fr"
     with_summary   = bool(inp.get("with_summary", WITH_SUMMARY_DEFAULT))
+    # Override possible du prompt Whisper depuis le job (pour clients spécialisés)
+    job_initial_prompt = (inp.get("initial_prompt") or "").strip() or None
 
     # Déterminer la direction de l'appel
     # Règle : un fichier dont le nom commence par "out" est sortant, tous les
@@ -1168,12 +1432,78 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 log(f"[HANDLER] Audio dominé par hold/silence (ch0={hold_coverage_ch0*100:.0f}%, ch1={hold_coverage_ch1*100:.0f}%) → hold music response")
                 return _build_hold_music_response(est_dur, "stereo_hold_dominant")
 
+            # ── Détection spectrale des régions IVR / annonce en boucle ─────
+            # Auto-similarité spectrale numpy-only (~0.5-1s pour 5min) qui retourne
+            # les ZONES temporelles où un canal contient une annonce/musique en
+            # boucle. On va utiliser ces zones pour :
+            #   1) Self-mute : ne pas transcrire l'annonce sur le canal qui boucle
+            #   2) Cross-mute : ne pas transcrire les bruits ambiants du canal d'en
+            #      face pendant la même période (le client en attente n'est pas
+            #      réellement en conversation)
+            # Si à la fin tout l'audio est couvert par hold/IVR → on_hold response.
+            ivr_regions_ch0: List[Tuple[float, float]] = []
+            ivr_regions_ch1: List[Tuple[float, float]] = []
+            try:
+                import soundfile as sf
+                data, sr_full = sf.read(local_path)
+                if data.ndim > 1:
+                    ivr_regions_ch0, p0, s0 = _detect_loop_regions(data[:, 0].astype("float32"), sr_full)
+                    ivr_regions_ch1, p1, s1 = _detect_loop_regions(data[:, 1].astype("float32"), sr_full)
+                    cov0 = sum(e - s for s, e in ivr_regions_ch0)
+                    cov1 = sum(e - s for s, e in ivr_regions_ch1)
+                    log(f"[IVR_LOOP] CH0 (Client): {len(ivr_regions_ch0)} zones, {cov0:.1f}s, period={p0:.0f}s, score={s0:.3f}")
+                    log(f"[IVR_LOOP] CH1 (Agent): {len(ivr_regions_ch1)} zones, {cov1:.1f}s, period={p1:.0f}s, score={s1:.3f}")
+                del data
+            except Exception as e:
+                log(f"[IVR_LOOP] Error: {e}")
+
+            # Fusionner les régions IVR avec les hold_regions existantes (mêmes effets) :
+            # toute zone marquée comme IVR ou hold/silence sera mutée pour cross-mute.
+            def _merge_regions(a, b):
+                merged = sorted(list(a) + list(b))
+                out: List[Tuple[float, float]] = []
+                for s, e in merged:
+                    if out and s <= out[-1][1] + 0.5:
+                        out[-1] = (out[-1][0], max(out[-1][1], e))
+                    else:
+                        out.append((s, e))
+                return out
+
+            mute_ch0 = _merge_regions(hold_regions_ch0, ivr_regions_ch0)
+            mute_ch1 = _merge_regions(hold_regions_ch1, ivr_regions_ch1)
+            mute_coverage_ch0 = sum(e - s for s, e in mute_ch0) / est_dur if est_dur > 0 else 0
+            mute_coverage_ch1 = sum(e - s for s, e in mute_ch1) / est_dur if est_dur > 0 else 0
+
+            # Si LES DEUX canaux sont quasi-entièrement dans des zones non-conversationnelles
+            # (hold/silence/IVR), l'appel n'a jamais été réellement pris en charge.
+            if mute_coverage_ch0 >= 0.90 and mute_coverage_ch1 >= 0.90:
+                log(f"[HANDLER] Both channels fully non-conversational (ch0={mute_coverage_ch0*100:.0f}%, ch1={mute_coverage_ch1*100:.0f}%) → on_hold response")
+                return _build_on_hold_response(est_dur, "stereo_dual_non_conv")
+
+            # Remplacer les hold_regions originales par les régions fusionnées :
+            # le code de transcription en dessous va utiliser hold_regions_ch{0,1}
+            # comme cross-mute. Du coup l'agent ne sera pas transcrit sur les zones
+            # IVR du client (et inversement), ET les bruits ambiants ne seront pas
+            # capturés en face d'une annonce IVR.
+            hold_regions_ch0 = mute_ch0
+            hold_regions_ch1 = mute_ch1
+            hold_coverage_ch0 = mute_coverage_ch0
+            hold_coverage_ch1 = mute_coverage_ch1
+            # Forcer l'activation du cross-mute si on a détecté des zones IVR
+            if ivr_regions_ch0 or ivr_regions_ch1:
+                log(f"[HANDLER] IVR regions detected → cross-mute forced")
+
             # Décider si on applique le cross-mute :
             # - Si UN seul canal est globalement hold music → cross-mute OK (cas typique : client en attente)
             # - Si LES DEUX ont des hold regions sans qu'aucun soit globalement hold → conversation
             #   normale avec pauses, on ne mute PAS (sinon on coupe des paroles légitimes)
+            # - SAUF si la détection IVR a trouvé des zones d'annonce : dans ce cas
+            #   on veut TOUJOURS muter (pour ne pas transcrire l'annonce ni les
+            #   bruits ambiants en face).
+            has_ivr_regions = bool(ivr_regions_ch0 or ivr_regions_ch1)
             apply_cross_mute = (
-                hold_ch0.get("is_hold_music") or hold_ch1.get("is_hold_music")
+                has_ivr_regions
+                or hold_ch0.get("is_hold_music") or hold_ch1.get("is_hold_music")
                 or hold_coverage_ch0 >= 0.50 or hold_coverage_ch1 >= 0.50
             )
             if not apply_cross_mute:
@@ -1181,6 +1511,14 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     log(f"[HANDLER] Conversation bidirectionnelle (ch0={hold_coverage_ch0*100:.0f}%, ch1={hold_coverage_ch1*100:.0f}%) → cross-mute désactivé")
                 hold_regions_ch0 = []
                 hold_regions_ch1 = []
+
+            # mute_regions passées à chaque canal :
+            #   - cross-mute : régions hold/IVR de l'AUTRE canal (ne pas transcrire
+            #     les bruits ambiants pendant que l'autre est en attente)
+            #   - self-mute IVR : régions IVR de CE canal (ne pas transcrire l'annonce
+            #     elle-même quand le canal joue une annonce en boucle)
+            ch0_mute = _merge_regions(hold_regions_ch1, ivr_regions_ch0)
+            ch1_mute = _merge_regions(hold_regions_ch0, ivr_regions_ch1)
 
             # Skip un canal UNIQUEMENT s'il est quasi-entièrement hold music (≥ 95%).
             # Sinon on le transcrit quand même : Whisper a son propre VAD qui sautera
@@ -1191,20 +1529,20 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 log(f"[HANDLER] CH0 (Client) is dominantly hold music ({hold_coverage_ch0*100:.0f}%) → skipping Whisper")
                 client_segs = []
             else:
-                # Pendant que l'agent est en hold music, muter ch0 (pas de conv)
                 client_segs = _transcribe_channel_whisper(
                     local_path, 0, "Client", language,
-                    mute_regions=hold_regions_ch1 or None,
+                    mute_regions=ch0_mute or None,
+                    initial_prompt=job_initial_prompt,
                 )
 
             if ENABLE_HOLD_MUSIC_DETECTION and hold_coverage_ch1 >= FULL_HOLD_THRESHOLD:
                 log(f"[HANDLER] CH1 (Agent) is dominantly hold music ({hold_coverage_ch1*100:.0f}%) → skipping Whisper")
                 agent_segs = []
             else:
-                # Pendant que le client est en hold music, muter ch1 (agent ne parle pas au client)
                 agent_segs = _transcribe_channel_whisper(
                     local_path, 1, "Agent", language,
-                    mute_regions=hold_regions_ch0 or None,
+                    mute_regions=ch1_mute or None,
+                    initial_prompt=job_initial_prompt,
                 )
 
             segments = client_segs + agent_segs
