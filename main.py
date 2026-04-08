@@ -1548,6 +1548,21 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             segments = client_segs + agent_segs
             segments.sort(key=lambda s: s["start"])
 
+            # Post-check : si un canal était dominé par une boucle IVR (≥95%) ET
+            # que le total de speech transcrite côté de l'autre canal est négligeable
+            # (< 5s cumulés), c'est en réalité un appel passé entièrement en attente.
+            # Les quelques fragments transcrits sont des hallucinations Whisper sur
+            # les rares fenêtres non mutées en début/fin d'appel.
+            ivr_dominated = (
+                (ivr_regions_ch0 and sum(e - s for s, e in ivr_regions_ch0) / est_dur >= 0.95) or
+                (ivr_regions_ch1 and sum(e - s for s, e in ivr_regions_ch1) / est_dur >= 0.95)
+            )
+            if ivr_dominated and segments:
+                total_speech = sum(max(0.0, s.get("end", 0.0) - s.get("start", 0.0)) for s in segments)
+                if total_speech < 5.0:
+                    log(f"[HANDLER] IVR dominated (≥95%) + résiduel négligeable ({total_speech:.1f}s de speech) → on_hold response")
+                    return _build_on_hold_response(est_dur, "stereo_ivr_dominated_residual")
+
             if not segments:
                 # Si on a des hold regions significatives, c'est probablement une annonce/attente
                 # → ne PAS fallback sur mono (qui re-transcrirait l'annonce)
