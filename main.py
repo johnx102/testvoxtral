@@ -1438,6 +1438,20 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         info = sf.info(local_path)
         is_stereo = info.channels >= 2
 
+        # ── Mapping canal → speaker selon la direction ──────────────────────
+        # Convention empirique observée sur les enregistrements FreePBX :
+        #   - Appels ENTRANTS  : CH0 = client (appelant), CH1 = agent local
+        #   - Appels SORTANTS  : CH0 = agent local (appelant), CH1 = distant
+        # On définit le mapping ici une fois pour toutes — le reste du code
+        # utilise ch0_speaker / ch1_speaker.
+        if call_direction == "outbound":
+            ch0_speaker = "Agent"
+            ch1_speaker = "Client"
+        else:
+            ch0_speaker = "Client"
+            ch1_speaker = "Agent"
+        log(f"[HANDLER] Channel mapping: CH0={ch0_speaker}, CH1={ch1_speaker} (direction={call_direction})")
+
         # Hold music detection (mono mix)
         if ENABLE_HOLD_MUSIC_DETECTION:
             if is_stereo:
@@ -1589,26 +1603,26 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             FULL_HOLD_THRESHOLD = 0.95
 
             if ENABLE_HOLD_MUSIC_DETECTION and hold_coverage_ch0 >= FULL_HOLD_THRESHOLD:
-                log(f"[HANDLER] CH0 (Client) is dominantly hold music ({hold_coverage_ch0*100:.0f}%) → skipping Whisper")
-                client_segs = []
+                log(f"[HANDLER] CH0 ({ch0_speaker}) is dominantly hold music ({hold_coverage_ch0*100:.0f}%) → skipping Whisper")
+                ch0_segs = []
             else:
-                client_segs = _transcribe_channel_whisper(
-                    local_path, 0, "Client", language,
+                ch0_segs = _transcribe_channel_whisper(
+                    local_path, 0, ch0_speaker, language,
                     mute_regions=ch0_mute or None,
                     initial_prompt=job_initial_prompt,
                 )
 
             if ENABLE_HOLD_MUSIC_DETECTION and hold_coverage_ch1 >= FULL_HOLD_THRESHOLD:
-                log(f"[HANDLER] CH1 (Agent) is dominantly hold music ({hold_coverage_ch1*100:.0f}%) → skipping Whisper")
-                agent_segs = []
+                log(f"[HANDLER] CH1 ({ch1_speaker}) is dominantly hold music ({hold_coverage_ch1*100:.0f}%) → skipping Whisper")
+                ch1_segs = []
             else:
-                agent_segs = _transcribe_channel_whisper(
-                    local_path, 1, "Agent", language,
+                ch1_segs = _transcribe_channel_whisper(
+                    local_path, 1, ch1_speaker, language,
                     mute_regions=ch1_mute or None,
                     initial_prompt=job_initial_prompt,
                 )
 
-            segments = client_segs + agent_segs
+            segments = ch0_segs + ch1_segs
             segments.sort(key=lambda s: s["start"])
 
             # Post-check : si un canal était dominé par une boucle IVR (≥95%) ET
