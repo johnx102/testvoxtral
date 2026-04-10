@@ -1646,95 +1646,90 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                     return _build_on_hold_response(est_dur, "stereo_ivr_dominated_residual")
 
             # ── Interleaving post-hoc : corriger les timestamps compressés ──
-            # Quand un canal a très peu de speech (ex: client après 11 min de
-            # hold music), Whisper compresse tous les word timestamps dans un
-            # intervalle court → un gros segment qui chevauche les segments de
-            # l'autre canal. On détecte ce cas et on redécoupe.
+            # Quand un canal a très peu de speech après un long mute (ex: client
+            # après 11 min de hold music), Whisper compresse tous les word timestamps
+            # dans un intervalle court → 1 gros segment contenant TOUTE la conversation
+            # de ce speaker, alors que l'autre speaker a des segments étalés sur une
+            # plage bien plus large.
             #
-            # Condition : un segment du speaker A chevauche temporellement
-            # des segments du speaker B → le texte de A contient en réalité
-            # des répliques qui s'intercalent entre les segments de B.
-            # On splitte A en sous-segments alignés sur les "trous" de B.
+            # Détection : un speaker a ≤ 2 segments contenant ≥ 3 phrases, et l'autre
+            # speaker a ≥ 3 segments étalés sur une plage plus large.
+            # Action : redistribuer les phrases du speaker compressé dans les "trous"
+            # entre les segments de l'autre speaker.
             #
-            # Ce traitement ne se déclenche PAS sur les conversations normales
-            # (où les segments ne se chevauchent pas entre speakers).
-            if len(segments) >= 3:
-                new_segments = []
-                for seg in segments:
-                    # Chercher les segments de l'AUTRE speaker qui chevauchent celui-ci
-                    other_segs = [
-                        s for s in segments
-                        if s["speaker"] != seg["speaker"]
-                        and s["start"] < seg["end"]
-                        and s["end"] > seg["start"]
-                    ]
-                    if not other_segs or len(other_segs) < 2:
-                        # Pas de chevauchement significatif → garder tel quel
-                        new_segments.append(seg)
+            # Sur les conversations normales, les 2 speakers ont des segments bien
+            # répartis → la condition ne se déclenche JAMAIS.
+            if len(segments) >= 4:
+                import re as _re
+                speakers = set(s["speaker"] for s in segments)
+                for spk in speakers:
+                    spk_segs = [s for s in segments if s["speaker"] == spk]
+                    other_segs = [s for s in segments if s["speaker"] != spk]
+                    if len(spk_segs) > 2 or len(other_segs) < 3:
                         continue
-
-                    # Il y a chevauchement : le segment `seg` couvre une plage
-                    # dans laquelle d'autres speakers parlent. Redistribuer le
-                    # texte de `seg` dans les "trous" entre les other_segs.
+                    # Compter les phrases dans les segments de ce speaker
+                    all_text = " ".join(s.get("text", "") for s in spk_segs)
+                    sentences = [s.strip() for s in _re.split(r'(?<=[.!?])\s+', all_text) if s.strip()]
+                    if len(sentences) < 3:
+                        continue
+                    # Vérifier que l'autre speaker s'étale sur une plage bien plus large
                     other_segs.sort(key=lambda s: s["start"])
-                    text = seg.get("text", "")
-                    # Approche simple : on coupe le texte par phrases (ponctuation)
-                    # et on distribue une phrase par trou temporel.
-                    import re as _re
-                    sentences = [s.strip() for s in _re.split(r'(?<=[.!?])\s+', text) if s.strip()]
-                    if not sentences:
-                        new_segments.append(seg)
-                        continue
+                    other_range = other_segs[-1]["end"] - other_segs[0]["start"]
+                    spk_range = max(s["end"] for s in spk_segs) - min(s["start"] for s in spk_segs)
+                    if other_range < spk_range * 2:
+                        continue  # pas de compression évidente
 
-                    # Calculer les "trous" (slots) où le speaker seg pourrait parler
+                    # OK : ce speaker a ses timestamps compressés. On redistribue
+                    # ses phrases dans les trous entre les segments de l'autre speaker.
                     slots = []
-                    # Slot avant le premier other_seg (si seg commence avant)
-                    if seg["start"] < other_segs[0]["start"]:
-                        slots.append((seg["start"], other_segs[0]["start"]))
-                    # Slots entre les other_segs
+                    # Slot avant le premier other_seg
+                    conv_start = min(s["start"] for s in spk_segs + other_segs)
+                    if conv_start < other_segs[0]["start"]:
+                        slots.append((conv_start, other_segs[0]["start"]))
+                    # Slots entre les segments de l'autre speaker
                     for i in range(len(other_segs) - 1):
                         gap_start = other_segs[i]["end"]
                         gap_end = other_segs[i + 1]["start"]
-                        if gap_end > gap_start:
+                        if gap_end - gap_start > 0.3:
                             slots.append((gap_start, gap_end))
-                    # Slot après le dernier other_seg (si seg finit après)
-                    if seg["end"] > other_segs[-1]["end"]:
-                        slots.append((other_segs[-1]["end"], seg["end"]))
+                    # Slot après le dernier other_seg
+                    conv_end = max(s["end"] for s in spk_segs + other_segs)
+                    if conv_end > other_segs[-1]["end"]:
+                        slots.append((other_segs[-1]["end"], conv_end))
 
                     if not slots:
-                        new_segments.append(seg)
                         continue
 
                     # Distribuer les phrases dans les slots
-                    # Si plus de phrases que de slots, regrouper les phrases restantes dans le dernier slot
+                    new_spk_segs = []
                     n_slots = len(slots)
                     for idx, (slot_start, slot_end) in enumerate(slots):
                         if idx < n_slots - 1:
-                            # Une phrase par slot
                             if idx < len(sentences):
                                 phrase = sentences[idx]
                             else:
                                 break
                         else:
-                            # Dernier slot : toutes les phrases restantes
                             phrase = " ".join(sentences[idx:])
                             if not phrase:
                                 break
-                        new_segments.append({
-                            "speaker": seg["speaker"],
+                        new_spk_segs.append({
+                            "speaker": spk,
                             "start": round(slot_start, 2),
                             "end": round(slot_end, 2),
                             "text": phrase,
                             "mood": None,
                         })
-                    log(f"[INTERLEAVE] Split {seg['speaker']} segment ({seg['start']:.1f}-{seg['end']:.1f}s, "
-                        f"{len(sentences)} phrases) into {min(len(sentences), n_slots)} sub-segments "
-                        f"across {n_slots} slots")
 
-                if len(new_segments) != len(segments):
-                    segments = new_segments
-                    segments.sort(key=lambda s: s["start"])
-                    log(f"[INTERLEAVE] Post-interleaving: {len(segments)} segments")
+                    if new_spk_segs:
+                        # Remplacer les segments compressés par les nouveaux
+                        segments = other_segs + new_spk_segs
+                        segments.sort(key=lambda s: s["start"])
+                        log(f"[INTERLEAVE] Redistributed {spk} ({len(spk_segs)} segs, "
+                            f"{len(sentences)} phrases) into {len(new_spk_segs)} sub-segments "
+                            f"across {n_slots} slots (other={len(other_segs)} segs, "
+                            f"range={other_range:.1f}s vs compressed={spk_range:.1f}s)")
+                        break  # un seul speaker peut être compressé par appel
 
             if not segments:
                 # Si on a des hold regions significatives, c'est probablement une annonce/attente
