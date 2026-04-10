@@ -1081,9 +1081,11 @@ def analyze_sentiment(text: str) -> Dict[str, Any]:
         "remerciements appuyés, ton convivial, complicité avec l'agent, soulagement). Au moins UN signe positif clair.\n"
         "- neutre : conversation factuelle/polie sans émotion marquée, OU demande non aboutie sans énervement, "
         "OU échange très bref. C'est le cas par défaut quand rien ne penche vraiment d'un côté.\n"
-        "- mauvais : le client est AGRESSIF, INSULTE, MENACE, ou se PLAINT EXPLICITEMENT du service ou de l'agent.\n\n"
-        "⚠ RÈGLE 1 : un client qui appelle pour un PROBLÈME (douleur, urgence, dent cassée) reste 'neutre' "
-        "si la conversation est polie. Exprimer une douleur N'EST PAS être mécontent.\n\n"
+        "- mauvais : le client montre du MÉCONTENTEMENT, de l'AGACEMENT, de l'IMPATIENCE marquée, "
+        "ou se PLAINT du service, de l'attente, ou de l'agent. Il peut aussi être AGRESSIF, INSULTER ou MENACER.\n\n"
+        "⚠ RÈGLE 1 : un client qui appelle pour un PROBLÈME MÉDICAL (douleur, urgence, dent cassée, 'ça fait mal', "
+        "'j'ai mal') reste 'neutre' si la conversation est polie. Exprimer une douleur physique ou un besoin "
+        "urgent N'EST PAS être mécontent — c'est le MOTIF de l'appel, pas une plainte contre le service.\n\n"
         "⚠ RÈGLE 2 : un client poli dont la demande est SATISFAITE (rdv pris, info reçue, problème résolu) "
         "et qui remercie en partant peut être 'bon', surtout s'il y a un ton chaleureux ou plusieurs remerciements.\n\n"
         "Exemples 'bon' :\n"
@@ -1094,13 +1096,16 @@ def analyze_sentiment(text: str) -> Dict[str, Any]:
         "- Échange convivial avec rires ou complicité → bon\n\n"
         "Exemples 'neutre' :\n"
         "- 'J'ai mal aux dents, c'est urgent' + agent répond + 'Merci, au revoir' → neutre\n"
+        "- 'Ça me fait mal' + rdv confirmé + 'OK merci beaucoup, à tout à l'heure' → neutre\n"
         "- 'Bonjour, je voudrais un rdv' + 'D'accord, c'est noté' + 'OK merci' → neutre\n"
         "- 'Vous n'avez rien avant 3 semaines ? D'accord, je rappellerai' (déçu mais poli) → neutre\n"
         "- Échange court 'Bonjour - Au revoir' → neutre\n\n"
         "Exemples 'mauvais' :\n"
         "- 'Vous m'avez fait attendre 30 min, c'est inadmissible !' → mauvais\n"
         "- 'Ça fait 3 fois que j'appelle, c'est scandaleux' → mauvais\n"
-        "- 'Vous êtes incompétents' → mauvais\n\n"
+        "- 'Vous êtes incompétents' → mauvais\n"
+        "- Client agacé : 'Bon c'est pas possible là, je perds mon temps' → mauvais\n"
+        "- Client impatient/irrité tout au long de l'appel, soupirs, ton sec → mauvais\n\n"
         f"Conversation à analyser :\n{text[:1500]}\n\n"
         "Ton (un seul mot) :"
     )
@@ -1639,6 +1644,97 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 if total_speech < 5.0:
                     log(f"[HANDLER] IVR dominated (≥95%) + résiduel négligeable ({total_speech:.1f}s de speech) → on_hold response")
                     return _build_on_hold_response(est_dur, "stereo_ivr_dominated_residual")
+
+            # ── Interleaving post-hoc : corriger les timestamps compressés ──
+            # Quand un canal a très peu de speech (ex: client après 11 min de
+            # hold music), Whisper compresse tous les word timestamps dans un
+            # intervalle court → un gros segment qui chevauche les segments de
+            # l'autre canal. On détecte ce cas et on redécoupe.
+            #
+            # Condition : un segment du speaker A chevauche temporellement
+            # des segments du speaker B → le texte de A contient en réalité
+            # des répliques qui s'intercalent entre les segments de B.
+            # On splitte A en sous-segments alignés sur les "trous" de B.
+            #
+            # Ce traitement ne se déclenche PAS sur les conversations normales
+            # (où les segments ne se chevauchent pas entre speakers).
+            if len(segments) >= 3:
+                new_segments = []
+                for seg in segments:
+                    # Chercher les segments de l'AUTRE speaker qui chevauchent celui-ci
+                    other_segs = [
+                        s for s in segments
+                        if s["speaker"] != seg["speaker"]
+                        and s["start"] < seg["end"]
+                        and s["end"] > seg["start"]
+                    ]
+                    if not other_segs or len(other_segs) < 2:
+                        # Pas de chevauchement significatif → garder tel quel
+                        new_segments.append(seg)
+                        continue
+
+                    # Il y a chevauchement : le segment `seg` couvre une plage
+                    # dans laquelle d'autres speakers parlent. Redistribuer le
+                    # texte de `seg` dans les "trous" entre les other_segs.
+                    other_segs.sort(key=lambda s: s["start"])
+                    text = seg.get("text", "")
+                    # Approche simple : on coupe le texte par phrases (ponctuation)
+                    # et on distribue une phrase par trou temporel.
+                    import re as _re
+                    sentences = [s.strip() for s in _re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+                    if not sentences:
+                        new_segments.append(seg)
+                        continue
+
+                    # Calculer les "trous" (slots) où le speaker seg pourrait parler
+                    slots = []
+                    # Slot avant le premier other_seg (si seg commence avant)
+                    if seg["start"] < other_segs[0]["start"]:
+                        slots.append((seg["start"], other_segs[0]["start"]))
+                    # Slots entre les other_segs
+                    for i in range(len(other_segs) - 1):
+                        gap_start = other_segs[i]["end"]
+                        gap_end = other_segs[i + 1]["start"]
+                        if gap_end > gap_start:
+                            slots.append((gap_start, gap_end))
+                    # Slot après le dernier other_seg (si seg finit après)
+                    if seg["end"] > other_segs[-1]["end"]:
+                        slots.append((other_segs[-1]["end"], seg["end"]))
+
+                    if not slots:
+                        new_segments.append(seg)
+                        continue
+
+                    # Distribuer les phrases dans les slots
+                    # Si plus de phrases que de slots, regrouper les phrases restantes dans le dernier slot
+                    n_slots = len(slots)
+                    for idx, (slot_start, slot_end) in enumerate(slots):
+                        if idx < n_slots - 1:
+                            # Une phrase par slot
+                            if idx < len(sentences):
+                                phrase = sentences[idx]
+                            else:
+                                break
+                        else:
+                            # Dernier slot : toutes les phrases restantes
+                            phrase = " ".join(sentences[idx:])
+                            if not phrase:
+                                break
+                        new_segments.append({
+                            "speaker": seg["speaker"],
+                            "start": round(slot_start, 2),
+                            "end": round(slot_end, 2),
+                            "text": phrase,
+                            "mood": None,
+                        })
+                    log(f"[INTERLEAVE] Split {seg['speaker']} segment ({seg['start']:.1f}-{seg['end']:.1f}s, "
+                        f"{len(sentences)} phrases) into {min(len(sentences), n_slots)} sub-segments "
+                        f"across {n_slots} slots")
+
+                if len(new_segments) != len(segments):
+                    segments = new_segments
+                    segments.sort(key=lambda s: s["start"])
+                    log(f"[INTERLEAVE] Post-interleaving: {len(segments)} segments")
 
             if not segments:
                 # Si on a des hold regions significatives, c'est probablement une annonce/attente
