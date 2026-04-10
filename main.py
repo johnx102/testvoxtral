@@ -1665,19 +1665,21 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 for spk in speakers:
                     spk_segs = [s for s in segments if s["speaker"] == spk]
                     other_segs = [s for s in segments if s["speaker"] != spk]
-                    if len(spk_segs) > 2 or len(other_segs) < 3:
+                    if len(other_segs) < 3:
                         continue
+                    # Critère principal : le speaker a tous ses segments dans
+                    # une plage temporelle COURTE alors que l'autre speaker
+                    # s'étale sur une plage ≥ 3× plus large.
+                    other_segs.sort(key=lambda s: s["start"])
+                    other_range = other_segs[-1]["end"] - other_segs[0]["start"]
+                    spk_range = max(s["end"] for s in spk_segs) - min(s["start"] for s in spk_segs)
+                    if other_range < spk_range * 3:
+                        continue  # pas de compression évidente
                     # Compter les phrases dans les segments de ce speaker
                     all_text = " ".join(s.get("text", "") for s in spk_segs)
                     sentences = [s.strip() for s in _re.split(r'(?<=[.!?])\s+', all_text) if s.strip()]
                     if len(sentences) < 3:
                         continue
-                    # Vérifier que l'autre speaker s'étale sur une plage bien plus large
-                    other_segs.sort(key=lambda s: s["start"])
-                    other_range = other_segs[-1]["end"] - other_segs[0]["start"]
-                    spk_range = max(s["end"] for s in spk_segs) - min(s["start"] for s in spk_segs)
-                    if other_range < spk_range * 2:
-                        continue  # pas de compression évidente
 
                     # OK : ce speaker a ses timestamps compressés. On redistribue
                     # ses phrases dans les trous entre les segments de l'autre speaker.
