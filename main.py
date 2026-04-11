@@ -1287,17 +1287,20 @@ def analyze_sentiment(text: str) -> Dict[str, Any]:
 # =============================================================================
 # HOLD MUSIC DETECTION (RMS-based, pas de LLM)
 # =============================================================================
-def detect_hold_music(audio_path: str) -> Dict[str, Any]:
-    """Détecte si un fichier audio est de la musique d'attente.
-    Utilise torch.unfold (GPU si dispo) pour le calcul RMS vectorisé
-    au lieu d'une boucle Python frame-par-frame (~100× plus rapide)."""
+def detect_hold_music(audio_path_or_np, sr: int = 0) -> Dict[str, Any]:
+    """Détecte si un audio est de la musique d'attente.
+    Accepte soit un chemin de fichier (str) soit un numpy array mono (float32).
+    Utilise torch.unfold (GPU si dispo) pour le calcul RMS vectorisé."""
     import soundfile as sf
     import numpy as np
     result = {"is_hold_music": False, "speech_ratio": 1.0, "duration": 0.0}
     try:
-        y, sr = sf.read(audio_path, dtype="float32")
-        if y.ndim > 1:
-            y = np.mean(y, axis=1)
+        if isinstance(audio_path_or_np, str):
+            y, sr = sf.read(audio_path_or_np, dtype="float32")
+            if y.ndim > 1:
+                y = np.mean(y, axis=1)
+        else:
+            y = audio_path_or_np
         duration = len(y) / sr
         result["duration"] = round(duration, 2)
         if duration < HOLD_MUSIC_MIN_DURATION:
@@ -1625,18 +1628,33 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             ch1_speaker = "Agent"
         log(f"[HANDLER] Channel mapping: CH0={ch0_speaker}, CH1={ch1_speaker} (direction={call_direction})")
 
-        # Hold music detection (mono mix)
+        # ── LECTURE UNIQUE du fichier audio ────────────────────────────────
+        # On lit le fichier stéréo UNE SEULE FOIS et on passe les numpy arrays
+        # à toutes les fonctions de détection. Ça élimine 5 relectures de
+        # fichier qui prenaient jusqu'à 60s sur des workers avec un disque lent.
+        import soundfile as sf
+        import numpy as np
+        stereo_data = None
+        sr_full = 0
+        ch0_np = None
+        ch1_np = None
+        if is_stereo:
+            stereo_data, sr_full = sf.read(local_path, dtype="float32")
+            if stereo_data.ndim > 1:
+                ch0_np = stereo_data[:, 0].copy()
+                ch1_np = stereo_data[:, 1].copy()
+            else:
+                ch0_np = stereo_data.copy()
+                ch1_np = stereo_data.copy()
+            del stereo_data
+
+        # Hold music detection
         if ENABLE_HOLD_MUSIC_DETECTION:
             if is_stereo:
-                # Vérifier chaque canal
-                ch0_path = _extract_mono_channel(local_path, 0)
-                ch1_path = _extract_mono_channel(local_path, 1)
-                hold_ch0 = detect_hold_music(ch0_path)
-                hold_ch1 = detect_hold_music(ch1_path)
+                hold_ch0 = detect_hold_music(ch0_np, sr_full)
+                hold_ch1 = detect_hold_music(ch1_np, sr_full)
                 log(f"[HOLD_MUSIC] CH0: hold={hold_ch0['is_hold_music']}, ratio={hold_ch0['speech_ratio']:.4f}")
                 log(f"[HOLD_MUSIC] CH1: hold={hold_ch1['is_hold_music']}, ratio={hold_ch1['speech_ratio']:.4f}")
-                for p in [ch0_path, ch1_path]:
-                    if p != local_path and os.path.exists(p): os.remove(p)
                 if hold_ch0["is_hold_music"] and hold_ch1["is_hold_music"]:
                     return _build_hold_music_response(est_dur, "stereo_hold_music")
             else:
@@ -1648,27 +1666,23 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         if is_stereo:
             log(f"[HANDLER] Stereo audio → Whisper per-channel with word timestamps")
 
-            # Détection des zones de hold music par canal (pour muter cross-canal)
+            # Détection des zones de hold music par canal (réutilise les arrays déjà en mémoire)
             hold_regions_ch0: List[Tuple[float, float]] = []
             hold_regions_ch1: List[Tuple[float, float]] = []
             hold_coverage_ch0 = 0.0
             hold_coverage_ch1 = 0.0
             if ENABLE_HOLD_MUSIC_DETECTION:
                 try:
-                    import soundfile as sf
-                    data, sr_full = sf.read(local_path)
-                    if data.ndim > 1:
-                        hold_regions_ch0 = _detect_hold_regions_in_channel(data[:, 0].astype("float32"), sr_full)
-                        hold_regions_ch1 = _detect_hold_regions_in_channel(data[:, 1].astype("float32"), sr_full)
-                        total_ch0 = sum(e - s for s, e in hold_regions_ch0)
-                        total_ch1 = sum(e - s for s, e in hold_regions_ch1)
-                        hold_coverage_ch0 = total_ch0 / est_dur if est_dur > 0 else 0
-                        hold_coverage_ch1 = total_ch1 / est_dur if est_dur > 0 else 0
-                        if hold_regions_ch0:
-                            log(f"[HOLD_REGIONS] CH0 (Client): {len(hold_regions_ch0)} zones, {total_ch0:.1f}s ({hold_coverage_ch0*100:.0f}%)")
-                        if hold_regions_ch1:
-                            log(f"[HOLD_REGIONS] CH1 (Agent): {len(hold_regions_ch1)} zones, {total_ch1:.1f}s ({hold_coverage_ch1*100:.0f}%)")
-                    del data
+                    hold_regions_ch0 = _detect_hold_regions_in_channel(ch0_np, sr_full)
+                    hold_regions_ch1 = _detect_hold_regions_in_channel(ch1_np, sr_full)
+                    total_ch0 = sum(e - s for s, e in hold_regions_ch0)
+                    total_ch1 = sum(e - s for s, e in hold_regions_ch1)
+                    hold_coverage_ch0 = total_ch0 / est_dur if est_dur > 0 else 0
+                    hold_coverage_ch1 = total_ch1 / est_dur if est_dur > 0 else 0
+                    if hold_regions_ch0:
+                        log(f"[HOLD_REGIONS] CH0 (Client): {len(hold_regions_ch0)} zones, {total_ch0:.1f}s ({hold_coverage_ch0*100:.0f}%)")
+                    if hold_regions_ch1:
+                        log(f"[HOLD_REGIONS] CH1 (Agent): {len(hold_regions_ch1)} zones, {total_ch1:.1f}s ({hold_coverage_ch1*100:.0f}%)")
                 except Exception as e:
                     log(f"[HOLD_REGIONS] Error: {e}")
 
@@ -1682,30 +1696,21 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 log(f"[HANDLER] Audio dominé par hold/silence (ch0={hold_coverage_ch0*100:.0f}%, ch1={hold_coverage_ch1*100:.0f}%) → hold music response")
                 return _build_hold_music_response(est_dur, "stereo_hold_dominant")
 
-            # ── Détection spectrale des régions IVR / annonce en boucle ─────
-            # Auto-similarité spectrale numpy-only (~0.5-1s pour 5min) qui retourne
-            # les ZONES temporelles où un canal contient une annonce/musique en
-            # boucle. On va utiliser ces zones pour :
-            #   1) Self-mute : ne pas transcrire l'annonce sur le canal qui boucle
-            #   2) Cross-mute : ne pas transcrire les bruits ambiants du canal d'en
-            #      face pendant la même période (le client en attente n'est pas
-            #      réellement en conversation)
-            # Si à la fin tout l'audio est couvert par hold/IVR → on_hold response.
+            # ── Détection spectrale des régions IVR (réutilise les arrays) ──
             ivr_regions_ch0: List[Tuple[float, float]] = []
             ivr_regions_ch1: List[Tuple[float, float]] = []
             try:
-                import soundfile as sf
-                data, sr_full = sf.read(local_path)
-                if data.ndim > 1:
-                    ivr_regions_ch0, p0, s0 = _detect_loop_regions(data[:, 0].astype("float32"), sr_full)
-                    ivr_regions_ch1, p1, s1 = _detect_loop_regions(data[:, 1].astype("float32"), sr_full)
-                    cov0 = sum(e - s for s, e in ivr_regions_ch0)
-                    cov1 = sum(e - s for s, e in ivr_regions_ch1)
-                    log(f"[IVR_LOOP] CH0 (Client): {len(ivr_regions_ch0)} zones, {cov0:.1f}s, period={p0:.0f}s, score={s0:.3f}")
-                    log(f"[IVR_LOOP] CH1 (Agent): {len(ivr_regions_ch1)} zones, {cov1:.1f}s, period={p1:.0f}s, score={s1:.3f}")
-                del data
+                ivr_regions_ch0, p0, s0 = _detect_loop_regions(ch0_np, sr_full)
+                ivr_regions_ch1, p1, s1 = _detect_loop_regions(ch1_np, sr_full)
+                cov0 = sum(e - s for s, e in ivr_regions_ch0)
+                cov1 = sum(e - s for s, e in ivr_regions_ch1)
+                log(f"[IVR_LOOP] CH0 (Client): {len(ivr_regions_ch0)} zones, {cov0:.1f}s, period={p0:.0f}s, score={s0:.3f}")
+                log(f"[IVR_LOOP] CH1 (Agent): {len(ivr_regions_ch1)} zones, {cov1:.1f}s, period={p1:.0f}s, score={s1:.3f}")
             except Exception as e:
                 log(f"[IVR_LOOP] Error: {e}")
+
+            # Libérer les arrays bruts (plus besoin, Whisper lit le fichier directement)
+            del ch0_np, ch1_np
 
             # Fusionner les régions IVR avec les hold_regions existantes (mêmes effets) :
             # toute zone marquée comme IVR ou hold/silence sera mutée pour cross-mute.
