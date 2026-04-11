@@ -84,16 +84,13 @@ WHISPER_DEFAULT_PROMPT = (
 WHISPER_INITIAL_PROMPT = os.environ.get("WHISPER_INITIAL_PROMPT", "").strip() or WHISPER_DEFAULT_PROMPT
 
 # LLM texte (résumé, sentiment, correction)
-# Forcé en dur — ne pas utiliser d'env var pour éviter les overrides
-LLM_MODEL_ID       = "mistralai/Ministral-8B-Instruct-2410"
-_RAW_QUANT_MODE    = os.environ.get("QUANT_MODE", "bf16").lower().strip()
-# Valeurs valides uniquement — tout le reste (torchao, auto, empty, ...) → bf16 par défaut
-_VALID_QUANT_MODES = {"bnb4", "int4", "nf4", "bnb8", "int8", "bf16", "bfloat16"}
-if _RAW_QUANT_MODE not in _VALID_QUANT_MODES:
-    print(f"[CONFIG] QUANT_MODE='{_RAW_QUANT_MODE}' non reconnu → fallback 'bf16'", flush=True)
-    QUANT_MODE = "bf16"
-else:
-    QUANT_MODE = _RAW_QUANT_MODE
+# Forcé en dur — ne pas utiliser d'env var pour éviter les overrides RunPod
+LLM_MODEL_ID       = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+# INT4 NF4 : ~14GB VRAM (vs ~16GB en bf16 pour le 8B) — tient dans 24GB avec Whisper (3GB)
+# Le 24B en INT4 est nettement plus intelligent que le 8B en bf16 pour le sentiment
+# et la correction, au prix d'une génération ~2× plus lente par token (compensée
+# par des chunks plus gros = moins d'appels LLM).
+QUANT_MODE         = "bnb4"
 
 # Sentiment
 ENABLE_SENTIMENT   = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
@@ -1001,9 +998,9 @@ ENABLE_TRANSCRIPT_CORRECTION = os.environ.get("ENABLE_TRANSCRIPT_CORRECTION", "1
 # Skip la correction LLM si le transcript dépasse cette taille (en chars).
 # Pourquoi : sur les longs transcripts, le LLM corrige peu (Whisper a plus de
 # contexte → meilleur résultat) et le coût en temps est élevé (~10s/1000 chars).
-CORRECT_MAX_CHARS = int(os.environ.get("CORRECT_MAX_CHARS", "3000"))
+CORRECT_MAX_CHARS = int(os.environ.get("CORRECT_MAX_CHARS", "4000"))
 
-CORRECT_CHUNK_SIZE = int(os.environ.get("CORRECT_CHUNK_SIZE", "15"))
+CORRECT_CHUNK_SIZE = int(os.environ.get("CORRECT_CHUNK_SIZE", "30"))
 
 
 def _correct_chunk(chunk_lines: List[str]) -> Optional[List[str]]:
@@ -1013,36 +1010,18 @@ def _correct_chunk(chunk_lines: List[str]) -> Optional[List[str]]:
     chunk_text = "\n".join(chunk_lines)
 
     prompt = (
-        "Tu corriges des transcriptions automatiques d'appels téléphoniques d'un CABINET DENTAIRE. "
-        "Whisper fait souvent des erreurs phonétiques où il remplace un mot par un autre qui sonne pareil "
-        "mais n'a aucun sens dans le contexte. Tu DOIS les corriger.\n\n"
-        "MÉTHODE : pour chaque ligne, demande-toi : 'Cette phrase a-t-elle du sens dans une conversation "
-        "entre un patient et un cabinet dentaire ?' Si NON, identifie le ou les mots qui clochent et "
-        "remplace-les par ceux qui ont du sens phonétiquement proches.\n\n"
-        "EXEMPLES D'ERREURS À CORRIGER (très important) :\n"
-        "- 'centre d'entraînement' → 'centre dentaire'\n"
-        "- 'votre présent de cachin' → 'centre dentaire de Gagny' (ou autre nom de ville qui sonne pareil)\n"
-        "- 'centre dentaire allemand' → 'centre dentaire Allemagne'\n"
-        "- 'désertage' / 'détertraite' / 'détertage' → 'détartrage'\n"
-        "- 'y a pas de passe' → 'y a pas de place'\n"
-        "- 'y a pas de passe toute la semaine' → 'y a pas de place toute la semaine'\n"
-        "- 'consultation à la fin d'apprentie' → 'consultation en fin d'après-midi'\n"
-        "- 'docteur Schreiby' → 'docteur Schreiber' (ou variante phonétique du nom)\n"
-        "- 'la dent sage' / 'dents sages' → 'dent de sagesse'\n"
-        "- 'rappellement' → 'rappel' / 'rappeler'\n"
-        "- 'géniable' → 'joignable'\n"
-        "- 'cabinet de Cholet' → si contexte = ville différente, garde le nom mais vérifie\n"
-        "- noms propres : si un nom de personne ou ville sonne bizarre, le LAISSER tel quel "
-        "(on ne devine pas), sauf s'il est manifestement une erreur phonétique d'un mot courant.\n\n"
-        "RÈGLES STRICTES DE FORMAT :\n"
-        f"- Tu DOIS rendre EXACTEMENT {n} lignes, dans le même ordre\n"
-        "- Chaque ligne DOIT commencer par 'Agent:' ou 'Client:' comme dans l'original\n"
-        "- NE FUSIONNE PAS des lignes, NE SÉPARE PAS des lignes\n"
-        "- Ne reformule pas, ne résume pas, ne supprime rien\n"
-        "- Garde la ponctuation et les hésitations naturelles ('euh', 'ben', 'ouais')\n"
-        "- N'AJOUTE PAS de mots, change UNIQUEMENT ceux qui sont manifestement erronés\n\n"
-        f"Transcript original ({n} lignes) :\n{chunk_text}\n\n"
-        f"Transcript corrigé (EXACTEMENT {n} lignes, même format) :"
+        "Corrige les erreurs phonétiques de cette transcription d'appel téléphonique "
+        "(cabinet dentaire/médical). Whisper remplace parfois un mot par un homonyme "
+        "incorrect. Corrige UNIQUEMENT les mots qui n'ont pas de sens dans le contexte.\n\n"
+        "Exemples : 'centre d'entraînement' → 'centre dentaire', "
+        "'désertage' → 'détartrage', 'y a pas de passe' → 'y a pas de place', "
+        "'dent sage' → 'dent de sagesse', 'géniable' → 'joignable'.\n\n"
+        f"RÈGLES : rends EXACTEMENT {n} lignes, même ordre, même speaker (Agent:/Client:). "
+        "Ne reformule pas, ne fusionne pas, ne supprime rien. "
+        "Garde les hésitations ('euh', 'ben'). "
+        "Laisse les noms propres tels quels sauf erreur évidente.\n\n"
+        f"Original ({n} lignes) :\n{chunk_text}\n\n"
+        f"Corrigé ({n} lignes) :"
     )
 
     # Budget : longueur chunk + 30% marge (pour les corrections un peu plus longues)
@@ -1950,12 +1929,27 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         # ── SENTIMENT ──────────────────────────────────────────────────────
         if ENABLE_SENTIMENT:
             log("[HANDLER] Analyzing sentiment...")
-            # Sentiment par speaker
             mood_by_speaker = {}
-            for speaker in set(s["speaker"] for s in merged):
-                speaker_text = " ".join(s["text"] for s in merged if s["speaker"] == speaker)
-                mood_by_speaker[speaker] = analyze_sentiment(speaker_text)
-                log(f"[SENTIMENT] {speaker}: {mood_by_speaker[speaker].get('label_fr', '?')}")
+            neutral_default = {
+                "label_en": "neutral", "label_fr": "neutre", "confidence": 0.7,
+                "scores": {"negative": 0.15, "neutral": 0.7, "positive": 0.15},
+            }
+
+            # Extraire UNIQUEMENT les lignes Client pour l'analyse sentiment Client.
+            # On ne passe pas le transcript interleaved complet : les répliques de
+            # l'Agent ("Non c'est pas possible") faussaient le score du Client.
+            client_text = " ".join(s["text"] for s in merged if s["speaker"] == "Client")
+            if client_text.strip():
+                mood_by_speaker["Client"] = analyze_sentiment(client_text)
+                log(f"[SENTIMENT] Client: {mood_by_speaker['Client'].get('label_fr', '?')}")
+            else:
+                mood_by_speaker["Client"] = neutral_default
+
+            # Agent = toujours neutre. Un agent fait son travail, il n'a pas
+            # de "sentiment" au sens métier. Analyser son texte créait des
+            # faux positifs (agent qui dit "c'est pas possible" → "mauvais").
+            mood_by_speaker["Agent"] = neutral_default
+            log(f"[SENTIMENT] Agent: neutre (forcé)")
 
             # Attacher aux segments
             for seg in merged:
@@ -1963,8 +1957,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 if sp in mood_by_speaker:
                     seg["mood"] = mood_by_speaker[sp]
 
-            # Client mood
-            client_mood = mood_by_speaker.get("Client", mood_by_speaker.get("Agent"))
+            # Client mood = mood global de l'appel
+            client_mood = mood_by_speaker.get("Client", neutral_default)
             result["mood_overall"] = client_mood
             result["mood_by_speaker"] = mood_by_speaker
             result["mood_client"] = client_mood
