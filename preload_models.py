@@ -45,6 +45,59 @@ if not HF_TOKEN:
 
 print(f"[PRELOAD] ✅ Token trouvé via {token_source} ({len(HF_TOKEN)} chars)")
 
+LLM_MODEL = os.environ.get("PRELOAD_LLM_MODEL", "mistralai/Mistral-Small-3.1-24B-Instruct-2503")
+WHISPER_REPO = "bofenghuang/whisper-large-v3-french-distil-dec16"
+WHISPER_LOCAL_DIR = "/app/.cache/whisper-french-distil-dec16"
+CACHE_DIR = "/app/.cache/huggingface/hub"
+
+print(f"[PRELOAD] LLM: {LLM_MODEL}")
+print(f"[PRELOAD] Whisper: {WHISPER_REPO}")
+print(f"[PRELOAD] Cache dir: {CACHE_DIR}")
+
+# 5) LLM via snapshot_download
+print(f"[PRELOAD] Downloading LLM {LLM_MODEL}...")
+try:
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        repo_id=LLM_MODEL,
+        token=HF_TOKEN,
+        cache_dir=CACHE_DIR,
+        ignore_patterns=[
+            "*.msgpack", "*.h5", "flax_model*", "tf_model*",
+            "consolidated*", "original/*", "*.pt", "*.bin",
+        ],
+    )
+    print(f"[PRELOAD] ✅ LLM {LLM_MODEL} downloaded successfully")
+except Exception as e:
+    print(f"[PRELOAD] ❌ ERROR downloading LLM: {type(e).__name__}: {e}")
+    # Ne pas faire échouer le build — le modèle sera téléchargé au runtime
+    sys.exit(0)
+
+# 6) Whisper bofenghuang français : on télécharge uniquement le sous-dossier ctranslate2/
+print(f"[PRELOAD] Downloading {WHISPER_REPO}...")
+try:
+    snapshot_download(
+        repo_id=WHISPER_REPO,
+        local_dir=WHISPER_LOCAL_DIR,
+        allow_patterns="ctranslate2/*",
+    )
+    print(f"[PRELOAD] ✅ Whisper downloaded successfully")
+except Exception as e:
+    print(f"[PRELOAD] ❌ ERROR downloading Whisper: {type(e).__name__}: {e}")
+    sys.exit(0)
+
+print("[PRELOAD] ✅ All models cached successfully")
+                    break
+            except Exception:
+                pass
+
+if not HF_TOKEN:
+    print("[PRELOAD] ⚠ Pas de HF_TOKEN au build → modèles téléchargés au 1er cold start")
+    print("[PRELOAD] ⚠ (FlashBoot prendra le snapshot après le 1er cold start, ~1s ensuite)")
+    sys.exit(0)
+
+print(f"[PRELOAD] ✅ Token trouvé via {token_source} ({len(HF_TOKEN)} chars)")
+
 LLM_MODEL = os.environ.get("PRELOAD_LLM_MODEL", "mistralai/Ministral-8B-Instruct-2410")
 WHISPER_MODEL = os.environ.get("PRELOAD_WHISPER_MODEL", "bofenghuang-french")
 CACHE_DIR = "/app/.cache/huggingface/hub"
