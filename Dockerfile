@@ -66,7 +66,7 @@ ENV LLM_MODEL_ID="Qwen/Qwen2.5-14B-Instruct" \
     ENABLE_SENTIMENT="1" \
     ENABLE_HOLD_MUSIC_DETECTION="1" \
     ENABLE_TRANSCRIPT_CORRECTION="1" \
-    QUANT_MODE="bnb8" \
+    QUANT_MODE="bnb4" \
     LOG_LEVEL="INFO"
 # Note : HF_TOKEN est passé via les env vars RunPod au runtime (pas ici)
 
