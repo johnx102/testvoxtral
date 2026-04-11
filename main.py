@@ -85,12 +85,11 @@ WHISPER_INITIAL_PROMPT = os.environ.get("WHISPER_INITIAL_PROMPT", "").strip() or
 
 # LLM texte (résumé, sentiment, correction)
 # Forcé en dur — ne pas utiliser d'env var pour éviter les overrides RunPod
-LLM_MODEL_ID       = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
-# INT4 NF4 : ~14GB VRAM (vs ~16GB en bf16 pour le 8B) — tient dans 24GB avec Whisper (3GB)
-# Le 24B en INT4 est nettement plus intelligent que le 8B en bf16 pour le sentiment
-# et la correction, au prix d'une génération ~2× plus lente par token (compensée
-# par des chunks plus gros = moins d'appels LLM).
-QUANT_MODE         = "bnb4"
+LLM_MODEL_ID       = "Qwen/Qwen2.5-14B-Instruct"
+# INT8 : ~14GB VRAM + 3GB Whisper = 17GB → tient dans 24GB avec marge
+# Le 14B en INT8 est nettement plus intelligent que le Ministral 8B en bf16
+# pour le sentiment et la correction, qualité INT8 quasi-identique à bf16.
+QUANT_MODE         = "bnb8"
 
 # Sentiment
 ENABLE_SENTIMENT   = os.environ.get("ENABLE_SENTIMENT", "1") == "1"

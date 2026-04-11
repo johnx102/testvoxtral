@@ -45,7 +45,7 @@ if not HF_TOKEN:
 
 print(f"[PRELOAD] ✅ Token trouvé via {token_source} ({len(HF_TOKEN)} chars)")
 
-LLM_MODEL = os.environ.get("PRELOAD_LLM_MODEL", "mistralai/Mistral-Small-3.1-24B-Instruct-2503")
+LLM_MODEL = os.environ.get("PRELOAD_LLM_MODEL", "Qwen/Qwen2.5-14B-Instruct")
 WHISPER_REPO = "bofenghuang/whisper-large-v3-french-distil-dec16"
 WHISPER_LOCAL_DIR = "/app/.cache/whisper-french-distil-dec16"
 CACHE_DIR = "/app/.cache/huggingface/hub"
