@@ -39,9 +39,10 @@ if not HF_TOKEN:
                 pass
 
 if not HF_TOKEN:
-    print("[PRELOAD] ⚠ Pas de HF_TOKEN au build → modèles téléchargés au 1er cold start")
-    print("[PRELOAD] ⚠ (FlashBoot prendra le snapshot après le 1er cold start, ~1s ensuite)")
-    sys.exit(0)
+    print("[PRELOAD] ⚠ Pas de HF_TOKEN au build — tentative sans token (modèles non-gated)")
+    print("[PRELOAD] ⚠ Si un modèle est gated, il sera téléchargé au 1er cold start")
+    # On NE fait PAS sys.exit(0) ici : Qwen et Whisper sont non-gated,
+    # ils peuvent être téléchargés sans token. On continue.
 
 print(f"[PRELOAD] ✅ Token trouvé via {token_source} ({len(HF_TOKEN)} chars)")
 
@@ -65,7 +66,7 @@ print(f"[PRELOAD] Downloading LLM {LLM_MODEL}...")
 try:
     snapshot_download(
         repo_id=LLM_MODEL,
-        token=HF_TOKEN,
+        token=HF_TOKEN or None,
         cache_dir=CACHE_DIR,
         ignore_patterns=[
             "*.msgpack", "*.h5", "flax_model*", "tf_model*",
