@@ -1662,16 +1662,24 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 log(f"[HANDLER] IVR regions detected → cross-mute forced")
 
             # Décider si on applique le cross-mute :
-            # - Si UN seul canal est globalement hold music → cross-mute OK (cas typique : client en attente)
-            # - Si LES DEUX ont des hold regions sans qu'aucun soit globalement hold → conversation
-            #   normale avec pauses, on ne mute PAS (sinon on coupe des paroles légitimes)
-            # - SAUF si la détection IVR a trouvé des zones d'annonce : dans ce cas
-            #   on veut TOUJOURS muter (pour ne pas transcrire l'annonce ni les
-            #   bruits ambiants en face).
+            # - Si la détection IVR a trouvé des zones d'annonce → TOUJOURS muter
+            # - Si un canal a ≥ 50% de hold_coverage → muter
+            # - Si un canal est classé "hold music" MAIS que les DEUX canaux ont
+            #   du speech détecté (ratio > 5%) → c'est une conversation bidirectionnelle
+            #   réelle, ne PAS muter (le hold_music est un faux positif sur un
+            #   agent qui parle doucement / micro faible).
             has_ivr_regions = bool(ivr_regions_ch0 or ivr_regions_ch1)
+            both_have_speech = (
+                hold_ch0.get("speech_ratio", 0) > 0.05
+                and hold_ch1.get("speech_ratio", 0) > 0.05
+            )
+            hold_flag_reliable = (
+                (hold_ch0.get("is_hold_music") or hold_ch1.get("is_hold_music"))
+                and not both_have_speech
+            )
             apply_cross_mute = (
                 has_ivr_regions
-                or hold_ch0.get("is_hold_music") or hold_ch1.get("is_hold_music")
+                or hold_flag_reliable
                 or hold_coverage_ch0 >= 0.50 or hold_coverage_ch1 >= 0.50
             )
             if not apply_cross_mute:
