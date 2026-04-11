@@ -1083,84 +1083,96 @@ CORRECT_MAX_CHARS = int(os.environ.get("CORRECT_MAX_CHARS", "4000"))
 CORRECT_CHUNK_SIZE = int(os.environ.get("CORRECT_CHUNK_SIZE", "30"))
 
 
-def _correct_chunk(chunk_lines: List[str]) -> Optional[List[str]]:
-    """Corrige un petit bloc de lignes 'Speaker: texte'.
-    Retourne la liste corrigée si valide, None si rejet (appelant garde l'original)."""
-    n = len(chunk_lines)
-    chunk_text = "\n".join(chunk_lines)
-
-    prompt = (
-        "Corrige les erreurs phonétiques de cette transcription d'appel téléphonique "
-        "(cabinet dentaire/médical). Whisper remplace parfois un mot par un homonyme "
-        "incorrect. Corrige UNIQUEMENT les mots qui n'ont pas de sens dans le contexte.\n\n"
-        "Exemples : 'centre d'entraînement' → 'centre dentaire', "
-        "'désertage' → 'détartrage', 'y a pas de passe' → 'y a pas de place', "
-        "'dent sage' → 'dent de sagesse', 'géniable' → 'joignable'.\n\n"
-        f"RÈGLES : rends EXACTEMENT {n} lignes, même ordre, même speaker (Agent:/Client:). "
-        "Ne reformule pas, ne fusionne pas, ne supprime rien. "
-        "Garde les hésitations ('euh', 'ben'). "
-        "Laisse les noms propres tels quels sauf erreur évidente.\n\n"
-        f"Original ({n} lignes) :\n{chunk_text}\n\n"
-        f"Corrigé ({n} lignes) :"
-    )
-
-    # Budget : longueur chunk + 30% marge (pour les corrections un peu plus longues)
-    max_tok = min(1800, max(384, int(len(chunk_text) * 0.7) + 200))
-    corrected = run_llm(prompt, max_new_tokens=max_tok)
-    if not corrected:
-        return None
-
-    cand = [l.strip() for l in corrected.split("\n") if l.strip()]
-    cand = [l for l in cand if l.startswith("Agent:") or l.startswith("Client:")]
-
-    if len(cand) != n:
-        return None
-
-    # Les speakers doivent matcher ligne à ligne
-    for orig, corr in zip(chunk_lines, cand):
-        if orig.split(":", 1)[0] != corr.split(":", 1)[0]:
-            return None
-
-    return cand
-
-
 def correct_transcript(transcript: str) -> str:
-    """Corrige les erreurs de reconnaissance Whisper via Mistral, par chunks.
-    Si un chunk est rejeté, on garde l'original pour ce chunk uniquement.
-    Retourne le transcript corrigé (potentiellement partiellement)."""
+    """Corrige les erreurs phonétiques Whisper via LLM en mode DIFF.
+
+    Fonctionnement :
+      1. Le LLM lit le transcript ENTIER pour comprendre le contexte
+      2. Il identifie les mots incorrects (homonymes phonétiques)
+      3. Il retourne UNIQUEMENT les corrections (pas le texte complet)
+      4. On applique les corrections en Python
+
+    Avantage : au lieu de régénérer 1800 chars (~480 tokens, ~42s), le LLM
+    n'émet que les corrections (~20-50 tokens, ~3-5s). Si rien à corriger, il
+    répond "OK" et on garde l'original tel quel.
+    """
     if not transcript or len(transcript.split()) < 5:
         return transcript
 
     original_lines = [l for l in transcript.split("\n") if l.strip()]
     n_lines = len(original_lines)
 
-    if n_lines <= CORRECT_CHUNK_SIZE:
-        # Cas simple : un seul chunk
-        cand = _correct_chunk(original_lines)
-        if cand is None:
-            log(f"[CORRECT] Chunk unique rejeté → keeping original ({n_lines} lines)")
-            return transcript
-        log(f"[CORRECT] Transcript corrected ({n_lines} lines, 1 chunk)")
-        return "\n".join(cand)
+    # Numéroter les lignes pour que le LLM puisse référencer
+    numbered = "\n".join(f"{i+1}. {line}" for i, line in enumerate(original_lines))
 
-    # Cas multi-chunks
-    result_lines: List[str] = []
-    n_chunks = (n_lines + CORRECT_CHUNK_SIZE - 1) // CORRECT_CHUNK_SIZE
-    n_ok = 0
-    n_ko = 0
-    for i in range(0, n_lines, CORRECT_CHUNK_SIZE):
-        chunk = original_lines[i:i + CORRECT_CHUNK_SIZE]
-        cand = _correct_chunk(chunk)
-        if cand is not None:
-            result_lines.extend(cand)
-            n_ok += 1
-        else:
-            # Garder l'original pour ce chunk
-            result_lines.extend(chunk)
-            n_ko += 1
+    prompt = (
+        "Tu lis cette transcription d'un appel téléphonique (cabinet dentaire/médical) "
+        "et tu identifies les erreurs phonétiques de Whisper : des mots remplacés par "
+        "un homonyme incorrect qui n'a pas de sens dans le contexte.\n\n"
+        "Exemples d'erreurs courantes : 'centre d'entraînement' → 'centre dentaire', "
+        "'désertage' → 'détartrage', 'y a pas de passe' → 'y a pas de place', "
+        "'dent sage' → 'dent de sagesse', 'géniable' → 'joignable'.\n\n"
+        "RÈGLES :\n"
+        "- Lis TOUT le transcript pour comprendre le contexte avant de corriger\n"
+        "- Ne corrige QUE les mots dont tu es SÛR qu'ils sont faux\n"
+        "- Laisse les noms propres, les hésitations ('euh', 'ben'), la ponctuation\n"
+        "- Ne reformule JAMAIS, ne change que le(s) mot(s) erroné(s)\n\n"
+        "FORMAT DE RÉPONSE :\n"
+        "- Si des corrections sont nécessaires, une par ligne : numéro_ligne: ancien → nouveau\n"
+        "- Si RIEN à corriger, réponds uniquement : OK\n\n"
+        "Exemples de réponse :\n"
+        "3: centre d'entraînement → centre dentaire\n"
+        "7: y a pas de passe → y a pas de place\n\n"
+        f"Transcript ({n_lines} lignes) :\n{numbered}\n\n"
+        "Corrections :"
+    )
 
-    log(f"[CORRECT] Transcript corrected ({n_lines} lines, {n_ok}/{n_chunks} chunks ok, {n_ko} fallback)")
-    return "\n".join(result_lines)
+    corrected_text = run_llm(prompt, max_new_tokens=256)
+    if not corrected_text:
+        return transcript
+
+    corrected_text = corrected_text.strip()
+
+    # Si le LLM dit OK ou rien à corriger → garder l'original
+    if corrected_text.upper() in ("OK", "AUCUNE CORRECTION", "RAS", "RIEN"):
+        log(f"[CORRECT] LLM: aucune correction nécessaire ({n_lines} lines)")
+        return transcript
+
+    # Parser et appliquer les corrections
+    n_applied = 0
+    for line in corrected_text.split("\n"):
+        line = line.strip()
+        if not line or "→" not in line:
+            continue
+        try:
+            # Format attendu : "3: ancien texte → nouveau texte"
+            parts = line.split(":", 1)
+            if len(parts) != 2:
+                continue
+            line_num_str = parts[0].strip()
+            # Extraire le numéro de ligne (peut contenir des espaces ou préfixes)
+            line_num = int("".join(c for c in line_num_str if c.isdigit()))
+            if line_num < 1 or line_num > n_lines:
+                continue
+            correction = parts[1].strip()
+            arrow_parts = correction.split("→")
+            if len(arrow_parts) != 2:
+                continue
+            old_text = arrow_parts[0].strip()
+            new_text = arrow_parts[1].strip()
+            if not old_text or not new_text:
+                continue
+            # Appliquer la correction sur la ligne correspondante
+            idx = line_num - 1
+            if old_text in original_lines[idx]:
+                original_lines[idx] = original_lines[idx].replace(old_text, new_text, 1)
+                n_applied += 1
+                log(f"[CORRECT]   L{line_num}: '{old_text}' → '{new_text}'")
+        except (ValueError, IndexError):
+            continue
+
+    log(f"[CORRECT] Transcript corrected: {n_applied} correction(s) applied ({n_lines} lines)")
+    return "\n".join(original_lines)
 
 
 # =============================================================================
