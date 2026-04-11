@@ -54,10 +54,15 @@ print(f"[PRELOAD] LLM: {LLM_MODEL}")
 print(f"[PRELOAD] Whisper: {WHISPER_REPO}")
 print(f"[PRELOAD] Cache dir: {CACHE_DIR}")
 
+from huggingface_hub import snapshot_download
+
 # 5) LLM via snapshot_download
+# Note : les gros modèles (24B+) sont trop volumineux pour le build Docker
+# RunPod (~48GB de safetensors). Si le téléchargement échoue (timeout, espace
+# disque, modèle gated, etc.), on continue quand même — le LLM sera téléchargé
+# au premier cold start et FlashBoot le cachera pour les starts suivants.
 print(f"[PRELOAD] Downloading LLM {LLM_MODEL}...")
 try:
-    from huggingface_hub import snapshot_download
     snapshot_download(
         repo_id=LLM_MODEL,
         token=HF_TOKEN,
@@ -69,9 +74,8 @@ try:
     )
     print(f"[PRELOAD] ✅ LLM {LLM_MODEL} downloaded successfully")
 except Exception as e:
-    print(f"[PRELOAD] ❌ ERROR downloading LLM: {type(e).__name__}: {e}")
-    # Ne pas faire échouer le build — le modèle sera téléchargé au runtime
-    sys.exit(0)
+    print(f"[PRELOAD] ⚠ LLM download failed (will download at runtime): {type(e).__name__}: {e}")
+    # NE PAS sys.exit() ici — on continue pour télécharger Whisper
 
 # 6) Whisper bofenghuang français : on télécharge uniquement le sous-dossier ctranslate2/
 print(f"[PRELOAD] Downloading {WHISPER_REPO}...")
@@ -83,74 +87,6 @@ try:
     )
     print(f"[PRELOAD] ✅ Whisper downloaded successfully")
 except Exception as e:
-    print(f"[PRELOAD] ❌ ERROR downloading Whisper: {type(e).__name__}: {e}")
-    sys.exit(0)
+    print(f"[PRELOAD] ⚠ Whisper download failed: {type(e).__name__}: {e}")
 
-print("[PRELOAD] ✅ All models cached successfully")
-                    break
-            except Exception:
-                pass
-
-if not HF_TOKEN:
-    print("[PRELOAD] ⚠ Pas de HF_TOKEN au build → modèles téléchargés au 1er cold start")
-    print("[PRELOAD] ⚠ (FlashBoot prendra le snapshot après le 1er cold start, ~1s ensuite)")
-    sys.exit(0)
-
-print(f"[PRELOAD] ✅ Token trouvé via {token_source} ({len(HF_TOKEN)} chars)")
-
-LLM_MODEL = os.environ.get("PRELOAD_LLM_MODEL", "mistralai/Ministral-8B-Instruct-2410")
-WHISPER_MODEL = os.environ.get("PRELOAD_WHISPER_MODEL", "bofenghuang-french")
-CACHE_DIR = "/app/.cache/huggingface/hub"
-
-print(f"[PRELOAD] LLM: {LLM_MODEL}")
-print(f"[PRELOAD] Whisper: {WHISPER_MODEL}")
-print(f"[PRELOAD] Cache dir: {CACHE_DIR}")
-
-# 5) LLM via snapshot_download
-print(f"[PRELOAD] Downloading LLM {LLM_MODEL}...")
-try:
-    from huggingface_hub import snapshot_download
-    snapshot_download(
-        repo_id=LLM_MODEL,
-        token=HF_TOKEN,
-        cache_dir=CACHE_DIR,
-        ignore_patterns=[
-            "*.msgpack", "*.h5", "flax_model*", "tf_model*",
-            "consolidated*", "original/*", "*.pt", "*.bin",
-        ],
-    )
-    print(f"[PRELOAD] ✅ LLM {LLM_MODEL} downloaded successfully")
-except Exception as e:
-    print(f"[PRELOAD] ❌ ERROR downloading LLM: {type(e).__name__}: {e}")
-    # Ne pas faire échouer le build — le modèle sera téléchargé au runtime
-    sys.exit(0)
-
-# 6) Whisper
-print(f"[PRELOAD] Downloading Whisper {WHISPER_MODEL}...")
-try:
-    if WHISPER_MODEL.lower() in ("bofenghuang-french", "french", "fr-distil"):
-        # Cas spécial : modèle bofenghuang français distillé
-        # On télécharge uniquement le sous-dossier ctranslate2/
-        from huggingface_hub import snapshot_download as hf_snapshot
-        hf_snapshot(
-            repo_id="bofenghuang/whisper-large-v3-french-distil-dec16",
-            local_dir="/app/.cache/whisper-french-distil-dec16",
-            allow_patterns="ctranslate2/*",
-        )
-        print(f"[PRELOAD] ✅ Whisper bofenghuang french distil dec16 downloaded successfully")
-    else:
-        # Cas standard : faster-whisper télécharge depuis Systran
-        from faster_whisper import WhisperModel
-        m = WhisperModel(
-            WHISPER_MODEL,
-            device="cpu",
-            compute_type="int8",
-            download_root="/app/.cache/huggingface/faster-whisper",
-        )
-        del m
-        print(f"[PRELOAD] ✅ Whisper {WHISPER_MODEL} downloaded successfully")
-except Exception as e:
-    print(f"[PRELOAD] ❌ ERROR downloading Whisper: {type(e).__name__}: {e}")
-    sys.exit(0)
-
-print("[PRELOAD] ✅ All models cached successfully")
+print("[PRELOAD] ✅ Preload terminé (les modèles manquants seront téléchargés au runtime)")
