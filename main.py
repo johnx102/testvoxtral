@@ -86,10 +86,11 @@ WHISPER_INITIAL_PROMPT = os.environ.get("WHISPER_INITIAL_PROMPT", "").strip() or
 # LLM texte (résumé, sentiment, correction)
 # Forcé en dur — ne pas utiliser d'env var pour éviter les overrides RunPod
 LLM_MODEL_ID       = "Qwen/Qwen2.5-14B-Instruct"
-# INT8 : ~14GB VRAM + 3GB Whisper = 17GB → tient dans 24GB avec marge
-# Le 14B en INT8 est nettement plus intelligent que le Ministral 8B en bf16
-# pour le sentiment et la correction, qualité INT8 quasi-identique à bf16.
-QUANT_MODE         = "bnb8"
+# INT4 NF4 : ~8GB VRAM + 3GB Whisper = 11GB → large marge dans 24GB
+# INT4 est souvent PLUS RAPIDE que INT8 en génération (moins de mémoire à lire
+# par layer → meilleur débit mémoire). Qualité légèrement inférieure à INT8
+# mais toujours très supérieure au Ministral 8B.
+QUANT_MODE         = "bnb4"
 
 # Sentiment
 ENABLE_SENTIMENT   = os.environ.get("ENABLE_SENTIMENT", "1") == "1"
@@ -370,18 +371,14 @@ def _detect_loop_regions(
     """Détecte les RÉGIONS temporelles où un canal contient une annonce IVR ou
     musique en boucle, via auto-similarité spectrale.
 
-    Méthode (numpy-only, ~0.5-1s pour 5min audio) :
+    Méthode (PyTorch CUDA si dispo, fallback numpy) :
       1. STFT magnitude (frames 50ms, hop 25ms)
       2. Réduction à 24 bandes log-fréquence
       3. Aggrégation par seconde → 1 vecteur log-spectral / seconde (normalisé L2)
-      4. Self-similarity matrix cosinus
-      5. Recherche de la meilleure période k (8s..90s) sur diagonales décalées
+      4. Self-similarity matrix cosinus (matmul GPU = quasi-instantané)
+      5. Recherche de la meilleure période k (15s..90s) sur diagonales décalées
       6. Pour chaque seconde t, marquage "in-loop" si sim(t, t±k) ≥ seuil
       7. Fusion en régions contiguës ≥ min_region_s
-
-    Une vraie conversation a un contenu spectral qui varie constamment → aucune
-    diagonale décalée n'atteint un haut score. Une annonce qui boucle (ou de la
-    musique d'attente) crée un pic net sur une diagonale = signature.
 
     Returns (regions, best_period_s, global_loop_score)
     """
@@ -394,7 +391,10 @@ def _detect_loop_regions(
     if peak < 1e-4:
         return ([], 0.0, 0.0)
 
-    # STFT
+    # Utiliser PyTorch + CUDA si disponible (10-50× plus rapide que numpy sur
+    # les grosses FFT et matmul). Fallback numpy si CUDA indisponible.
+    use_torch = torch.cuda.is_available()
+
     frame_len = int(0.050 * sr)
     hop = int(0.025 * sr)
     n_fft = 1024 if sr >= 16000 else 512
@@ -403,71 +403,120 @@ def _detect_loop_regions(
         return ([], 0.0, 0.0)
 
     try:
-        window = np.hanning(frame_len).astype(np.float32)
-        audio_f = np.ascontiguousarray(audio_np, dtype=np.float32)
-        frames = np.lib.stride_tricks.as_strided(
-            audio_f,
-            shape=(n_frames, frame_len),
-            strides=(audio_f.strides[0] * hop, audio_f.strides[0]),
-        )
-        frames_w = frames * window
-        spec = np.abs(np.fft.rfft(frames_w, n=n_fft, axis=1))
+        if use_torch:
+            # ── PyTorch CUDA path ──
+            device = "cuda"
+            audio_t = torch.from_numpy(np.ascontiguousarray(audio_np, dtype=np.float32)).to(device)
+            window_t = torch.hann_window(frame_len, device=device)
+
+            # STFT via torch.stft (retourne complex tensor)
+            stft_out = torch.stft(
+                audio_t, n_fft=n_fft, hop_length=hop, win_length=frame_len,
+                window=window_t, return_complex=True, center=False,
+            )
+            spec = stft_out.abs().T  # (n_frames_stft, n_fft//2+1)
+            n_frames = spec.shape[0]
+
+            # Réduction en 24 bandes log-fréquence
+            n_bins = spec.shape[1]
+            n_bands = 24
+            freqs = torch.linspace(0, sr / 2, n_bins, device=device)
+            f_max = max(sr / 2 - 1, 200)
+            log_edges = torch.from_numpy(np.geomspace(80, f_max, n_bands + 1).astype(np.float32)).to(device)
+            bands = torch.zeros((n_frames, n_bands), device=device)
+            for i in range(n_bands):
+                mask = (freqs >= log_edges[i]) & (freqs < log_edges[i + 1])
+                if mask.any():
+                    bands[:, i] = spec[:, mask].mean(dim=1)
+            log_bands = torch.log1p(bands)
+
+            # Aggrégation par seconde
+            frames_per_sec = int(round(1.0 / 0.025))
+            n_sec = n_frames // frames_per_sec
+            if n_sec < int(min_loop_s * 2.5):
+                return ([], 0.0, 0.0)
+            sec_vectors = log_bands[: n_sec * frames_per_sec].reshape(n_sec, frames_per_sec, n_bands).mean(dim=1)
+
+            # Énergie par seconde (pour filtrage silence)
+            samples_per_sec = sr
+            sec_energy = torch.zeros(n_sec, device=device)
+            for t in range(n_sec):
+                s_idx = t * samples_per_sec
+                e_idx = min(s_idx + samples_per_sec, len(audio_t))
+                if e_idx > s_idx:
+                    chunk = audio_t[s_idx:e_idx]
+                    sec_energy[t] = torch.sqrt(torch.mean(chunk * chunk))
+            energy_peak = float(sec_energy.max())
+            if energy_peak < 1e-6:
+                return ([], 0.0, 0.0)
+            active_mask_t = sec_energy >= (silence_energy_ratio * energy_peak)
+            n_active = int(active_mask_t.sum())
+            if n_active < min_active_seconds:
+                return ([], 0.0, 0.0)
+
+            # Normalisation L2 + self-similarity (matmul GPU = quasi-instantané)
+            norms = sec_vectors.norm(dim=1, keepdim=True) + 1e-9
+            sec_vectors = sec_vectors / norms
+            sim = sec_vectors @ sec_vectors.T  # (n_sec, n_sec) — GPU matmul
+
+            # Convertir vers numpy pour la boucle de recherche (petite, pas de bottleneck)
+            sim = sim.cpu().numpy()
+            active_mask = active_mask_t.cpu().numpy()
+            del audio_t, stft_out, spec, bands, log_bands, sec_vectors, sec_energy, active_mask_t
+            torch.cuda.empty_cache()
+        else:
+            # ── Numpy fallback path ──
+            window = np.hanning(frame_len).astype(np.float32)
+            audio_f = np.ascontiguousarray(audio_np, dtype=np.float32)
+            frames = np.lib.stride_tricks.as_strided(
+                audio_f,
+                shape=(n_frames, frame_len),
+                strides=(audio_f.strides[0] * hop, audio_f.strides[0]),
+            )
+            frames_w = frames * window
+            spec = np.abs(np.fft.rfft(frames_w, n=n_fft, axis=1))
+
+            n_bins = spec.shape[1]
+            n_bands = 24
+            freqs = np.linspace(0, sr / 2, n_bins)
+            f_max = max(sr / 2 - 1, 200)
+            log_edges = np.geomspace(80, f_max, n_bands + 1)
+            bands = np.zeros((n_frames, n_bands), dtype=np.float32)
+            for i in range(n_bands):
+                mask = (freqs >= log_edges[i]) & (freqs < log_edges[i + 1])
+                if mask.any():
+                    bands[:, i] = spec[:, mask].mean(axis=1)
+            log_bands = np.log1p(bands)
+
+            frames_per_sec = int(round(1.0 / 0.025))
+            n_sec = n_frames // frames_per_sec
+            if n_sec < int(min_loop_s * 2.5):
+                return ([], 0.0, 0.0)
+            sec_vectors = log_bands[: n_sec * frames_per_sec].reshape(n_sec, frames_per_sec, n_bands).mean(axis=1)
+
+            sec_energy = np.zeros(n_sec, dtype=np.float32)
+            samples_per_sec = sr
+            for t in range(n_sec):
+                s_idx = t * samples_per_sec
+                e_idx = min(s_idx + samples_per_sec, len(audio_np))
+                if e_idx > s_idx:
+                    chunk = audio_np[s_idx:e_idx]
+                    sec_energy[t] = float(np.sqrt(np.mean(chunk * chunk)))
+            energy_peak = float(np.max(sec_energy)) if len(sec_energy) > 0 else 0.0
+            if energy_peak < 1e-6:
+                return ([], 0.0, 0.0)
+            active_mask = sec_energy >= (silence_energy_ratio * energy_peak)
+            n_active = int(np.sum(active_mask))
+            if n_active < min_active_seconds:
+                return ([], 0.0, 0.0)
+
+            norms = np.linalg.norm(sec_vectors, axis=1, keepdims=True) + 1e-9
+            sec_vectors = sec_vectors / norms
+            sim = sec_vectors @ sec_vectors.T
     except Exception:
         return ([], 0.0, 0.0)
 
-    # Réduction en 24 bandes log-fréquence
-    n_bins = spec.shape[1]
-    n_bands = 24
-    freqs = np.linspace(0, sr / 2, n_bins)
-    f_max = max(sr / 2 - 1, 200)
-    log_edges = np.geomspace(80, f_max, n_bands + 1)
-    bands = np.zeros((n_frames, n_bands), dtype=np.float32)
-    for i in range(n_bands):
-        mask = (freqs >= log_edges[i]) & (freqs < log_edges[i + 1])
-        if mask.any():
-            bands[:, i] = spec[:, mask].mean(axis=1)
-    log_bands = np.log1p(bands)
-
-    # Vecteur log-spectral / seconde
-    frames_per_sec = int(round(1.0 / 0.025))
-    n_sec = n_frames // frames_per_sec
-    if n_sec < int(min_loop_s * 2.5):
-        return ([], 0.0, 0.0)
-
-    sec_vectors = log_bands[: n_sec * frames_per_sec].reshape(n_sec, frames_per_sec, n_bands).mean(axis=1)
-
-    # ── Filtrage des secondes silencieuses ─────────────────────────────────
-    # Sans ce filtre, l'algorithme est leurré par les longues plages de silence :
-    # toutes les secondes silencieuses ont des vecteurs quasi-identiques (faible
-    # énergie, spectre plat) → cosine similarity ≈ 1.0 → faux pic sur n'importe
-    # quelle période. On marque "active" chaque seconde dont l'énergie dépasse
-    # 10% du pic du canal, et on EXCLUT les paires impliquant une seconde silencieuse
-    # quand on calcule les diagonales.
-    sec_energy = np.zeros(n_sec, dtype=np.float32)
-    samples_per_sec = sr
-    for t in range(n_sec):
-        s_idx = t * samples_per_sec
-        e_idx = min(s_idx + samples_per_sec, len(audio_np))
-        if e_idx > s_idx:
-            chunk = audio_np[s_idx:e_idx]
-            sec_energy[t] = float(np.sqrt(np.mean(chunk * chunk)))
-    energy_peak = float(np.max(sec_energy)) if len(sec_energy) > 0 else 0.0
-    if energy_peak < 1e-6:
-        return ([], 0.0, 0.0)
-    active_mask = sec_energy >= (silence_energy_ratio * energy_peak)
-    n_active = int(np.sum(active_mask))
-    if n_active < min_active_seconds:
-        # Pas assez de contenu non-silencieux pour conclure à une boucle
-        return ([], 0.0, 0.0)
-
-    norms = np.linalg.norm(sec_vectors, axis=1, keepdims=True) + 1e-9
-    sec_vectors = sec_vectors / norms
-
-    # Self-similarity matrix
-    sim = sec_vectors @ sec_vectors.T  # (n_sec, n_sec)
-
-    # Recherche meilleure période k — on calcule la moyenne UNIQUEMENT sur les
-    # paires (t, t+k) où LES DEUX secondes sont actives (non-silencieuses)
+    # Recherche meilleure période k (CPU, petite boucle ~75 itérations)
     min_k = max(int(min_loop_s), 5)
     max_k = min(int(max_loop_s), n_sec - 5)
     if max_k <= min_k:
@@ -476,10 +525,8 @@ def _detect_loop_regions(
     best_score = 0.0
     best_k = 0
     for k in range(min_k, max_k + 1):
-        # Indices t pour lesquels t et t+k sont tous deux actifs
         valid = active_mask[: n_sec - k] & active_mask[k:]
         n_valid = int(np.sum(valid))
-        # Exiger au moins 8 paires actives (sinon on s'appuie sur trop peu de données)
         if n_valid < 8:
             continue
         diag = np.diagonal(sim, offset=k)
