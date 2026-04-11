@@ -557,8 +557,19 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
     """Transcrit un canal avec FasterWhisper + word_timestamps. Regroupe par pauses.
     Si mute_regions est fourni, les zones correspondantes sont mises à zéro avant transcription
     (utile pour skipper ce que dit l'agent pendant que le client est en hold music).
-    Si initial_prompt est fourni, override le prompt par défaut WHISPER_INITIAL_PROMPT."""
-    # Si on doit muter des zones, on génère un fichier WAV temporaire masqué
+    Si initial_prompt est fourni, override le prompt par défaut WHISPER_INITIAL_PROMPT.
+
+    Optimisation : quand les mute_regions couvrent > 50% de l'audio, au lieu de
+    mettre les échantillons à zéro et d'envoyer le fichier complet (Whisper + VAD
+    doivent parcourir tout le fichier), on EXTRAIT uniquement les portions non-mutées
+    et on les concatène en un WAV court. Les timestamps sont remappés vers l'audio
+    original après transcription. Gain typique : 10× sur un appel de 20 min dont
+    18 min sont mutées.
+    """
+    # Variables pour le remapping de timestamps (utilisées plus bas si on fait
+    # l'extraction optimisée). Par défaut : pas de remapping.
+    timestamp_remap_regions = None  # list of (original_start, short_start, duration)
+
     if mute_regions:
         import soundfile as sf
         import numpy as np
@@ -567,11 +578,60 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             mono = data[:, channel].astype(np.float32)
         else:
             mono = data.astype(np.float32)
-        mono = _mute_audio_regions(mono, sr, mute_regions)
-        ch_path = os.path.join(tempfile.gettempdir(), f"muted_ch{channel}_{uuid.uuid4().hex}.wav")
-        sf.write(ch_path, mono, sr)
-        total_muted = sum(e - s for s, e in mute_regions)
-        log(f"[WHISPER] {speaker} (ch{channel}): masked {total_muted:.1f}s of cross-channel hold music")
+        total_duration = len(mono) / sr
+        total_muted = sum(min(e, total_duration) - max(s, 0) for s, e in mute_regions)
+        mute_ratio = total_muted / total_duration if total_duration > 0 else 0
+
+        if mute_ratio >= 0.50 and total_muted > 30:
+            # ── Optimisation : extraire UNIQUEMENT les portions non-mutées ──
+            # Calculer les régions à GARDER (inverse des mute_regions)
+            mute_sorted = sorted(mute_regions, key=lambda r: r[0])
+            keep_regions: List[Tuple[float, float]] = []
+            prev_end = 0.0
+            for ms, me in mute_sorted:
+                ms = max(ms, 0.0)
+                me = min(me, total_duration)
+                if ms > prev_end + 0.01:
+                    keep_regions.append((prev_end, ms))
+                prev_end = max(prev_end, me)
+            if prev_end < total_duration - 0.01:
+                keep_regions.append((prev_end, total_duration))
+
+            if keep_regions:
+                # Extraire et concaténer les portions à garder
+                chunks = []
+                timestamp_remap_regions = []
+                short_offset = 0.0
+                for ks, ke in keep_regions:
+                    s_idx = max(0, int(ks * sr))
+                    e_idx = min(len(mono), int(ke * sr))
+                    if e_idx > s_idx:
+                        chunk = mono[s_idx:e_idx]
+                        chunk_dur = len(chunk) / sr
+                        timestamp_remap_regions.append((ks, short_offset, chunk_dur))
+                        chunks.append(chunk)
+                        short_offset += chunk_dur
+
+                if chunks:
+                    short_audio = np.concatenate(chunks)
+                    ch_path = os.path.join(tempfile.gettempdir(), f"trimmed_ch{channel}_{uuid.uuid4().hex}.wav")
+                    sf.write(ch_path, short_audio, sr)
+                    kept_dur = len(short_audio) / sr
+                    log(f"[WHISPER] {speaker} (ch{channel}): extracted {kept_dur:.1f}s from {total_duration:.1f}s "
+                        f"({len(keep_regions)} regions, skipped {total_muted:.1f}s muted)")
+                else:
+                    # Fallback : pas de chunk exploitable → fichier vide
+                    ch_path = _extract_mono_channel(wav_path, channel)
+                    timestamp_remap_regions = None
+            else:
+                # Tout est muté → rien à transcrire
+                return []
+        else:
+            # Mute faible (< 50%) : comportement existant (zéro les samples)
+            mono = _mute_audio_regions(mono, sr, mute_regions)
+            ch_path = os.path.join(tempfile.gettempdir(), f"muted_ch{channel}_{uuid.uuid4().hex}.wav")
+            sf.write(ch_path, mono, sr)
+            log(f"[WHISPER] {speaker} (ch{channel}): masked {total_muted:.1f}s of cross-channel hold music")
     else:
         ch_path = _extract_mono_channel(wav_path, channel)
 
@@ -637,6 +697,25 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             if DEBUG_WHISPER_RAW:
                 log(f"[DEBUG_WHISPER_RAW] {speaker} (ch{channel}) — aucun mot extrait, return []")
             return []
+
+        # ── Remapping des timestamps si on a extrait un WAV court ──
+        # Les timestamps de Whisper sont relatifs au WAV court. On doit les
+        # convertir vers la timeline de l'audio original.
+        if timestamp_remap_regions:
+            def _remap_ts(t_short: float) -> float:
+                """Convertit un timestamp du WAV court vers l'audio original."""
+                for orig_start, short_start, dur in timestamp_remap_regions:
+                    if short_start <= t_short < short_start + dur + 0.1:
+                        return orig_start + (t_short - short_start)
+                # Fallback : dernier region
+                if timestamp_remap_regions:
+                    last = timestamp_remap_regions[-1]
+                    return last[0] + (t_short - last[1])
+                return t_short
+
+            for w in all_words:
+                w["start"] = _remap_ts(w["start"])
+                w["end"] = _remap_ts(w["end"])
 
         # Regrouper par pauses > 0.8s
         result_segments = []
