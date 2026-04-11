@@ -597,6 +597,13 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             if prev_end < total_duration - 0.01:
                 keep_regions.append((prev_end, total_duration))
 
+            # Filtrer les keep regions trop courtes (< 5s) : ce sont des micro-trous
+            # entre les zones mute, contenant du bruit/silence mais pas de vraie
+            # speech. Les envoyer à Whisper génère des hallucinations et des
+            # timestamps incohérents quand ils sont concaténés.
+            MIN_KEEP_REGION_S = 5.0
+            keep_regions = [(s, e) for s, e in keep_regions if (e - s) >= MIN_KEEP_REGION_S]
+
             if keep_regions:
                 # Extraire et concaténer les portions à garder
                 chunks = []
