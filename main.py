@@ -2026,12 +2026,13 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 "scores": {"negative": 0.15, "neutral": 0.7, "positive": 0.15},
             }
 
-            # Extraire UNIQUEMENT les lignes Client pour l'analyse sentiment Client.
-            # On ne passe pas le transcript interleaved complet : les répliques de
-            # l'Agent ("Non c'est pas possible") faussaient le score du Client.
-            client_text = " ".join(s["text"] for s in merged if s["speaker"] == "Client")
-            if client_text.strip():
-                mood_by_speaker["Client"] = analyze_sentiment(client_text)
+            # Passer le transcript COMPLET (Client + Agent interleaved) pour que
+            # le LLM ait le contexte de la conversation (question/réponse, ton de
+            # l'échange, résolution du problème). Le Qwen 14B est assez intelligent
+            # pour distinguer le ton du client vs les réponses de l'agent.
+            full_text = "\n".join(f"{s['speaker']}: {s['text']}" for s in merged)
+            if full_text.strip():
+                mood_by_speaker["Client"] = analyze_sentiment(full_text)
                 log(f"[SENTIMENT] Client: {mood_by_speaker['Client'].get('label_fr', '?')}")
             else:
                 mood_by_speaker["Client"] = neutral_default
