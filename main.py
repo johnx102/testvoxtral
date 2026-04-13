@@ -1764,10 +1764,19 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 (hold_ch0.get("is_hold_music") or hold_ch1.get("is_hold_music"))
                 and not both_have_speech
             )
+            # hold_coverage ≥ 50% déclenche le cross-mute SAUF si les deux
+            # canaux ont du speech (> 5%). Dans une vraie conversation, l'agent
+            # écoute le client → son canal est silencieux → faux "hold regions".
+            # Seule exception : hold_coverage ≥ 80% (quasi-certain hold réel,
+            # même avec un peu de speech résiduel sur l'autre canal).
+            coverage_trigger = (
+                (hold_coverage_ch0 >= 0.50 or hold_coverage_ch1 >= 0.50)
+                and (not both_have_speech or hold_coverage_ch0 >= 0.80 or hold_coverage_ch1 >= 0.80)
+            )
             apply_cross_mute = (
                 has_ivr_regions
                 or hold_flag_reliable
-                or hold_coverage_ch0 >= 0.50 or hold_coverage_ch1 >= 0.50
+                or coverage_trigger
             )
             if not apply_cross_mute:
                 if hold_regions_ch0 or hold_regions_ch1:
