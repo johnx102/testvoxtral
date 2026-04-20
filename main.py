@@ -187,6 +187,93 @@ def _extract_mono_channel(wav_path: str, channel: int) -> str:
     return out_path
 
 
+def _gate_crosstalk_stereo(ch0_np, ch1_np, sr: int,
+                            window_ms: float = 200.0,
+                            ratio_threshold: float = 1.5,
+                            min_energy: float = 1e-4) -> str:
+    """Ecrit un WAV stéréo nettoyé où le bruit de fond / crosstalk de chaque canal
+    est mis à zéro quand l'AUTRE canal est le speaker actif.
+
+    Pour chaque fenêtre de window_ms :
+    - Compare l'énergie RMS des deux canaux
+    - Si ch0 est plus fort de ratio_threshold × → ch1 mis à zéro (ch0 parle, ch1 = bruit)
+    - Si ch1 est plus fort → ch0 mis à zéro
+    - Si énergie similaire (les deux parlent ou silence) → on garde les deux
+
+    Le gating est appliqué avec un léger fondu (fade) de 5ms aux transitions
+    pour éviter les clics audio.
+
+    Retourne le chemin vers le WAV stéréo nettoyé (fichier temporaire).
+    N'affecte PAS les arrays originaux (copie interne).
+    """
+    import numpy as np
+    import soundfile as sf
+
+    window = int(window_ms / 1000.0 * sr)
+    fade_samples = int(0.005 * sr)  # 5ms fade pour transitions douces
+    n_samples = min(len(ch0_np), len(ch1_np))
+
+    ch0_clean = ch0_np[:n_samples].copy()
+    ch1_clean = ch1_np[:n_samples].copy()
+
+    # Calcul RMS vectorisé par fenêtres
+    n_windows = n_samples // window
+    if n_windows == 0:
+        # Audio trop court, pas de gating
+        out_path = os.path.join(tempfile.gettempdir(), f"gated_{uuid.uuid4().hex}.wav")
+        stereo = np.column_stack([ch0_clean, ch1_clean])
+        sf.write(out_path, stereo, sr)
+        return out_path
+
+    gated_ch0 = 0
+    gated_ch1 = 0
+
+    for i in range(n_windows):
+        s = i * window
+        e = min(s + window, n_samples)
+
+        rms0 = float(np.sqrt(np.mean(ch0_np[s:e] ** 2)))
+        rms1 = float(np.sqrt(np.mean(ch1_np[s:e] ** 2)))
+
+        # Les deux en dessous du seuil minimal → silence réel, on touche à rien
+        if rms0 < min_energy and rms1 < min_energy:
+            continue
+
+        if rms0 > rms1 * ratio_threshold and rms0 > min_energy:
+            # ch0 parle → mettre ch1 à zéro (bruit de fond pendant que ch0 parle)
+            ch1_clean[s:e] = 0.0
+            gated_ch1 += 1
+        elif rms1 > rms0 * ratio_threshold and rms1 > min_energy:
+            # ch1 parle → mettre ch0 à zéro
+            ch0_clean[s:e] = 0.0
+            gated_ch0 += 1
+        # else : énergie similaire (overlap ou bruit ambiant faible), on garde les deux
+
+    # Appliquer un fade aux transitions brusques (0 → signal) pour éviter les clics
+    for ch in [ch0_clean, ch1_clean]:
+        for i in range(1, n_windows):
+            s = i * window
+            # Transition silence → signal
+            if abs(ch[s]) > min_energy and s >= fade_samples:
+                prev = ch[s - 1]
+                if abs(prev) < min_energy * 10:
+                    # Fade in
+                    fade = np.linspace(0, 1, fade_samples)
+                    end_fade = min(s + fade_samples, n_samples)
+                    ch[s:end_fade] *= fade[:end_fade - s]
+
+    total_windows = n_windows
+    log(f"[GATE] Gating cross-canal: {total_windows} fenêtres, "
+        f"ch0 gaté {gated_ch0} ({gated_ch0*100//max(total_windows,1)}%), "
+        f"ch1 gaté {gated_ch1} ({gated_ch1*100//max(total_windows,1)}%)")
+
+    # Écrire le fichier stéréo nettoyé
+    out_path = os.path.join(tempfile.gettempdir(), f"gated_{uuid.uuid4().hex}.wav")
+    stereo = np.column_stack([ch0_clean, ch1_clean])
+    sf.write(out_path, stereo, sr)
+    return out_path
+
+
 # =============================================================================
 # WHISPER — Transcription (bofenghuang french distillé)
 # =============================================================================
@@ -1709,8 +1796,25 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             except Exception as e:
                 log(f"[IVR_LOOP] Error: {e}")
 
-            # Libérer les arrays bruts (plus besoin, Whisper lit le fichier directement)
+            # Gating cross-canal : nettoyer le bruit de fond / ambiant de chaque canal
+            # en utilisant l'énergie de l'autre canal comme référence.
+            # Quand un speaker parle (énergie forte sur son canal), l'autre canal est
+            # mis à zéro (bruit de fond pendant l'écoute). Résultat : de vrais silences
+            # entre les phrases → VAD + Whisper produisent des timestamps précis.
+            # Fait APRÈS la détection hold/IVR (qui a besoin des canaux bruts) et AVANT
+            # la transcription Whisper (qui bénéficie des canaux nettoyés).
+            gated_path = None
+            try:
+                gated_path = _gate_crosstalk_stereo(ch0_np, ch1_np, sr_full)
+            except Exception as e:
+                log(f"[GATE] Error: {e} (using original audio)")
+
+            # Libérer les arrays bruts (plus besoin)
             del ch0_np, ch1_np
+
+            # Si le gating a produit un fichier nettoyé, Whisper l'utilisera
+            # au lieu du fichier original pour la transcription
+            whisper_audio_path = gated_path if gated_path else local_path
 
             # Fusionner les régions IVR avec les hold_regions existantes (mêmes effets) :
             # toute zone marquée comme IVR ou hold/silence sera mutée pour cross-mute.
@@ -1802,7 +1906,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 ch0_segs = []
             else:
                 ch0_segs = _transcribe_channel_whisper(
-                    local_path, 0, ch0_speaker, language,
+                    whisper_audio_path, 0, ch0_speaker, language,
                     mute_regions=ch0_mute or None,
                     initial_prompt=job_initial_prompt,
                 )
@@ -1812,7 +1916,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
                 ch1_segs = []
             else:
                 ch1_segs = _transcribe_channel_whisper(
-                    local_path, 1, ch1_speaker, language,
+                    whisper_audio_path, 1, ch1_speaker, language,
                     mute_regions=ch1_mute or None,
                     initial_prompt=job_initial_prompt,
                 )
@@ -2092,6 +2196,11 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         if cleanup and local_path and os.path.exists(local_path):
             try: os.remove(local_path)
             except: pass
+        # Nettoyer le fichier stéréo gaté temporaire
+        try:
+            if 'gated_path' in dir() and gated_path and gated_path != local_path and os.path.exists(gated_path):
+                os.remove(gated_path)
+        except: pass
 
 
 # =============================================================================
