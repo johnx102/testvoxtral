@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-# Whisper + Mistral Small 3.1 — RunPod Serverless Worker2
+# Whisper + Mistral Small 3.1 — RunPod Serverless Worker
 # Pipeline : Whisper (transcription + diarisation stéréo) + Mistral (résumé + sentiment + correction)
 # =============================================================================
 
