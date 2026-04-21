@@ -188,7 +188,7 @@ def _extract_mono_channel(wav_path: str, channel: int) -> str:
 
 
 def _gate_crosstalk_stereo(ch0_np, ch1_np, sr: int,
-                            window_ms: float = 200.0,
+                            window_ms: float = 150.0,
                             ratio_threshold: float = 1.5,
                             min_energy: float = 1e-4) -> str:
     """Ecrit un WAV stéréo nettoyé où le bruit de fond / crosstalk de chaque canal
@@ -836,8 +836,8 @@ def _transcribe_channel_whisper(wav_path: str, channel: int, speaker: str, langu
             initial_prompt=prompt_to_use,
             vad_filter=True,
             vad_parameters={
-                "min_silence_duration_ms": 1000,
-                "speech_pad_ms": 500,
+                "min_silence_duration_ms": 600,
+                "speech_pad_ms": 400,
                 "threshold": 0.30,
             },
             condition_on_previous_text=False,
