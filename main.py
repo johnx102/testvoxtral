@@ -41,7 +41,7 @@ def log(msg: str):
 # ---------------------------
 # Configuration
 # ---------------------------
-APP_VERSION        = os.environ.get("APP_VERSION", "whisper-mistral-v5.0")
+APP_VERSION        = os.environ.get("APP_VERSION", "whisper-mistral-v5.1-largev3")
 HF_TOKEN           = os.environ.get("HF_TOKEN", "").strip()
 MAX_DURATION_S     = int(os.environ.get("MAX_DURATION_S", "3600"))
 WITH_SUMMARY_DEFAULT = os.environ.get("WITH_SUMMARY_DEFAULT", "1") == "1"
@@ -56,15 +56,14 @@ ENABLE_AUDIO_ENHANCEMENT = os.environ.get("ENABLE_AUDIO_ENHANCEMENT", "1") == "1
 
 # Whisper : seul modèle utilisé en production
 #
-# bofenghuang/whisper-large-v3-french-distil-dec16 :
-# - Distillé (16 décodeurs au lieu de 32) → ~2× plus rapide que large-v3
-# - Fine-tuné sur 5 datasets français (~97k samples)
-# - WER 7.18% sur CommonVoice FR (vs ~10% pour large-v3 standard)
-# - WER 3.57% sur Multilingual LibriSpeech FR
-# - Réduit les hallucinations sur les transcriptions longues
-WHISPER_REPO_ID    = "bofenghuang/whisper-large-v3-french-distil-dec16"
-WHISPER_LOCAL_DIR  = "/app/.cache/whisper-french-distil-dec16"
-WHISPER_CT2_PATH   = WHISPER_LOCAL_DIR + "/ctranslate2"
+# Systran/faster-whisper-large-v3 : conversion CT2 officielle de openai/whisper-large-v3.
+# - 32 décodeurs (vs 16 distillé) → plus lent mais plus robuste sur la musique d'attente
+# - Hallucinations significativement plus rares que les versions distillées
+# - Meilleure reconnaissance des noms propres (marques, brand names)
+# - Structure HF : model.bin + config.json + tokenizer.json à la racine (pas de sous-dossier ctranslate2/)
+WHISPER_REPO_ID    = "Systran/faster-whisper-large-v3"
+WHISPER_LOCAL_DIR  = "/app/.cache/whisper-large-v3"
+WHISPER_CT2_PATH   = WHISPER_LOCAL_DIR
 WHISPER_DEVICE     = os.environ.get("WHISPER_DEVICE", "cuda")
 WHISPER_COMPUTE    = os.environ.get("WHISPER_COMPUTE", "float16")
 
@@ -275,21 +274,23 @@ def _gate_crosstalk_stereo(ch0_np, ch1_np, sr: int,
 
 
 # =============================================================================
-# WHISPER — Transcription (bofenghuang french distillé)
+# WHISPER — Transcription (Systran faster-whisper large-v3)
 # =============================================================================
 def _ensure_whisper_model() -> str:
-    """S'assure que le modèle bofenghuang français est présent localement.
-    Télécharge le sous-dossier ctranslate2/ si absent. Retourne le chemin local."""
+    """S'assure que le modèle Whisper CT2 est présent localement.
+    Télécharge tous les fichiers à la racine du repo si absents.
+    Retourne le chemin local."""
     if os.path.exists(os.path.join(WHISPER_CT2_PATH, "model.bin")):
         log(f"[WHISPER] Model cached at {WHISPER_CT2_PATH}")
         return WHISPER_CT2_PATH
 
     from huggingface_hub import snapshot_download
-    log(f"[WHISPER] Downloading {WHISPER_REPO_ID} (ctranslate2 subfolder)...")
+    log(f"[WHISPER] Downloading {WHISPER_REPO_ID}...")
     snapshot_download(
         repo_id=WHISPER_REPO_ID,
         local_dir=WHISPER_LOCAL_DIR,
-        allow_patterns="ctranslate2/*",
+        allow_patterns=["model.bin", "config.json", "tokenizer.json",
+                        "preprocessor_config.json", "vocabulary*"],
     )
     log(f"[WHISPER] Model ready at {WHISPER_CT2_PATH}")
     return WHISPER_CT2_PATH

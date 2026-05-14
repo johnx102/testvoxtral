@@ -47,8 +47,8 @@ if not HF_TOKEN:
 print(f"[PRELOAD] ✅ Token trouvé via {token_source} ({len(HF_TOKEN)} chars)")
 
 LLM_MODEL = os.environ.get("PRELOAD_LLM_MODEL", "Qwen/Qwen2.5-14B-Instruct")
-WHISPER_REPO = "bofenghuang/whisper-large-v3-french-distil-dec16"
-WHISPER_LOCAL_DIR = "/app/.cache/whisper-french-distil-dec16"
+WHISPER_REPO = "Systran/faster-whisper-large-v3"
+WHISPER_LOCAL_DIR = "/app/.cache/whisper-large-v3"
 CACHE_DIR = "/app/.cache/huggingface/hub"
 
 print(f"[PRELOAD] LLM: {LLM_MODEL}")
@@ -78,13 +78,14 @@ except Exception as e:
     print(f"[PRELOAD] ⚠ LLM download failed (will download at runtime): {type(e).__name__}: {e}")
     # NE PAS sys.exit() ici — on continue pour télécharger Whisper
 
-# 6) Whisper bofenghuang français : on télécharge uniquement le sous-dossier ctranslate2/
+# 6) Whisper Systran large-v3 CT2 : fichiers à la racine du repo (pas de sous-dossier ctranslate2/)
 print(f"[PRELOAD] Downloading {WHISPER_REPO}...")
 try:
     snapshot_download(
         repo_id=WHISPER_REPO,
         local_dir=WHISPER_LOCAL_DIR,
-        allow_patterns="ctranslate2/*",
+        allow_patterns=["model.bin", "config.json", "tokenizer.json",
+                        "preprocessor_config.json", "vocabulary*"],
     )
     print(f"[PRELOAD] ✅ Whisper downloaded successfully")
 except Exception as e:
