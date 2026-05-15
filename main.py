@@ -1171,7 +1171,83 @@ CORRECT_MAX_CHARS = int(os.environ.get("CORRECT_MAX_CHARS", "4000"))
 CORRECT_CHUNK_SIZE = int(os.environ.get("CORRECT_CHUNK_SIZE", "30"))
 
 
-def correct_transcript(transcript: str) -> str:
+# =============================================================================
+# GLOSSAIRE METIER (envoye par l'app via event["input"]["glossary"])
+# =============================================================================
+# Format attendu (tout est optionnel) :
+#   {
+#     "brand_names":     ["Drexco Medical", ...],
+#     "brand_variants":  ["Dresco", "DREX Comedical", ...],
+#     "terms":           ["Vicryl", "FFP2", ...],
+#     "agents":          ["Joanna", "Bachir", ...],
+#     "ivr_phrases":     ["Depuis 1988, Drexco Medical", ...],
+#     "context":         "Distributeur de materiel medical..."
+#   }
+# Si vide ou absent, le pod retombe sur son comportement par defaut.
+
+
+def _build_initial_prompt(base_prompt: str, glossary: Optional[Dict]) -> str:
+    """Construit un initial_prompt Whisper enrichi avec le glossaire metier.
+    base_prompt = prompt par defaut (vocabulaire generique).
+    Le glossaire (marques + termes techniques + prenoms d'agents) est ajoute
+    en fin de prompt pour biaiser le decodage Whisper vers ces tokens."""
+    if not glossary:
+        return base_prompt
+
+    parts = [base_prompt]
+
+    brands = glossary.get("brand_names") or []
+    terms  = glossary.get("terms") or []
+    agents = glossary.get("agents") or []
+
+    extras = []
+    if brands:
+        extras.append("Societes mentionnees : " + ", ".join(brands) + ".")
+    if terms:
+        extras.append("Vocabulaire metier : " + ", ".join(terms) + ".")
+    if agents:
+        extras.append("Prenoms d'agents : " + ", ".join(agents) + ".")
+
+    if extras:
+        parts.append(" ".join(extras))
+
+    return " ".join(parts)
+
+
+def _normalize_for_match(s: str) -> str:
+    """Normalise une string pour matching IVR : lowercase + collapse whitespace."""
+    return re.sub(r"\s+", " ", (s or "").lower().strip())
+
+
+def _filter_ivr_segments(segments: List[Dict], ivr_phrases: Optional[List[str]]) -> List[Dict]:
+    """Supprime les segments dont le texte contient une phrase IVR du glossaire.
+    Match insensible a la casse et tolerant aux espaces multiples.
+    Retourne la liste filtree."""
+    if not ivr_phrases or not segments:
+        return segments
+
+    normalized_phrases = [_normalize_for_match(p) for p in ivr_phrases if p and p.strip()]
+    if not normalized_phrases:
+        return segments
+
+    filtered = []
+    removed = 0
+    for seg in segments:
+        text_norm = _normalize_for_match(seg.get("text", ""))
+        if any(p in text_norm for p in normalized_phrases):
+            removed += 1
+            log(f"[IVR_FILTER] Removed segment matching glossary IVR phrase: "
+                f"{seg.get('text','')[:80]!r}")
+            continue
+        filtered.append(seg)
+
+    if removed > 0:
+        log(f"[IVR_FILTER] Removed {removed} segment(s) matching {len(normalized_phrases)} glossary IVR phrase(s)")
+
+    return filtered
+
+
+def correct_transcript(transcript: str, glossary: Optional[Dict] = None) -> str:
     """Corrige les erreurs phonétiques Whisper via LLM en mode DIFF.
 
     Fonctionnement :
@@ -1193,6 +1269,32 @@ def correct_transcript(transcript: str) -> str:
     # Numéroter les lignes pour que le LLM puisse référencer
     numbered = "\n".join(f"{i+1}. {line}" for i, line in enumerate(original_lines))
 
+    # Bloc glossaire metier (si fourni) — injecte dans le prompt pour guider
+    # les corrections vers les marques et le contexte du client.
+    glossary_block = ""
+    if glossary:
+        brands   = glossary.get("brand_names") or []
+        variants = glossary.get("brand_variants") or []
+        context  = (glossary.get("context") or "").strip()
+
+        gparts = []
+        if context:
+            gparts.append(f"Contexte de la societe : {context}")
+        if brands:
+            gparts.append(
+                "Noms officiels (orthographe a respecter) : "
+                + ", ".join(brands)
+            )
+        if variants and brands:
+            primary = brands[0]
+            gparts.append(
+                "Variantes phonetiques erronees a corriger vers '"
+                + primary + "' (ou un autre nom officiel si plus pertinent) : "
+                + ", ".join(variants)
+            )
+        if gparts:
+            glossary_block = "GLOSSAIRE METIER :\n" + "\n".join(gparts) + "\n\n"
+
     prompt = (
         "Tu lis cette transcription d'un appel téléphonique (cabinet dentaire/médical) "
         "et tu identifies les erreurs phonétiques de Whisper : des mots remplacés par "
@@ -1200,10 +1302,12 @@ def correct_transcript(transcript: str) -> str:
         "Exemples d'erreurs courantes : 'centre d'entraînement' → 'centre dentaire', "
         "'désertage' → 'détartrage', 'y a pas de passe' → 'y a pas de place', "
         "'dent sage' → 'dent de sagesse', 'géniable' → 'joignable'.\n\n"
+        + glossary_block +
         "RÈGLES :\n"
         "- Lis TOUT le transcript pour comprendre le contexte avant de corriger\n"
         "- Ne corrige QUE les mots dont tu es SÛR qu'ils sont faux\n"
-        "- Laisse les noms propres, les hésitations ('euh', 'ben'), la ponctuation\n"
+        "- Si le glossaire metier est fourni, corrige systematiquement les variantes erronees vers le nom officiel\n"
+        "- Laisse les noms propres legitimes, les hésitations ('euh', 'ben'), la ponctuation\n"
         "- Ne reformule JAMAIS, ne change que le(s) mot(s) erroné(s)\n\n"
         "FORMAT DE RÉPONSE :\n"
         "- Si des corrections sont nécessaires, une par ligne : numéro_ligne: ancien → nouveau\n"
@@ -1650,6 +1754,25 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     # Override possible du prompt Whisper depuis le job (pour clients spécialisés)
     job_initial_prompt = (inp.get("initial_prompt") or "").strip() or None
 
+    # Glossaire metier envoye par l'app (cf services/transcript_glossary.py
+    # cote telecom-billing). Utilise pour :
+    #   - enrichir le Whisper initial_prompt (brand_names + terms + agents)
+    #   - filtrer les segments matchant des phrases IVR connues (ivr_phrases)
+    #   - guider la correction LLM (brand_variants → brand_names + context)
+    glossary = inp.get("glossary") or None
+    if glossary:
+        log(f"[GLOSSARY] Loaded: brands={len(glossary.get('brand_names') or [])}, "
+            f"variants={len(glossary.get('brand_variants') or [])}, "
+            f"terms={len(glossary.get('terms') or [])}, "
+            f"agents={len(glossary.get('agents') or [])}, "
+            f"ivr_phrases={len(glossary.get('ivr_phrases') or [])}, "
+            f"context={'yes' if (glossary.get('context') or '').strip() else 'no'}")
+        # Enrichir le prompt Whisper avec brand_names + terms + agents.
+        # Si l'app a deja fourni un job_initial_prompt explicite, on l'utilise
+        # tel quel (override total). Sinon on enrichit le default.
+        if not job_initial_prompt:
+            job_initial_prompt = _build_initial_prompt(WHISPER_INITIAL_PROMPT, glossary)
+
     # Déterminer la direction de l'appel
     # Règle : un fichier dont le nom commence par "out" est sortant, tous les
     # autres sont entrants. On vérifie aussi si "out-" ou "out_" apparaît n'importe
@@ -2061,6 +2184,14 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             log("[HANDLER] No segments detected → treating as hold music / silence")
             return _build_hold_music_response(est_dur, diarization_mode + "_empty")
 
+        # Filtre IVR base sur le glossaire client (phrases d'annonce/attente).
+        # Tourne AVANT le dedup pour reduire le travail de dedup.
+        if glossary:
+            segments = _filter_ivr_segments(segments, glossary.get("ivr_phrases"))
+            if not segments:
+                log("[HANDLER] All segments filtered by IVR glossary → hold music response")
+                return _build_hold_music_response(est_dur, diarization_mode + "_ivr_filtered")
+
         # Dedup
         segments = remove_duplicate_segments(segments)
 
@@ -2125,7 +2256,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             corrected_transcript = full_transcript  # pas de correction
         elif n_segs_text >= 3 or n_chars_transcript >= 200:
             log(f"[HANDLER] Correcting transcript ({n_segs_text} segs, {n_chars_transcript} chars)...")
-            corrected_transcript = correct_transcript(full_transcript)
+            corrected_transcript = correct_transcript(full_transcript, glossary=glossary)
             if corrected_transcript != full_transcript:
                 # Réappliquer les corrections aux segments (ligne à ligne, même ordre)
                 corrected_lines = [l.strip() for l in corrected_transcript.split("\n") if l.strip()]
